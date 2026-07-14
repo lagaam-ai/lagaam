@@ -216,3 +216,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# macOS
+.DS_Store
+
+# Personal working notes — local only
+CLAUDE.local.md
+
+# Private founder notes — never commit (lives outside repo, belt-and-suspenders)
+hq/
+lagaam-hq/
