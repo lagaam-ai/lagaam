@@ -46,3 +46,12 @@ class CatalogInfo(BaseModel):
 
 class CatalogMetadata(BaseModel):
     catalogs: list[CatalogInfo]
+
+
+class DialectCard(BaseModel):
+    """Engine-quirks brief injected into SQL-generation prompts."""
+
+    engine: str
+    # The sqlglot dialect id used for parse-validation of generated SQL.
+    sqlglot_dialect: str
+    rules: list[str]

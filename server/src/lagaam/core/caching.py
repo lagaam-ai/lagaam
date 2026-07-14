@@ -11,7 +11,7 @@ Failures are never cached — a table can appear right after a miss.
 import time
 from collections.abc import Callable
 
-from lagaam.core.models import CatalogMetadata, TableSchema
+from lagaam.core.models import CatalogMetadata, DialectCard, TableSchema
 from lagaam.core.ports import QueryEngine
 
 
@@ -27,6 +27,10 @@ class CachingQueryEngine:
         self._clock = clock
         self._catalogs: tuple[float, CatalogMetadata] | None = None
         self._tables: dict[tuple[str, str, str], tuple[float, TableSchema]] = {}
+
+    def dialect(self) -> DialectCard:
+        # Static engine knowledge; nothing to cache.
+        return self._engine.dialect()
 
     def _fresh(self, stored_at: float) -> bool:
         return self._clock() - stored_at <= self._ttl

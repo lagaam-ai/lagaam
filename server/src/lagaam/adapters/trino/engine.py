@@ -11,12 +11,14 @@ import anyio.to_thread
 import trino.dbapi
 import trino.exceptions
 
+from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
 from lagaam.core.errors import EngineError, TableNotFoundError
 from lagaam.core.identifiers import quote_identifier
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     ColumnInfo,
+    DialectCard,
     SchemaInfo,
     TableSchema,
 )
@@ -66,6 +68,9 @@ class TrinoEngine:
             )
         except (trino.exceptions.Error, OSError) as exc:
             raise EngineError(str(exc)) from exc
+
+    def dialect(self) -> DialectCard:
+        return TRINO_DIALECT_CARD
 
     def _connect(self) -> trino.dbapi.Connection:
         return trino.dbapi.connect(
