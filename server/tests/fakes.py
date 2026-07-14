@@ -5,6 +5,7 @@ from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     ColumnInfo,
+    DialectCard,
     SchemaInfo,
     TableSchema,
 )
@@ -41,4 +42,11 @@ class FakeQueryEngine:
             raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
         return TableSchema(
             catalog=catalog, schema_name=schema, table=table, columns=_TABLES[key]
+        )
+
+    def dialect(self) -> DialectCard:
+        return DialectCard(
+            engine="Fake",
+            sqlglot_dialect="trino",
+            rules=["Names are catalog.schema.table"],
         )

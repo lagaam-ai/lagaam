@@ -1,10 +1,10 @@
-"""Table cards: compact prompt-ready grounding for one table.
+"""Cards: compact prompt-ready grounding text.
 
-Cards go inside LLM prompts (SQL generation lands in U3), so size is a
-feature: one header line, one line per column, nothing else.
+Cards go inside LLM prompts, so size is a feature: one header line, one
+line per item, nothing else.
 """
 
-from lagaam.core.models import TableSchema
+from lagaam.core.models import DialectCard, TableSchema
 
 
 def render_card(schema: TableSchema) -> str:
@@ -17,4 +17,10 @@ def render_card(schema: TableSchema) -> str:
         if column.comment:
             line += f" — {column.comment}"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def render_dialect_card(card: DialectCard) -> str:
+    lines = [f"{card.engine} SQL dialect:"]
+    lines += [f"- {rule}" for rule in card.rules]
     return "\n".join(lines)

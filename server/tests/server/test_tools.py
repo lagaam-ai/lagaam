@@ -5,7 +5,7 @@ content shapes, and error text it can self-correct on.
 """
 
 from lagaam.core.errors import EngineError
-from lagaam.core.models import CatalogMetadata, TableSchema
+from lagaam.core.models import CatalogMetadata, DialectCard, TableSchema
 from tests.fakes import FakeQueryEngine
 from tests.helpers import lagaam_client
 
@@ -19,6 +19,9 @@ class ExplodingEngine:
     async def describe_table(
         self, catalog: str, schema: str, table: str
     ) -> TableSchema:
+        raise EngineError("connection refused")
+
+    def dialect(self) -> DialectCard:
         raise EngineError("connection refused")
 
 

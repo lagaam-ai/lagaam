@@ -22,6 +22,32 @@ def test_trino_engine_satisfies_the_port(engine: TrinoEngine) -> None:
     assert isinstance(engine, QueryEngine)
 
 
+def test_dialect_card_targets_trino(engine: TrinoEngine) -> None:
+    card = engine.dialect()
+    assert card.engine == "Trino"
+    assert card.sqlglot_dialect == "trino"
+    assert card.rules
+
+
+def test_validated_sql_executes_on_trino(engine: TrinoEngine) -> None:
+    # The canonicalized output (incl. injected LIMIT) must be real Trino SQL.
+    import trino.dbapi
+
+    from lagaam.core.safety import validate_query
+
+    sql = validate_query(
+        "select orderkey, totalprice from tpch.tiny.orders where orderkey < 100",
+        dialect=engine.dialect().sqlglot_dialect,
+        default_limit=5,
+    )
+    assert "LIMIT 5" in sql
+    with trino.dbapi.connect(host="localhost", port=8080, user="lagaam-test") as conn:
+        cur = conn.cursor()
+        cur.execute(sql)
+        rows = cur.fetchall()
+    assert 0 < len(rows) <= 5
+
+
 async def test_describe_table_carries_row_estimate_from_stats(
     engine: TrinoEngine,
 ) -> None:
