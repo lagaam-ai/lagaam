@@ -29,11 +29,16 @@ _HIDDEN_SCHEMAS = {"information_schema"}
 
 class TrinoEngine:
     def __init__(
-        self, host: str = "localhost", port: int = 8080, user: str = "lagaam"
+        self,
+        host: str = "localhost",
+        port: int = 8080,
+        user: str = "lagaam",
+        max_tables_per_catalog: int = 1000,
     ) -> None:
         self._host = host
         self._port = port
         self._user = user
+        self._max_tables = max_tables_per_catalog
 
     @classmethod
     def from_env(cls) -> "TrinoEngine":
@@ -73,23 +78,25 @@ class TrinoEngine:
             cur.execute("SHOW CATALOGS")
             catalog_names = [row[0] for row in cur.fetchall()]
 
-            # U2 caches and bounds this listing; serial + unbounded is U1-only.
+            # Serial queries are fine behind the cache; LIMIT bounds monster catalogs.
+            hidden = ", ".join(f"'{s}'" for s in sorted(_HIDDEN_SCHEMAS))
             catalogs: list[CatalogInfo] = []
             for name in catalog_names:
                 try:
                     cur.execute(
                         "SELECT table_schema, table_name "
                         f"FROM {quote_identifier(name)}.information_schema.tables "
-                        "ORDER BY table_schema, table_name"
+                        f"WHERE table_schema NOT IN ({hidden}) "
+                        "ORDER BY table_schema, table_name "
+                        f"LIMIT {self._max_tables + 1}"
                     )
                     rows = cur.fetchall()
                 except (trino.exceptions.TrinoQueryError, ValueError):
                     # One broken catalog must not cost the grounding for healthy ones.
                     continue
+                truncated = len(rows) > self._max_tables
                 schemas: dict[str, list[str]] = {}
-                for table_schema, table_name in rows:
-                    if table_schema in _HIDDEN_SCHEMAS:
-                        continue
+                for table_schema, table_name in rows[: self._max_tables]:
                     schemas.setdefault(table_schema, []).append(table_name)
                 catalogs.append(
                     CatalogInfo(
@@ -97,6 +104,7 @@ class TrinoEngine:
                         schemas=[
                             SchemaInfo(name=s, tables=t) for s, t in schemas.items()
                         ],
+                        truncated=truncated,
                     )
                 )
             return CatalogMetadata(catalogs=catalogs)
@@ -129,4 +137,19 @@ class TrinoEngine:
                 schema_name=schema.lower(),
                 table=table.lower(),
                 columns=columns,
+                row_estimate=self._row_estimate(cur, quoted),
             )
+
+    @staticmethod
+    def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:
+        """Best-effort row count from engine statistics; never fails a describe."""
+        try:
+            cur.execute(f"SHOW STATS FOR {quoted}")
+            rows = cur.fetchall()
+        except trino.exceptions.TrinoQueryError:
+            return None  # views and stats-less connectors have no SHOW STATS
+        for row in rows:
+            # The summary row has column_name None and carries row_count.
+            if row[0] is None and row[4] is not None:
+                return round(row[4])
+        return None
