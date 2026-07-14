@@ -24,6 +24,8 @@ class TableSchema(BaseModel):
     table: str
     columns: list[ColumnInfo]
     comment: str | None = None
+    # From engine statistics when available; grounds LIMIT/filter decisions.
+    row_estimate: int | None = None
 
     @property
     def fqn(self) -> str:
@@ -38,6 +40,8 @@ class SchemaInfo(BaseModel):
 class CatalogInfo(BaseModel):
     name: str
     schemas: list[SchemaInfo]
+    # Listing was capped; unseen tables may still exist.
+    truncated: bool = False
 
 
 class CatalogMetadata(BaseModel):
