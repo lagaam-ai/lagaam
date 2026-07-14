@@ -1,0 +1,137 @@
+"""SQL safety validation: parse, judge, constrain.
+
+Every rejection message must tell the agent what to change — these texts
+are part of the API, like the domain errors.
+"""
+
+import pytest
+
+from lagaam.core.errors import SqlValidationError
+from lagaam.core.safety import validate_query
+
+
+def validate(sql: str) -> str:
+    return validate_query(sql, dialect="trino")
+
+
+# --- what passes ---------------------------------------------------------
+
+
+def test_plain_select_with_limit_passes() -> None:
+    sql = validate("SELECT orderkey FROM tpch.tiny.orders LIMIT 10")
+    assert "orderkey" in sql.lower()
+    assert "limit" in sql.lower()
+
+
+def test_cte_and_union_pass() -> None:
+    validate(
+        "WITH big AS (SELECT orderkey FROM tpch.tiny.orders WHERE totalprice > 100) "
+        "SELECT orderkey FROM big LIMIT 5"
+    )
+    validate(
+        "SELECT orderkey FROM tpch.tiny.orders "
+        "UNION ALL SELECT orderkey FROM tpch.tiny.lineitem LIMIT 5"
+    )
+
+
+def test_count_star_is_allowed() -> None:
+    # The star lives inside a function, not as a projection.
+    validate("SELECT count(*) FROM tpch.tiny.orders LIMIT 1")
+
+
+def test_missing_limit_is_injected_not_rejected() -> None:
+    sql = validate("SELECT orderkey FROM tpch.tiny.orders")
+    assert "LIMIT 1000" in sql
+
+
+def test_existing_limit_is_kept() -> None:
+    sql = validate("SELECT orderkey FROM tpch.tiny.orders LIMIT 7")
+    assert "LIMIT 7" in sql
+    assert "1000" not in sql
+
+
+def test_output_is_canonicalized_trino_sql() -> None:
+    # What was validated is exactly what runs — the AST is re-rendered.
+    sql = validate("select orderkey from tpch.tiny.orders limit 3")
+    assert sql == 'SELECT orderkey FROM tpch.tiny.orders LIMIT 3'
+
+
+# --- what is rejected, and how it teaches --------------------------------
+
+
+def test_select_star_rejected_with_guidance() -> None:
+    with pytest.raises(SqlValidationError, match="name the columns"):
+        validate("SELECT * FROM tpch.tiny.orders LIMIT 5")
+
+
+def test_qualified_star_rejected() -> None:
+    with pytest.raises(SqlValidationError, match="name the columns"):
+        validate("SELECT o.* FROM tpch.tiny.orders o LIMIT 5")
+
+
+def test_star_in_subquery_rejected() -> None:
+    with pytest.raises(SqlValidationError, match="name the columns"):
+        validate(
+            "SELECT orderkey FROM (SELECT * FROM tpch.tiny.orders) LIMIT 5"
+        )
+
+
+def test_deeply_qualified_star_rejected() -> None:
+    # 4+ part names parent the star under exp.Dot, not Column.
+    with pytest.raises(SqlValidationError, match="name the columns"):
+        validate("SELECT a.b.c.d.* FROM t LIMIT 5")
+
+
+def test_fetch_first_counts_as_a_limit() -> None:
+    sql = validate("SELECT orderkey FROM tpch.tiny.orders FETCH FIRST 3 ROWS ONLY")
+    assert "1000" not in sql
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET x = 1",
+        "DELETE FROM t",
+        "DROP TABLE t",
+        "CREATE TABLE t (x int)",
+        "ALTER TABLE t ADD COLUMN y int",
+    ],
+)
+def test_writes_and_ddl_rejected(sql: str) -> None:
+    with pytest.raises(SqlValidationError, match="read-only"):
+        validate(sql)
+
+
+def test_write_smuggled_into_cte_rejected() -> None:
+    # find() must scan the whole tree, not just the root.
+    with pytest.raises(SqlValidationError, match="read-only"):
+        validate("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x")
+
+
+@pytest.mark.parametrize("sql", ["SHOW CATALOGS", "SET SESSION x = 1"])
+def test_loosely_parsed_commands_rejected(sql: str) -> None:
+    # exp.Command is sqlglot's "parsed loosely" bucket — never trust it.
+    with pytest.raises(SqlValidationError, match="read-only"):
+        validate(sql)
+
+
+def test_multiple_statements_rejected() -> None:
+    with pytest.raises(SqlValidationError, match="one statement"):
+        validate("SELECT 1; DROP TABLE t")
+
+
+def test_unparseable_sql_fails_closed_with_position() -> None:
+    with pytest.raises(SqlValidationError, match="could not be parsed"):
+        validate("SELEC orderkey FRM orders")
+
+
+def test_empty_input_rejected() -> None:
+    with pytest.raises(SqlValidationError):
+        validate("")
+
+
+def test_tokenizer_error_fails_closed() -> None:
+    # An unterminated literal raises TokenError, not ParseError — still ours.
+    with pytest.raises(SqlValidationError, match="could not be parsed"):
+        validate("'''")

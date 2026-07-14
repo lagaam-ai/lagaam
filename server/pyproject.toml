@@ -8,6 +8,7 @@ dependencies = [
     # v2.0 renames FastMCP -> MCPServer and breaks the import path; migrate deliberately.
     "mcp>=1.28,<2",
     "pydantic>=2.7",
+    "sqlglot>=30,<31",
     "trino>=0.330",
 ]
 

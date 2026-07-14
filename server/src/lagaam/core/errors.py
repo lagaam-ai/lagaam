@@ -15,6 +15,10 @@ class TableNotFoundError(LagaamError):
         super().__init__(f"Table {catalog}.{schema}.{table} does not exist.")
 
 
+class SqlValidationError(LagaamError):
+    """The SQL failed a safety check; the message says what to change."""
+
+
 class EngineError(LagaamError):
     """The query engine failed or is unreachable — not the agent's fault."""
 
