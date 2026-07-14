@@ -22,6 +22,23 @@ def test_trino_engine_satisfies_the_port(engine: TrinoEngine) -> None:
     assert isinstance(engine, QueryEngine)
 
 
+async def test_describe_table_carries_row_estimate_from_stats(
+    engine: TrinoEngine,
+) -> None:
+    schema = await engine.describe_table("tpch", "tiny", "orders")
+    assert schema.row_estimate == 15000  # tpch tiny is deterministic
+
+
+async def test_capped_listing_is_marked_truncated(trino_ready: None) -> None:
+    capped = TrinoEngine(
+        host="localhost", port=8080, user="lagaam-test", max_tables_per_catalog=5
+    )
+    meta = await capped.list_catalogs()
+    tpch = next(c for c in meta.catalogs if c.name == "tpch")
+    assert tpch.truncated
+    assert sum(len(s.tables) for s in tpch.schemas) <= 5
+
+
 async def test_list_catalogs_includes_tpch_tables(engine: TrinoEngine) -> None:
     meta = await engine.list_catalogs()
     tpch = next(c for c in meta.catalogs if c.name == "tpch")
