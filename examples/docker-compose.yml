@@ -1,0 +1,14 @@
+# Run only the engine the current task needs: docker compose --profile trino up -d
+# Version pinned: EXPLAIN (FORMAT JSON) output is not version-stable (U4 depends on it).
+services:
+  trino:
+    image: trinodb/trino:476
+    container_name: lagaam-trino
+    profiles: ["trino"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 30

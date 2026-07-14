@@ -1,0 +1,26 @@
+"""Domain errors.
+
+Every error an agent can hit must say what to change — agents self-correct
+on error text, so the message is part of the API. Core states the fact;
+recovery hints that name MCP tools are attached at the server layer.
+"""
+
+
+class LagaamError(Exception):
+    """Base for all domain errors."""
+
+
+class TableNotFoundError(LagaamError):
+    def __init__(self, catalog: str, schema: str, table: str) -> None:
+        super().__init__(f"Table {catalog}.{schema}.{table} does not exist.")
+
+
+class EngineError(LagaamError):
+    """The query engine failed or is unreachable — not the agent's fault."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            f"The query engine could not complete the request: {detail}. "
+            "This is not a problem with your input — retry, and report it "
+            "if it persists."
+        )
