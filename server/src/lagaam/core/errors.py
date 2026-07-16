@@ -19,6 +19,11 @@ class SqlValidationError(LagaamError):
     """The SQL failed a safety check; the message says what to change."""
 
 
+class BudgetExceededError(LagaamError):
+    """The query's estimated cost exceeds the agent's budget; message says
+    what to change to make it fit."""
+
+
 class EngineError(LagaamError):
     """The query engine failed or is unreachable — not the agent's fault."""
 
