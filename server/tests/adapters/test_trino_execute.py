@@ -66,3 +66,26 @@ def test_no_timeout_sets_no_session_property(
     )
     engine._execute("SELECT x FROM t", max_rows=10, timeout_seconds=None)
     assert captured["props"] is None
+
+
+def test_translate_error_maps_resource_limits_not_via_user_error() -> None:
+    # A timeout arrives as base TrinoQueryError (not TrinoUserError) with an
+    # error_name; it must still translate to a hint, and never leak query_id.
+    from lagaam.adapters.trino.engine import _translate_error
+    from lagaam.core.errors import EngineError, QueryFailedError
+
+    class FakeTimeout(Exception):
+        error_name = "EXCEEDED_TIME_LIMIT"
+        message = "Query exceeded maximum time limit of 2.00s"
+
+    translated = _translate_error(FakeTimeout())
+    assert isinstance(translated, QueryFailedError)
+    assert "query_id" not in str(translated)
+
+    class FakeInfra(Exception):
+        error_name = "GENERIC_INTERNAL_ERROR"
+        message = "worker crashed"
+
+    infra = _translate_error(FakeInfra())
+    assert isinstance(infra, EngineError)
+    assert "worker crashed" in str(infra)

@@ -37,3 +37,11 @@ class EngineError(LagaamError):
             "This is not a problem with your input — retry, and report it "
             "if it persists."
         )
+
+
+class QueryFailedError(LagaamError):
+    """The query ran but the engine rejected it (bad column, too big, ...);
+    the message is a next action the agent can take to recover."""
+
+    def __init__(self, hint: str) -> None:
+        super().__init__(hint)

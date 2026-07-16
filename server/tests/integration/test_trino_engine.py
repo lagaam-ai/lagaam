@@ -180,3 +180,56 @@ async def test_describe_missing_catalog_raises_domain_error(
 ) -> None:
     with pytest.raises(TableNotFoundError):
         await engine.describe_table("no_such_catalog", "tiny", "orders")
+
+
+async def test_bad_column_becomes_a_self_correctable_error(
+    engine: TrinoEngine,
+) -> None:
+    from lagaam.core.errors import QueryFailedError
+
+    with pytest.raises(QueryFailedError, match="describe_table"):
+        await engine.execute(
+            "SELECT no_such_column FROM tpch.tiny.orders LIMIT 1", max_rows=1
+        )
+
+
+async def test_syntax_error_becomes_a_self_correctable_error(
+    engine: TrinoEngine,
+) -> None:
+    from lagaam.core.errors import QueryFailedError
+
+    with pytest.raises(QueryFailedError):
+        # Reaches execute already "validated"; a raw engine syntax reject still
+        # translates to a hint rather than a raw code.
+        await engine.execute("SELECT FROM tpch.tiny.orders", max_rows=1)
+
+
+async def test_bad_column_in_estimate_is_self_correctable(
+    engine: TrinoEngine,
+) -> None:
+    # EXPLAIN (in estimate_cost) rejects the bad column before execute is
+    # ever reached — that path must translate too.
+    from lagaam.core.errors import QueryFailedError
+
+    with pytest.raises(QueryFailedError, match="describe_table"):
+        await engine.estimate_cost(
+            "SELECT no_such_column FROM tpch.tiny.orders LIMIT 1"
+        )
+
+
+async def test_timeout_is_self_correctable_and_leak_free(
+    engine: TrinoEngine,
+) -> None:
+    # A real timeout arrives as base TrinoQueryError, not TrinoUserError; it
+    # must still translate to the timeout hint and not leak the query id.
+    from lagaam.core.errors import QueryFailedError
+
+    with pytest.raises(QueryFailedError) as exc:
+        await engine.execute(
+            "SELECT count(*) FROM tpch.sf1000.lineitem a "
+            "JOIN tpch.sf1000.orders b ON a.orderkey > b.orderkey",
+            max_rows=1,
+            timeout_seconds=1,
+        )
+    assert "query_id" not in str(exc.value)
+    assert "filter" in str(exc.value).lower()
