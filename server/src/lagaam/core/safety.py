@@ -71,6 +71,16 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
             f"(found {denied.key.upper()}). Send a plain SELECT query."
         )
 
+    for table in tree.find_all(exp.Table):
+        # A base table parses with an Identifier here; a table function (e.g.
+        # a system.query passthrough) parses as a Func and can smuggle
+        # arbitrary SQL — including writes — past every check above.
+        if isinstance(table.this, exp.Func):
+            raise SqlValidationError(
+                "This tool is read-only: table functions are not allowed. "
+                "Query base tables directly by catalog.schema.table name."
+            )
+
     for star in tree.find_all(exp.Star):
         # count(*) is fine — a star only offends as a projection. Projection
         # stars parent under Select, Column, or (for 4+ part names) Dot.

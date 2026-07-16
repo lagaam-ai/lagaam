@@ -109,6 +109,26 @@ def test_write_smuggled_into_cte_rejected() -> None:
         validate("WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x")
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT x FROM TABLE(system.query(query => 'DROP TABLE t'))",
+        "SELECT x FROM mysql.system.query(query => 'DELETE FROM t')",
+        "SELECT x FROM TABLE(exclude_columns(input => TABLE(tpch.tiny.orders), "
+        "columns => DESCRIPTOR(orderkey)))",
+    ],
+)
+def test_table_functions_rejected(sql: str) -> None:
+    # Passthrough functions like system.query run their string argument on
+    # the remote engine — a read-only bypass if ever allowed through.
+    with pytest.raises(SqlValidationError, match="table functions"):
+        validate(sql)
+
+
+def test_unnest_is_not_a_table_function() -> None:
+    validate("SELECT u FROM UNNEST(ARRAY[1, 2]) AS t(u) LIMIT 5")
+
+
 @pytest.mark.parametrize("sql", ["SHOW CATALOGS", "SET SESSION x = 1"])
 def test_loosely_parsed_commands_rejected(sql: str) -> None:
     # exp.Command is sqlglot's "parsed loosely" bucket — never trust it.
