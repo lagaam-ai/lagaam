@@ -4,7 +4,9 @@ These are the shapes the MCP tool surface returns to agents; adapters
 translate engine-specific metadata into them. Core never imports engine SDKs.
 """
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ColumnInfo(BaseModel):
@@ -46,6 +48,38 @@ class CatalogInfo(BaseModel):
 
 class CatalogMetadata(BaseModel):
     catalogs: list[CatalogInfo]
+
+
+class CostEstimate(BaseModel):
+    """Pre-execution QUOTATION for a query: what it would scan, how sure we are.
+
+    ``confidence`` is "low" whenever the byte number is missing — the engine
+    had no statistics, so the budget gate must fail safe rather than admit a
+    query on an absent estimate.
+    """
+
+    scanned_bytes: int | None = None
+    row_estimate: int | None = None
+    # None = "infer from the evidence"; an explicit value is checked for sanity.
+    confidence: Literal["high", "low"] | None = None
+
+    @model_validator(mode="after")
+    def _confidence_follows_the_evidence(self) -> "CostEstimate":
+        if self.confidence == "high" and self.scanned_bytes is None:
+            raise ValueError("high confidence needs a scanned_bytes number")
+        if self.confidence is None:
+            resolved = "low" if self.scanned_bytes is None else "high"
+            object.__setattr__(self, "confidence", resolved)
+        return self
+
+    def summary(self) -> str:
+        """One agent-facing line: the quotation in words it can act on."""
+        from lagaam.core.cost import human_bytes
+
+        rows = f"{self.row_estimate:,}" if self.row_estimate is not None else "unknown"
+        if self.scanned_bytes is None:
+            return f"No scan estimate available (rows: {rows}); treat as high risk."
+        return f"Estimated scan {human_bytes(self.scanned_bytes)} (rows: {rows})."
 
 
 class DialectCard(BaseModel):

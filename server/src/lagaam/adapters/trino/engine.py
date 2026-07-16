@@ -12,12 +12,15 @@ import trino.dbapi
 import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
+from lagaam.adapters.trino.explain import parse_io_estimate
 from lagaam.core.errors import EngineError, TableNotFoundError
 from lagaam.core.identifiers import quote_identifier
+from lagaam.core.scans import has_repeated_scan
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     ColumnInfo,
+    CostEstimate,
     DialectCard,
     SchemaInfo,
     TableSchema,
@@ -71,6 +74,12 @@ class TrinoEngine:
 
     def dialect(self) -> DialectCard:
         return TRINO_DIALECT_CARD
+
+    async def estimate_cost(self, sql: str) -> CostEstimate:
+        try:
+            return await anyio.to_thread.run_sync(self._estimate_cost, sql)
+        except (trino.exceptions.Error, OSError) as exc:
+            raise EngineError(str(exc)) from exc
 
     def _connect(self) -> trino.dbapi.Connection:
         return trino.dbapi.connect(
@@ -144,6 +153,18 @@ class TrinoEngine:
                 columns=columns,
                 row_estimate=self._row_estimate(cur, quoted),
             )
+
+    def _estimate_cost(self, sql: str) -> CostEstimate:
+        # A table scanned by several operators is billed once in the IO plan;
+        # if so, the byte sum undercounts — don't vouch for it.
+        if has_repeated_scan(sql, TRINO_DIALECT_CARD.sqlglot_dialect):
+            return CostEstimate(confidence="low")
+        # TYPE IO plans the query without running it; NEVER use ANALYZE here.
+        with self._connect() as conn:
+            cur = conn.cursor()
+            cur.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {sql}")
+            io_json = cur.fetchone()[0]
+        return parse_io_estimate(io_json)
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:

@@ -48,6 +48,44 @@ def test_validated_sql_executes_on_trino(engine: TrinoEngine) -> None:
     assert 0 < len(rows) <= 5
 
 
+async def test_estimate_cost_quotes_a_real_scan(engine: TrinoEngine) -> None:
+    est = await engine.estimate_cost(
+        "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey < 100 LIMIT 5"
+    )
+    assert est.confidence == "high"
+    assert est.scanned_bytes is not None and est.scanned_bytes > 0
+    assert est.row_estimate == 15000  # tpch tiny orders scan is deterministic
+
+
+async def test_count_star_is_not_quoted_as_free(engine: TrinoEngine) -> None:
+    # Regression: count(*) scans the whole table but Trino reports 0 bytes.
+    # Must NOT come back as high-confidence 0 — that would slip past a budget.
+    est = await engine.estimate_cost("SELECT count(*) FROM tpch.sf1.orders")
+    assert est.confidence == "low"
+
+
+async def test_self_join_is_not_quoted_as_a_single_scan(
+    engine: TrinoEngine,
+) -> None:
+    # Two physical scans of lineitem; the IO plan bills one. Quoting it high
+    # would undercount by 2x — must degrade to low.
+    est = await engine.estimate_cost(
+        "SELECT a.orderkey FROM tpch.sf1.lineitem a "
+        "JOIN tpch.sf1.lineitem b ON a.orderkey = b.orderkey"
+    )
+    assert est.confidence == "low"
+
+
+async def test_estimate_cost_of_join_sums_both_scans(engine: TrinoEngine) -> None:
+    est = await engine.estimate_cost(
+        "SELECT o.orderkey FROM tpch.tiny.orders o "
+        "JOIN tpch.tiny.lineitem l ON o.orderkey = l.orderkey LIMIT 5"
+    )
+    assert est.confidence == "high"
+    # Both tables are scanned; the quote must exceed either alone.
+    assert est.scanned_bytes is not None and est.scanned_bytes > 300_000
+
+
 async def test_describe_table_carries_row_estimate_from_stats(
     engine: TrinoEngine,
 ) -> None:
