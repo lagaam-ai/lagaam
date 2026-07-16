@@ -5,6 +5,7 @@ the async surface is what the MCP server needs. All engine failures leave
 this module as LagaamError subclasses — raw trino exceptions never escape.
 """
 
+import math
 import os
 
 import anyio.to_thread
@@ -22,6 +23,7 @@ from lagaam.core.models import (
     ColumnInfo,
     CostEstimate,
     DialectCard,
+    QueryResult,
     SchemaInfo,
     TableSchema,
 )
@@ -81,9 +83,24 @@ class TrinoEngine:
         except (trino.exceptions.Error, OSError) as exc:
             raise EngineError(str(exc)) from exc
 
-    def _connect(self) -> trino.dbapi.Connection:
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult:
+        try:
+            return await anyio.to_thread.run_sync(
+                self._execute, sql, max_rows, timeout_seconds
+            )
+        except (trino.exceptions.Error, OSError) as exc:
+            raise EngineError(str(exc)) from exc
+
+    def _connect(
+        self, session_properties: dict[str, str] | None = None
+    ) -> trino.dbapi.Connection:
         return trino.dbapi.connect(
-            host=self._host, port=self._port, user=self._user
+            host=self._host,
+            port=self._port,
+            user=self._user,
+            session_properties=session_properties,
         )
 
     def _list_catalogs(self) -> CatalogMetadata:
@@ -153,6 +170,31 @@ class TrinoEngine:
                 columns=columns,
                 row_estimate=self._row_estimate(cur, quoted),
             )
+
+    def _execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None
+    ) -> QueryResult:
+        # query_max_run_time caps wall-clock; Trino kills the query past it.
+        # Round up: a sub-second budget must never render as "0s" (no cap).
+        props = (
+            {"query_max_run_time": f"{math.ceil(timeout_seconds)}s"}
+            if timeout_seconds is not None
+            else None
+        )
+        with self._connect(props) as conn:
+            cur = conn.cursor()
+            cur.execute(sql)
+            # Fetch one extra to detect truncation without a second query.
+            rows = cur.fetchmany(max_rows + 1)
+            columns = [d[0] for d in cur.description or []]
+        truncated = len(rows) > max_rows
+        capped = [list(r) for r in rows[:max_rows]]
+        return QueryResult(
+            columns=columns,
+            rows=capped,
+            row_count=len(capped),
+            truncated=truncated,
+        )
 
     def _estimate_cost(self, sql: str) -> CostEstimate:
         # A table scanned by several operators is billed once in the IO plan;

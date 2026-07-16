@@ -94,6 +94,7 @@ def enforce_budget(estimate: CostEstimate, budget: QueryBudget) -> None:
         if estimate.row_estimate > budget.max_rows:
             raise BudgetExceededError(
                 f"This query is estimated to read {estimate.row_estimate:,} "
-                f"rows, over your budget of {budget.max_rows:,}. Add a WHERE "
-                "filter or a smaller LIMIT, then retry."
+                f"rows, over your budget of {budget.max_rows:,}. This counts "
+                "rows scanned, not returned, so a LIMIT alone won't help — add "
+                "a WHERE filter (a date or key range) to read fewer rows."
             )

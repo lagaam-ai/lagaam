@@ -9,6 +9,7 @@ from lagaam.core.models import (
     CatalogMetadata,
     CostEstimate,
     DialectCard,
+    QueryResult,
     TableSchema,
 )
 
@@ -27,3 +28,9 @@ class QueryEngine(Protocol):
     # Pre-execution QUOTATION: what this SQL would scan. sql is already
     # safety-validated (U3); the engine only sizes it, never runs it.
     async def estimate_cost(self, sql: str) -> CostEstimate: ...
+
+    # Run validated, budget-cleared SQL. Fetches at most max_rows (+1 to flag
+    # truncation); timeout_seconds bounds execution. sql is never trusted raw.
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult: ...

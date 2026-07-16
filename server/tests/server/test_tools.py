@@ -9,6 +9,7 @@ from lagaam.core.models import (
     CatalogMetadata,
     CostEstimate,
     DialectCard,
+    QueryResult,
     TableSchema,
 )
 from tests.fakes import FakeQueryEngine
@@ -32,11 +33,20 @@ class ExplodingEngine:
     async def estimate_cost(self, sql: str) -> CostEstimate:
         raise EngineError("connection refused")
 
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult:
+        raise EngineError("connection refused")
 
-async def test_server_exposes_exactly_the_u1_tools() -> None:
+
+async def test_server_exposes_the_expected_tools() -> None:
     async with lagaam_client(FakeQueryEngine()) as client:
         tools = (await client.list_tools()).tools
-        assert sorted(t.name for t in tools) == ["describe_table", "list_catalogs"]
+        assert sorted(t.name for t in tools) == [
+            "describe_table",
+            "list_catalogs",
+            "query_data",
+        ]
         for tool in tools:
             assert tool.description, f"{tool.name} needs an agent-facing description"
 
