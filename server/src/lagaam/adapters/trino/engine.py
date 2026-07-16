@@ -40,19 +40,23 @@ _NOT_FOUND_ERRORS = {"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}
 _HIDDEN_SCHEMAS = {"information_schema"}
 
 
+def _detail(exc: Exception) -> str:
+    """Agent-safe failure text: exc.message, never str(exc), which leaks
+    the query id."""
+    return getattr(exc, "message", None) or str(exc)
+
+
 def _translate_error(exc: Exception) -> LagaamError:
     """Map a raw engine failure to a domain error.
 
     A recognised error_name (bad column, timeout, memory — regardless of the
     Trino subclass it arrives as) is the agent's to fix, so it becomes a
-    teachable QueryFailedError. Everything else is an engine fault: use
-    exc.message, never str(exc), which leaks the query id.
+    teachable QueryFailedError. Everything else is an engine fault.
     """
     error_name = getattr(exc, "error_name", None)
     if is_self_correctable(error_name):
         return QueryFailedError(hint_for_engine_error(error_name))
-    message = getattr(exc, "message", None) or str(exc)
-    return EngineError(message)
+    return EngineError(_detail(exc))
 
 
 class TrinoEngine:
@@ -83,7 +87,7 @@ class TrinoEngine:
         try:
             return await anyio.to_thread.run_sync(self._list_catalogs)
         except (trino.exceptions.Error, OSError) as exc:
-            raise EngineError(str(exc)) from exc
+            raise EngineError(_detail(exc)) from exc
 
     async def describe_table(
         self, catalog: str, schema: str, table: str
@@ -93,7 +97,7 @@ class TrinoEngine:
                 self._describe_table, catalog, schema, table
             )
         except (trino.exceptions.Error, OSError) as exc:
-            raise EngineError(str(exc)) from exc
+            raise EngineError(_detail(exc)) from exc
 
     def dialect(self) -> DialectCard:
         return TRINO_DIALECT_CARD

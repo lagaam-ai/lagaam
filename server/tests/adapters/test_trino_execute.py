@@ -89,3 +89,17 @@ def test_translate_error_maps_resource_limits_not_via_user_error() -> None:
     infra = _translate_error(FakeInfra())
     assert isinstance(infra, EngineError)
     assert "worker crashed" in str(infra)
+
+def test_metadata_failures_use_message_not_repr() -> None:
+    # str(TrinoQueryError) is a repr with query_id and full kwargs; the
+    # metadata wrappers must strip it down the same way _translate_error does.
+    from lagaam.adapters.trino.engine import _detail
+
+    class FakeQueryError(Exception):
+        message = "line 1:1: mismatched input"
+
+        def __str__(self) -> str:
+            return "TrinoQueryError(message=..., query_id=20260716_abc)"
+
+    assert _detail(FakeQueryError()) == "line 1:1: mismatched input"
+    assert _detail(OSError("connection refused")) == "connection refused"
