@@ -5,6 +5,7 @@ from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     ColumnInfo,
+    CostEstimate,
     DialectCard,
     SchemaInfo,
     TableSchema,
@@ -24,6 +25,15 @@ _TABLES: dict[tuple[str, str, str], list[ColumnInfo]] = {
 
 
 class FakeQueryEngine:
+    def __init__(self, estimate: CostEstimate | None = None) -> None:
+        # Tests that exercise the budget gate inject the quote they need.
+        self._estimate = estimate or CostEstimate(
+            scanned_bytes=1_000_000, row_estimate=1000
+        )
+
+    async def estimate_cost(self, sql: str) -> CostEstimate:
+        return self._estimate
+
     async def list_catalogs(self) -> CatalogMetadata:
         return CatalogMetadata(
             catalogs=[

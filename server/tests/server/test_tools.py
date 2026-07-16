@@ -5,7 +5,12 @@ content shapes, and error text it can self-correct on.
 """
 
 from lagaam.core.errors import EngineError
-from lagaam.core.models import CatalogMetadata, DialectCard, TableSchema
+from lagaam.core.models import (
+    CatalogMetadata,
+    CostEstimate,
+    DialectCard,
+    TableSchema,
+)
 from tests.fakes import FakeQueryEngine
 from tests.helpers import lagaam_client
 
@@ -22,6 +27,9 @@ class ExplodingEngine:
         raise EngineError("connection refused")
 
     def dialect(self) -> DialectCard:
+        raise EngineError("connection refused")
+
+    async def estimate_cost(self, sql: str) -> CostEstimate:
         raise EngineError("connection refused")
 
 
