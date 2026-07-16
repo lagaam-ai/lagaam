@@ -19,6 +19,10 @@ class SqlValidationError(LagaamError):
     """The SQL failed a safety check; the message says what to change."""
 
 
+class TableAccessDeniedError(LagaamError):
+    """The query touches a table outside the agent's allowlist."""
+
+
 class BudgetExceededError(LagaamError):
     """The query's estimated cost exceeds the agent's budget; message says
     what to change to make it fit."""
