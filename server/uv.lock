@@ -421,7 +421,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=1.28,<2" },
-    { name = "pydantic", specifier = ">=2.7" },
+    { name = "pydantic", specifier = ">=2.11" },
     { name = "sqlglot", specifier = ">=30,<31" },
     { name = "trino", specifier = ">=0.330" },
 ]
