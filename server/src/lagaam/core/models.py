@@ -93,6 +93,8 @@ class QueryResult(BaseModel):
     rows: list[list[Any]]
     row_count: int
     truncated: bool = False
+    # Non-blocking notes the agent should weigh before trusting the result.
+    warnings: list[str] = Field(default_factory=list)
 
 
 class DialectCard(BaseModel):

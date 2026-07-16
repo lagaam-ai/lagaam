@@ -14,7 +14,13 @@ import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
 from lagaam.adapters.trino.explain import parse_io_estimate
-from lagaam.core.errors import EngineError, TableNotFoundError
+from lagaam.core.errors import (
+    EngineError,
+    LagaamError,
+    QueryFailedError,
+    TableNotFoundError,
+)
+from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
 from lagaam.core.scans import has_repeated_scan
 from lagaam.core.models import (
@@ -32,6 +38,21 @@ _NOT_FOUND_ERRORS = {"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}
 
 # Present in every catalog; protocol plumbing, not grounding material.
 _HIDDEN_SCHEMAS = {"information_schema"}
+
+
+def _translate_error(exc: Exception) -> LagaamError:
+    """Map a raw engine failure to a domain error.
+
+    A recognised error_name (bad column, timeout, memory — regardless of the
+    Trino subclass it arrives as) is the agent's to fix, so it becomes a
+    teachable QueryFailedError. Everything else is an engine fault: use
+    exc.message, never str(exc), which leaks the query id.
+    """
+    error_name = getattr(exc, "error_name", None)
+    if is_self_correctable(error_name):
+        return QueryFailedError(hint_for_engine_error(error_name))
+    message = getattr(exc, "message", None) or str(exc)
+    return EngineError(message)
 
 
 class TrinoEngine:
@@ -81,7 +102,7 @@ class TrinoEngine:
         try:
             return await anyio.to_thread.run_sync(self._estimate_cost, sql)
         except (trino.exceptions.Error, OSError) as exc:
-            raise EngineError(str(exc)) from exc
+            raise _translate_error(exc) from exc
 
     async def execute(
         self, sql: str, max_rows: int, timeout_seconds: float | None = None
@@ -91,7 +112,7 @@ class TrinoEngine:
                 self._execute, sql, max_rows, timeout_seconds
             )
         except (trino.exceptions.Error, OSError) as exc:
-            raise EngineError(str(exc)) from exc
+            raise _translate_error(exc) from exc
 
     def _connect(
         self, session_properties: dict[str, str] | None = None

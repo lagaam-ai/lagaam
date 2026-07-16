@@ -108,3 +108,48 @@ async def test_injected_limit_is_cap_plus_one_for_truncation_detection() -> None
             "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
         )
     assert "LIMIT 51" in engine.executed[0].upper()
+
+
+async def test_result_carries_verification_warnings() -> None:
+    # An empty result must reach the agent with a "no rows" warning attached.
+    engine = FakeQueryEngine(
+        result=QueryResult(columns=["orderkey"], rows=[], row_count=0)
+    )
+    async with lagaam_client(engine) as client:
+        result = await client.call_tool(
+            "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
+        )
+        assert result.structuredContent is not None
+        warnings = result.structuredContent["warnings"]
+        assert any("no rows" in w.lower() for w in warnings)
+
+
+async def test_clean_result_has_empty_warnings() -> None:
+    engine = FakeQueryEngine(
+        result=QueryResult(columns=["x"], rows=[[1], [2]], row_count=2)
+    )
+    async with lagaam_client(engine) as client:
+        result = await client.call_tool("query_data", {"sql": "SELECT x FROM t"})
+        assert result.structuredContent is not None
+        assert result.structuredContent["warnings"] == []
+
+
+async def test_engine_query_failure_reaches_agent_as_a_hint() -> None:
+    # A QueryFailedError (bad column, too big) must surface as its recovery
+    # hint, not a stack trace or generic engine error.
+    from lagaam.core.errors import QueryFailedError
+
+    class FailingEngine(FakeQueryEngine):
+        async def execute(self, sql, max_rows, timeout_seconds=None):  # type: ignore[no-untyped-def]
+            raise QueryFailedError(
+                "A column in the query does not exist. Call describe_table ..."
+            )
+
+    async with lagaam_client(FailingEngine()) as client:
+        result = await client.call_tool(
+            "query_data", {"sql": "SELECT nope FROM tpch.tiny.orders"}
+        )
+        assert result.isError
+        text = result.content[0].text  # type: ignore[union-attr]
+        assert "describe_table" in text
+        assert "Traceback" not in text

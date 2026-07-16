@@ -19,6 +19,7 @@ from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogMetadata, QueryResult, TableSchema
 from lagaam.core.ports import QueryEngine
 from lagaam.core.safety import validate_query
+from lagaam.core.verification import verify_result
 
 # Cap on rows returned when the budget sets no tighter row limit.
 _DEFAULT_ROW_CAP = 1000
@@ -114,7 +115,9 @@ def create_server(
         check_tables_allowed(safe_sql, dialect, identity)
         estimate = await engine.estimate_cost(safe_sql)
         enforce_budget(estimate, budget)
-        return await engine.execute(safe_sql, row_cap, budget.timeout_seconds)
+        result = await engine.execute(safe_sql, row_cap, budget.timeout_seconds)
+        result.warnings = verify_result(result)
+        return result
 
     def _require_table_allowed(catalog: str, schema: str, table: str) -> None:
         # describe_table takes parts, not SQL — build the SELECT the allowlist
