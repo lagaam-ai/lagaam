@@ -123,7 +123,9 @@ def create_server(
         # describe_table takes parts, not SQL — build the SELECT the allowlist
         # check understands so one code path guards both tools.
         check_tables_allowed(
-            f"SELECT 1 FROM {catalog}.{schema}.{table}", "trino", identity
+            f"SELECT 1 FROM {catalog}.{schema}.{table}",
+            engine.dialect().sqlglot_dialect,
+            identity,
         )
 
     return mcp
