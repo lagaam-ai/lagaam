@@ -86,6 +86,36 @@ async def test_estimate_cost_of_join_sums_both_scans(engine: TrinoEngine) -> Non
     assert est.scanned_bytes is not None and est.scanned_bytes > 300_000
 
 
+async def test_execute_returns_capped_rows(engine: TrinoEngine) -> None:
+    result = await engine.execute(
+        "SELECT orderkey FROM tpch.tiny.orders ORDER BY orderkey", max_rows=5
+    )
+    assert result.columns == ["orderkey"]
+    assert result.row_count == 5
+    assert result.truncated  # tpch.tiny.orders has 15000 rows, far over 5
+
+
+async def test_execute_not_truncated_when_rows_fit(engine: TrinoEngine) -> None:
+    result = await engine.execute(
+        "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey = 1", max_rows=100
+    )
+    assert result.row_count == 1
+    assert not result.truncated
+
+
+async def test_execute_truncation_needs_a_limit_above_the_cap(
+    engine: TrinoEngine,
+) -> None:
+    # The server injects cap+1 so this detection works; here we pass the SQL
+    # already carrying a limit past the cap, as the server would.
+    result = await engine.execute(
+        "SELECT orderkey FROM tpch.tiny.orders ORDER BY orderkey LIMIT 6",
+        max_rows=5,
+    )
+    assert result.row_count == 5
+    assert result.truncated
+
+
 async def test_describe_table_carries_row_estimate_from_stats(
     engine: TrinoEngine,
 ) -> None:

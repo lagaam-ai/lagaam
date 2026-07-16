@@ -15,6 +15,7 @@ from lagaam.core.models import (
     CatalogMetadata,
     CostEstimate,
     DialectCard,
+    QueryResult,
     TableSchema,
 )
 from lagaam.core.ports import QueryEngine
@@ -40,6 +41,12 @@ class CachingQueryEngine:
     async def estimate_cost(self, sql: str) -> CostEstimate:
         # Query-specific and cheap to plan; caching would risk stale quotes.
         return await self._engine.estimate_cost(sql)
+
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult:
+        # Results are never cached — a cache would serve stale data.
+        return await self._engine.execute(sql, max_rows, timeout_seconds)
 
     def _fresh(self, stored_at: float) -> bool:
         return self._clock() - stored_at <= self._ttl

@@ -4,7 +4,7 @@ These are the shapes the MCP tool surface returns to agents; adapters
 translate engine-specific metadata into them. Core never imports engine SDKs.
 """
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -80,6 +80,19 @@ class CostEstimate(BaseModel):
         if self.scanned_bytes is None:
             return f"No scan estimate available (rows: {rows}); treat as high risk."
         return f"Estimated scan {human_bytes(self.scanned_bytes)} (rows: {rows})."
+
+
+class QueryResult(BaseModel):
+    """Rows returned to the agent, capped to a row budget.
+
+    ``truncated`` says the cap hit — more rows exist than were returned, so a
+    conclusion drawn from these alone may be wrong.
+    """
+
+    columns: list[str]
+    rows: list[list[Any]]
+    row_count: int
+    truncated: bool = False
 
 
 class DialectCard(BaseModel):
