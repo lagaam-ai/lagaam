@@ -11,6 +11,7 @@ from sqlglot import exp
 
 from lagaam.core.errors import TableAccessDeniedError
 from lagaam.core.identity import AgentIdentity
+from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
 
 def check_tables_allowed(
@@ -46,3 +47,36 @@ def check_tables_allowed(
                 "permitted for this agent. Query only the tables in your "
                 "grant; call list_catalogs to see them."
             )
+
+
+def filter_catalog_metadata(
+    metadata: CatalogMetadata, identity: AgentIdentity
+) -> CatalogMetadata:
+    """Return only the catalogs/schemas/tables the agent may query.
+
+    list_catalogs is the agent's grounding — showing tables outside the grant
+    both leaks metadata and teaches the agent names it will only be denied on.
+    Catalogs and schemas left with no visible tables are dropped entirely.
+    """
+    allowed = identity.normalized_allowlist()
+    if allowed is None:
+        return metadata
+
+    catalogs: list[CatalogInfo] = []
+    for catalog in metadata.catalogs:
+        schemas: list[SchemaInfo] = []
+        for schema in catalog.schemas:
+            tables = [
+                t
+                for t in schema.tables
+                if f"{catalog.name}.{schema.name}.{t}".lower() in allowed
+            ]
+            if tables:
+                schemas.append(SchemaInfo(name=schema.name, tables=tables))
+        if schemas:
+            catalogs.append(
+                CatalogInfo(
+                    name=catalog.name, schemas=schemas, truncated=catalog.truncated
+                )
+            )
+    return CatalogMetadata(catalogs=catalogs)

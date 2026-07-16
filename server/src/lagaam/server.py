@@ -11,7 +11,7 @@ from typing import Any, TypeVar
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
-from lagaam.core.allowlist import check_tables_allowed
+from lagaam.core.allowlist import check_tables_allowed, filter_catalog_metadata
 from lagaam.core.audit import AuditLog
 from lagaam.core.budget import QueryBudget, enforce_budget
 from lagaam.core.errors import LagaamError, TableNotFoundError
@@ -83,7 +83,7 @@ def create_server(
         Call this first to ground yourself before describing tables or
         writing SQL — table names you have not seen here are guesses.
         """
-        return await engine.list_catalogs()
+        return filter_catalog_metadata(await engine.list_catalogs(), identity)
 
     @mcp.tool()
     @_instrumented("describe_table", identity, audit)
@@ -123,7 +123,9 @@ def create_server(
         # describe_table takes parts, not SQL — build the SELECT the allowlist
         # check understands so one code path guards both tools.
         check_tables_allowed(
-            f"SELECT 1 FROM {catalog}.{schema}.{table}", "trino", identity
+            f"SELECT 1 FROM {catalog}.{schema}.{table}",
+            engine.dialect().sqlglot_dialect,
+            identity,
         )
 
     return mcp
