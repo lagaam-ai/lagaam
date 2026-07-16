@@ -12,16 +12,23 @@ from mcp.shared.memory import (
     create_connected_server_and_client_session as client_session,
 )
 
+from lagaam.core.audit import AuditLog
 from lagaam.core.budget import QueryBudget
+from lagaam.core.identity import AgentIdentity
 from lagaam.core.ports import QueryEngine
 from lagaam.server import create_server
 
 
 @asynccontextmanager
 async def lagaam_client(
-    engine: QueryEngine, budget: QueryBudget | None = None
+    engine: QueryEngine,
+    budget: QueryBudget | None = None,
+    identity: AgentIdentity | None = None,
+    audit: AuditLog | None = None,
 ) -> AsyncIterator[ClientSession]:
     """A real MCP client connected in-memory to a Lagaam server over `engine`."""
-    server = create_server(engine, budget=budget or QueryBudget())
+    server = create_server(
+        engine, budget=budget or QueryBudget(), identity=identity, audit=audit
+    )
     async with client_session(server._mcp_server) as client:
         yield client
