@@ -80,3 +80,21 @@ async def test_no_allowlist_leaves_the_agent_unrestricted() -> None:
             "query_data", {"sql": "SELECT ssn FROM anything.at.all"}
         )
         assert not result.isError
+
+
+async def test_list_catalogs_shows_only_the_grant() -> None:
+    # The fake exposes tpch.tiny.{orders,lineitem}; the grant covers one.
+    identity = _agent({"tpch.tiny.orders"})
+    async with lagaam_client(FakeQueryEngine(), identity=identity) as client:
+        result = await client.call_tool("list_catalogs", {})
+        assert not result.isError
+        listing = result.content[0].text  # type: ignore[union-attr]
+        assert "orders" in listing
+        assert "lineitem" not in listing
+
+
+async def test_list_catalogs_unrestricted_shows_everything() -> None:
+    async with lagaam_client(FakeQueryEngine(), identity=_agent(None)) as client:
+        result = await client.call_tool("list_catalogs", {})
+        listing = result.content[0].text  # type: ignore[union-attr]
+        assert "orders" in listing and "lineitem" in listing

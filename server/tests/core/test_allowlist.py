@@ -7,9 +7,10 @@ cannot resolve is denied, never waved through.
 
 import pytest
 
-from lagaam.core.allowlist import check_tables_allowed
+from lagaam.core.allowlist import check_tables_allowed, filter_catalog_metadata
 from lagaam.core.errors import TableAccessDeniedError
 from lagaam.core.identity import AgentIdentity
+from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
 
 def guard(sql: str, allowed: set[str] | None) -> None:
@@ -119,3 +120,43 @@ def test_table_function_with_empty_name_is_denied() -> None:
             "SELECT * FROM TABLE(system.something(x => 1))",
             allowed={"tpch.tiny.orders"},
         )
+
+
+# --- metadata filtering ---------------------------------------------------
+
+
+def _metadata() -> CatalogMetadata:
+    return CatalogMetadata(
+        catalogs=[
+            CatalogInfo(
+                name="tpch",
+                schemas=[
+                    SchemaInfo(name="tiny", tables=["orders", "lineitem"]),
+                    SchemaInfo(name="secret", tables=["pii"]),
+                ],
+                truncated=True,
+            ),
+            CatalogInfo(name="mysql", schemas=[SchemaInfo(name="app", tables=["users"])]),
+        ]
+    )
+
+
+def test_no_allowlist_returns_metadata_unfiltered() -> None:
+    identity = AgentIdentity(name="agent-1")
+    assert filter_catalog_metadata(_metadata(), identity) == _metadata()
+
+
+def test_filter_drops_tables_schemas_and_catalogs_outside_the_grant() -> None:
+    identity = AgentIdentity(name="agent-1", allowed_tables={"TPCH.tiny.Orders"})
+    filtered = filter_catalog_metadata(_metadata(), identity)
+    assert len(filtered.catalogs) == 1
+    catalog = filtered.catalogs[0]
+    assert catalog.name == "tpch"
+    assert catalog.truncated is True
+    assert [s.name for s in catalog.schemas] == ["tiny"]
+    assert catalog.schemas[0].tables == ["orders"]
+
+
+def test_empty_allowlist_hides_everything() -> None:
+    identity = AgentIdentity(name="agent-1", allowed_tables=set())
+    assert filter_catalog_metadata(_metadata(), identity).catalogs == []
