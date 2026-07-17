@@ -27,10 +27,12 @@ class CachingQueryEngine:
         engine: QueryEngine,
         ttl_seconds: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
+        max_entries: int = 512,
     ) -> None:
         self._engine = engine
         self._ttl = ttl_seconds
         self._clock = clock
+        self._max_entries = max_entries
         self._catalogs: tuple[float, CatalogMetadata] | None = None
         self._tables: dict[tuple[str, str, str], tuple[float, TableSchema]] = {}
 
@@ -67,5 +69,17 @@ class CachingQueryEngine:
         if cached is not None and self._fresh(cached[0]):
             return cached[1]
         result = await self._engine.describe_table(catalog, schema, table)
+        self._evict_for(key)
         self._tables[key] = (self._clock(), result)
         return result
+
+    def _evict_for(self, key: tuple[str, str, str]) -> None:
+        """Keep the table cache bounded: drop dead entries, then oldest-first."""
+        if key in self._tables or len(self._tables) < self._max_entries:
+            return
+        self._tables = {
+            k: v for k, v in self._tables.items() if self._fresh(v[0])
+        }
+        while len(self._tables) >= self._max_entries:
+            # Insertion order approximates oldest-stored-first.
+            self._tables.pop(next(iter(self._tables)))

@@ -101,3 +101,45 @@ async def test_errors_are_not_cached(
         with pytest.raises(TableNotFoundError):
             await cached.describe_table("tpch", "tiny", "nope")
     assert backend.describe_calls == 2
+
+
+# --- bounded size ---------------------------------------------------------
+
+
+class AnyTableEngine(CountingEngine):
+    async def describe_table(self, catalog, schema, table):  # type: ignore[no-untyped-def]
+        self.describe_calls += 1
+        return await super(CountingEngine, self).describe_table(
+            "tpch", "tiny", "orders"
+        )
+
+
+async def test_table_cache_is_bounded(clock: FakeClock) -> None:
+    backend = AnyTableEngine()
+    cache = CachingQueryEngine(backend, clock=clock, max_entries=3)
+    for i in range(5):
+        await cache.describe_table("c", "s", f"t{i}")
+    assert len(cache._tables) == 3
+
+
+async def test_eviction_prefers_expired_entries(clock: FakeClock) -> None:
+    backend = AnyTableEngine()
+    cache = CachingQueryEngine(backend, ttl_seconds=300, clock=clock, max_entries=2)
+    await cache.describe_table("c", "s", "old")
+    clock.now += 301  # "old" expires
+    await cache.describe_table("c", "s", "live")
+    await cache.describe_table("c", "s", "new")
+    assert ("c", "s", "old") not in cache._tables
+    # The still-fresh entry survived the purge and stays served from cache.
+    calls = backend.describe_calls
+    await cache.describe_table("c", "s", "live")
+    assert backend.describe_calls == calls
+
+
+async def test_refreshing_a_cached_key_does_not_evict(clock: FakeClock) -> None:
+    backend = AnyTableEngine()
+    cache = CachingQueryEngine(backend, clock=clock, max_entries=2)
+    await cache.describe_table("c", "s", "a")
+    await cache.describe_table("c", "s", "b")
+    await cache.describe_table("c", "s", "a")
+    assert len(cache._tables) == 2
