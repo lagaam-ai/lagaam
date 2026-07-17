@@ -71,8 +71,8 @@ def create_server(
     budget = budget or QueryBudget()
     identity = identity or AgentIdentity(name="anonymous")
     audit = audit or AuditLog()
-    # The row cap actually applied: the budget's, or the default if unset.
-    row_cap = budget.max_rows or _DEFAULT_ROW_CAP
+    # Returned-row cap: distinct from max_rows, which gates rows *scanned*.
+    row_cap = budget.max_returned_rows or _DEFAULT_ROW_CAP
     mcp = FastMCP("lagaam", stateless_http=True, json_response=True)
 
     @mcp.tool()

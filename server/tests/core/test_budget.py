@@ -93,15 +93,28 @@ def test_budget_rejects_nonpositive_limits() -> None:
 def test_from_env_reads_all_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LAGAAM_MAX_SCAN_BYTES", "5368709120")
     monkeypatch.setenv("LAGAAM_MAX_ROWS", "1000000")
+    monkeypatch.setenv("LAGAAM_MAX_RETURNED_ROWS", "500")
     monkeypatch.setenv("LAGAAM_QUERY_TIMEOUT", "30")
     budget = QueryBudget.from_env()
     assert budget.max_scan_bytes == 5368709120
     assert budget.max_rows == 1_000_000
+    assert budget.max_returned_rows == 500
     assert budget.timeout_seconds == 30.0
 
 
+def test_scan_row_budget_does_not_gate_returned_rows() -> None:
+    # max_rows is a scan-estimate gate; the returned-row cap is its own knob.
+    budget = QueryBudget(max_rows=1_000_000)
+    assert budget.max_returned_rows is None
+
+
 def test_from_env_defaults_to_no_limits(monkeypatch: pytest.MonkeyPatch) -> None:
-    for var in ("LAGAAM_MAX_SCAN_BYTES", "LAGAAM_MAX_ROWS", "LAGAAM_QUERY_TIMEOUT"):
+    for var in (
+        "LAGAAM_MAX_SCAN_BYTES",
+        "LAGAAM_MAX_ROWS",
+        "LAGAAM_MAX_RETURNED_ROWS",
+        "LAGAAM_QUERY_TIMEOUT",
+    ):
         monkeypatch.delenv(var, raising=False)
     budget = QueryBudget.from_env()
     assert budget == QueryBudget()
