@@ -36,19 +36,6 @@ def test_high_confidence_requires_a_byte_number() -> None:
         CostEstimate(scanned_bytes=None, row_estimate=5, confidence="high")
 
 
-def test_summary_reads_as_agent_facing_prose() -> None:
-    est = CostEstimate(scanned_bytes=48 * 1024**3, row_estimate=2_000_000)
-    text = est.summary()
-    assert "48" in text and "GB" in text
-    assert "2,000,000" in text or "2000000" in text
-
-
-def test_summary_flags_unknown_when_low_confidence() -> None:
-    est = CostEstimate(scanned_bytes=None, row_estimate=None)
-    text = est.summary().lower()
-    assert "unknown" in text or "no estimate" in text
-
-
 @pytest.mark.parametrize(
     "raw, expected",
     [

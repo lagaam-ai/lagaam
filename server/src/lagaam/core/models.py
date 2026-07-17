@@ -72,15 +72,6 @@ class CostEstimate(BaseModel):
             object.__setattr__(self, "confidence", resolved)
         return self
 
-    def summary(self) -> str:
-        """One agent-facing line: the quotation in words it can act on."""
-        from lagaam.core.cost import human_bytes
-
-        rows = f"{self.row_estimate:,}" if self.row_estimate is not None else "unknown"
-        if self.scanned_bytes is None:
-            return f"No scan estimate available (rows: {rows}); treat as high risk."
-        return f"Estimated scan {human_bytes(self.scanned_bytes)} (rows: {rows})."
-
 
 class QueryResult(BaseModel):
     """Rows returned to the agent, capped to a row budget.
