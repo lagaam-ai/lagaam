@@ -1,22 +1,89 @@
 # Lagaam
 
-A governed MCP server between your AI agents and your lakehouse. Every query
-is schema-grounded, priced *before* it runs, checked against a budget, and
-audited — and every rejection tells the agent how to fix its SQL.
+**Stop your agent from running the $500 query.** Lagaam is a governed MCP
+server that sits between your AI agents and your lakehouse (Trino today,
+Pinot next). Every query is schema-grounded, priced *before* it runs,
+checked against a budget, and audited — and every rejection tells the agent
+exactly how to fix its SQL.
 
-Trino today; Pinot next.
+![Lagaam demo: SELECT * rejected, an oversized join blocked pre-execution, a scoped query running](docs/demo.gif)
+
+*Real session, real Trino, nothing mocked — reproduce it with
+`uv run --project server python examples/demo.py`.*
+
+## The problem
+
+Agents write syntactically-valid, catastrophic SQL. A missing partition
+filter turns into a full scan over a petabyte table; one retry loop burns a
+day's warehouse budget in minutes; a `SELECT *` drags 40 columns into a
+context window that needed 2. The usual fix is to not give agents database
+access at all.
+
+Lagaam gives them access with reins on:
+
+- **Cost is a quotation, not a bill.** Every query is priced from the
+  engine's own plan before execution — `EXPLAIN (TYPE IO)` for the bytes it
+  would scan, `EXPLAIN (TYPE LOGICAL)` for the widest row count any operator
+  would build (the number a cross join blows and a `LIMIT` cannot hide).
+  Over budget → blocked, with the number and the fix.
+- **Un-estimable means no.** No table statistics, a self-join that breaks
+  the estimate, a passthrough the planner can't see — the gate fails safe
+  instead of hoping.
+- **Read-only, enforced in the AST.** Single `SELECT` only. No DDL/DML, no
+  multi-statement injection, no `SELECT *`, no table-function passthrough,
+  and a `LIMIT` is injected when missing. Validated SQL is re-rendered, so
+  what runs is exactly what was checked.
+- **Agents ground themselves.** `list_catalogs` and `describe_table` return
+  exact names, types, and row estimates — scoped to the agent's table grant,
+  so the agent never learns names it isn't allowed to touch.
+- **Results are verified before they're trusted.** Zero rows, truncated
+  pages, all-NULL columns — the agent gets a warning with a next action, not
+  a silently misleading answer.
+- **Every call is audited.** One JSONL line per tool call: who, what,
+  allowed or denied, and why.
+
+## Catch rate
+
+11 queries an LLM agent plausibly writes — full scans, `SELECT *`, DDL,
+injection attempts, un-estimable joins, out-of-grant reads. A raw MCP
+wrapper submits all of them to the engine. Lagaam stops **11/11 before
+execution** while the well-scoped control query runs untouched.
+Reproduce: [`benchmarks/catch_rate.py`](benchmarks/catch_rate.py) →
+[results](benchmarks/results.md).
 
 ## Quickstart
 
 ```bash
-docker compose -f examples/docker-compose.yml --profile trino up -d
+git clone https://github.com/lagaam-ai/lagaam && cd lagaam
+docker compose -f examples/docker-compose.yml --profile trino up -d   # demo warehouse
 cd server && uv sync
 LAGAAM_ALLOWED_TABLES=tpch.tiny.orders,tpch.tiny.lineitem \
-  uv run python -m lagaam
+  uv run python -m lagaam                                             # MCP server on stdio
 ```
 
-The agent gets three tools — `list_catalogs`, `describe_table`, `query_data` —
-and cannot reach the engine any other way.
+Or point it at the Trino you already have with `TRINO_HOST` / `TRINO_PORT` /
+`TRINO_USER`.
+
+Wire it into any MCP client (Claude Code, Claude Desktop, or your own agent):
+
+```json
+{
+  "mcpServers": {
+    "lagaam": {
+      "command": "uv",
+      "args": ["run", "--project", "/path/to/lagaam/server", "python", "-m", "lagaam"],
+      "env": {
+        "TRINO_HOST": "localhost",
+        "LAGAAM_MAX_SCAN_BYTES": "5368709120",
+        "LAGAAM_ALLOWED_TABLES": "hive.sales.orders,hive.sales.customers"
+      }
+    }
+  }
+}
+```
+
+The agent gets three tools — `list_catalogs`, `describe_table`,
+`query_data` — and cannot reach the engine any other way.
 
 ## Configuration
 
@@ -53,9 +120,10 @@ kind that runs for $500.
 
 ## How it works
 
-A `QueryEngine` port with a Trino adapter. Every `query_data` call walks one
-pipeline: **validate (sqlglot AST) → table allowlist → cost quotation → budget
-gate → execute (row cap + timeout) → verify → audit**.
+A `QueryEngine` port with a Trino adapter (native Pinot adapter is next).
+Every `query_data` call walks one pipeline: **validate (sqlglot AST) → table
+allowlist → cost quotation → budget gate → execute (row cap + timeout) →
+verify → audit**.
 
 The quote is the engine's own plan, not a guess from the SQL text:
 `EXPLAIN (TYPE IO)` prices the bytes a query would scan, and
@@ -64,5 +132,14 @@ build — the number a cross join blows and a `LIMIT` cannot hide.
 
 Details in [docs/architecture.md](docs/architecture.md); the longer story in
 [docs/vision.md](docs/vision.md).
+
+## Status
+
+`v0.1.2` — Trino adapter, schema tools, plan-based cost guard, query
+budgets, read-only enforcement, per-agent allowlists, result verification,
+audit log. 381 unit + 87 integration tests, mypy strict. On deck
+([roadmap](docs/roadmap.md)): native Pinot adapter (realtime tables), then
+a Kubernetes control plane — agents as CRDs with token/dollar budgets and
+kill switches.
 
 Apache 2.0.
