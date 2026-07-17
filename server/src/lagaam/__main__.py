@@ -3,7 +3,8 @@
 Usage: uv run python -m lagaam
 Env: TRINO_HOST (localhost), TRINO_PORT (8080), TRINO_USER (lagaam),
      LAGAAM_METADATA_TTL (seconds, 300), LAGAAM_MAX_SCAN_BYTES,
-     LAGAAM_MAX_ROWS, LAGAAM_QUERY_TIMEOUT (all unset = no limit),
+     LAGAAM_MAX_ROWS (scan estimate), LAGAAM_QUERY_TIMEOUT (unset = no limit),
+     LAGAAM_MAX_RETURNED_ROWS (returned-row cap, default 1000),
      LAGAAM_AGENT_NAME, LAGAAM_ALLOWED_TABLES (comma list, unset = all),
      LAGAAM_AUDIT_LOG (file path, unset = stderr)
 """

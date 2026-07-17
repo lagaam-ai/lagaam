@@ -21,10 +21,16 @@ from lagaam.core.models import CostEstimate
 
 
 class QueryBudget(BaseModel):
-    """Per-query ceilings. Unset (None) means that dimension is not gated."""
+    """Per-query ceilings. Unset (None) means that dimension is not gated.
+
+    ``max_rows`` gates rows the engine would *scan* (pre-execution estimate);
+    ``max_returned_rows`` caps rows *returned* to the agent (at execution).
+    """
 
     max_scan_bytes: int | None = Field(default=None, gt=0)
     max_rows: int | None = Field(default=None, gt=0)
+    # Unset falls back to the server's default row cap, never unlimited.
+    max_returned_rows: int | None = Field(default=None, gt=0)
     # Enforced at execution time (U6); validated here so it is coherent.
     timeout_seconds: float | None = Field(default=None, gt=0)
 
@@ -34,6 +40,7 @@ class QueryBudget(BaseModel):
         return cls(
             max_scan_bytes=_int_env("LAGAAM_MAX_SCAN_BYTES"),
             max_rows=_int_env("LAGAAM_MAX_ROWS"),
+            max_returned_rows=_int_env("LAGAAM_MAX_RETURNED_ROWS"),
             timeout_seconds=_float_env("LAGAAM_QUERY_TIMEOUT"),
         )
 

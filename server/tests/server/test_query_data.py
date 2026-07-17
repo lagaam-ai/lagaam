@@ -102,7 +102,7 @@ async def test_injected_limit_is_cap_plus_one_for_truncation_detection() -> None
     engine = FakeQueryEngine(
         estimate=CostEstimate(scanned_bytes=1000, row_estimate=10)
     )
-    budget = QueryBudget(max_rows=50)
+    budget = QueryBudget(max_returned_rows=50)
     async with lagaam_client(engine, budget=budget) as client:
         await client.call_tool(
             "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
@@ -153,3 +153,16 @@ async def test_engine_query_failure_reaches_agent_as_a_hint() -> None:
         text = result.content[0].text  # type: ignore[union-attr]
         assert "describe_table" in text
         assert "Traceback" not in text
+
+
+async def test_scan_row_budget_does_not_shrink_the_returned_row_cap() -> None:
+    # max_rows gates the scan estimate; the LIMIT comes from the default cap.
+    engine = FakeQueryEngine(
+        estimate=CostEstimate(scanned_bytes=1000, row_estimate=10)
+    )
+    budget = QueryBudget(max_rows=50)
+    async with lagaam_client(engine, budget=budget) as client:
+        await client.call_tool(
+            "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
+        )
+    assert "LIMIT 1001" in engine.executed[0].upper()
