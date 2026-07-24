@@ -22,7 +22,7 @@ from lagaam.core.errors import (
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
-from lagaam.core.scans import has_repeated_scan
+from lagaam.core.scans import has_unpriceable_shape
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
@@ -232,9 +232,9 @@ class TrinoEngine:
         )
 
     def _estimate_cost(self, sql: str) -> CostEstimate:
-        # A table scanned by several operators is billed once in the IO plan;
-        # if so, the byte sum undercounts — don't vouch for it.
-        if has_repeated_scan(sql, TRINO_DIALECT_CARD.sqlglot_dialect):
+        # Repeated scans, cross joins, and row generators all break the IO
+        # plan's byte sum — don't vouch for a quote it would misprice.
+        if has_unpriceable_shape(sql, TRINO_DIALECT_CARD.sqlglot_dialect):
             return CostEstimate(confidence="low")
         # TYPE IO plans the query without running it; NEVER use ANALYZE here.
         with self._connect() as conn:
