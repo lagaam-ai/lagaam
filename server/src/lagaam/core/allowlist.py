@@ -10,6 +10,7 @@ import sqlglot
 from sqlglot import exp
 
 from lagaam.core.errors import TableAccessDeniedError
+from lagaam.core.identifiers import IdentifierError, normalize_grant, table_fqn
 from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
@@ -35,18 +36,35 @@ def check_tables_allowed(
         # A bare reference to a CTE is a local alias, not a base table.
         if table.name.lower() in ctes and not table.catalog and not table.db:
             continue
-        if not table.catalog or not table.db:
+        rendered = table.sql(dialect=dialect)
+        try:
+            fqn = table_fqn(table)
+        except IdentifierError as exc:
             raise TableAccessDeniedError(
-                f"Table '{table.name}' is not fully qualified, so access "
-                "cannot be checked. Use catalog.schema.table names."
-            )
-        fqn = f"{table.catalog}.{table.db}.{table.name}".lower()
+                f"Table '{rendered}' cannot be checked against your grant "
+                f"({exc}). Use plain catalog.schema.table names."
+            ) from exc
         if fqn not in allowed:
             raise TableAccessDeniedError(
-                f"Access to {table.catalog}.{table.db}.{table.name} is not "
-                "permitted for this agent. Query only the tables in your "
-                "grant; call list_catalogs to see them."
+                f"Access to {rendered} is not permitted for this agent. "
+                "Query only the tables in your grant; call list_catalogs "
+                "to see them."
             )
+
+
+def _engine_name_allowed(
+    catalog: str, schema: str, table: str, allowed: set[str]
+) -> bool:
+    """Is this engine-reported name in the grant?
+
+    Engine names are already resolved objects, so they match a grant only when
+    they are exactly the lowercase ASCII form a grant can express — a physical
+    ``Orders`` is a different table from ``orders`` and must stay hidden.
+    """
+    parts = (catalog, schema, table)
+    if not all(p and p.isascii() and p == p.lower() for p in parts):
+        return False
+    return ".".join(parts) in allowed
 
 
 def filter_catalog_metadata(
@@ -69,7 +87,7 @@ def filter_catalog_metadata(
             tables = [
                 t
                 for t in schema.tables
-                if f"{catalog.name}.{schema.name}.{t}".lower() in allowed
+                if _engine_name_allowed(catalog.name, schema.name, t, allowed)
             ]
             if tables:
                 schemas.append(SchemaInfo(name=schema.name, tables=tables))

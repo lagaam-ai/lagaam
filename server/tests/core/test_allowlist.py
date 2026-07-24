@@ -6,6 +6,7 @@ cannot resolve is denied, never waved through.
 """
 
 import pytest
+from pydantic import ValidationError
 
 from lagaam.core.allowlist import check_tables_allowed, filter_catalog_metadata
 from lagaam.core.errors import TableAccessDeniedError
@@ -122,6 +123,66 @@ def test_table_function_with_empty_name_is_denied() -> None:
         )
 
 
+# --- name-shape bypasses --------------------------------------------------
+# Each of these once matched a grant while the engine resolved a different
+# table, because the check compared a lossy string projection of the name.
+
+
+def test_four_part_name_is_denied() -> None:
+    # sqlglot maps 4 parts onto catalog/db/name by dropping the middle one, so
+    # this once checked 'tpch.tiny.orders' and ran against a nested namespace.
+    with pytest.raises(TableAccessDeniedError, match="name parts"):
+        guard(
+            "SELECT ssn FROM tpch.tiny.secret.orders",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
+def test_four_part_name_with_allowed_prefix_is_denied() -> None:
+    with pytest.raises(TableAccessDeniedError, match="name parts"):
+        guard(
+            "SELECT ssn FROM tpch.tiny.orders.extra",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
+def test_quoted_identifier_keeps_its_case() -> None:
+    # Trino resolves "Orders" as a distinct object from orders; folding it
+    # would authorize one table and run the other.
+    with pytest.raises(TableAccessDeniedError, match="Orders"):
+        guard('SELECT x FROM tpch.tiny."Orders"', allowed={"tpch.tiny.orders"})
+
+
+def test_fully_quoted_uppercase_name_is_denied() -> None:
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            'SELECT x FROM "TPCH"."TINY"."ORDERS"', allowed={"tpch.tiny.orders"}
+        )
+
+
+def test_quoted_lowercase_name_still_matches() -> None:
+    # Quoting alone must not deny: "orders" and orders are the same object.
+    guard('SELECT x FROM tpch.tiny."orders"', allowed={"tpch.tiny.orders"})
+
+
+def test_non_ascii_identifier_is_denied() -> None:
+    # U+212A KELVIN SIGN lowercases to ASCII 'k' in Python but not in Trino,
+    # so a folded match would name a different table than the SQL renders.
+    with pytest.raises(TableAccessDeniedError, match="non-ASCII"):
+        guard("SELECT x FROM tpch.tiny.orderK", allowed={"tpch.tiny.orderk"})
+
+
+def test_non_ascii_grant_is_rejected_at_construction() -> None:
+    # A grant that can never match is a configuration bug, not a silent denial.
+    with pytest.raises(ValidationError, match="non-ASCII"):
+        AgentIdentity(name="agent-1", allowed_tables={"tpch.tiny.orderK"})
+
+
+def test_malformed_grant_is_rejected_at_construction() -> None:
+    with pytest.raises(ValidationError, match="catalog.schema.table"):
+        AgentIdentity(name="agent-1", allowed_tables={"tiny.orders"})
+
+
 # --- metadata filtering ---------------------------------------------------
 
 
@@ -160,3 +221,19 @@ def test_filter_drops_tables_schemas_and_catalogs_outside_the_grant() -> None:
 def test_empty_allowlist_hides_everything() -> None:
     identity = AgentIdentity(name="agent-1", allowed_tables=set())
     assert filter_catalog_metadata(_metadata(), identity).catalogs == []
+
+
+def test_filter_hides_a_physical_table_whose_case_differs_from_the_grant() -> None:
+    # A grant for 'orders' does not cover a physically distinct "Orders";
+    # showing it would ground the agent on a table it cannot query.
+    metadata = CatalogMetadata(
+        catalogs=[
+            CatalogInfo(
+                name="tpch",
+                schemas=[SchemaInfo(name="tiny", tables=["Orders", "orders"])],
+            )
+        ]
+    )
+    identity = AgentIdentity(name="agent-1", allowed_tables={"tpch.tiny.orders"})
+    filtered = filter_catalog_metadata(metadata, identity)
+    assert filtered.catalogs[0].schemas[0].tables == ["orders"]
