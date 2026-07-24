@@ -20,6 +20,15 @@ from lagaam.core.errors import BudgetExceededError
 from lagaam.core.models import CostEstimate
 
 
+# A gate that opens when unconfigured is not a gate: env-built budgets get
+# these ceilings rather than None. Generous enough not to block real work,
+# small enough that an unconfigured server cannot run away with the bill.
+DEFAULT_MAX_SCAN_BYTES = 50 * 1024**3  # 50 GiB
+DEFAULT_TIMEOUT_SECONDS = 300.0
+# Rows are materialized in this process, so the ceiling is memory, not policy.
+MAX_RETURNED_ROWS_CEILING = 100_000
+
+
 class QueryBudget(BaseModel):
     """Per-query ceilings. Unset (None) means that dimension is not gated.
 
@@ -30,18 +39,26 @@ class QueryBudget(BaseModel):
     max_scan_bytes: int | None = Field(default=None, gt=0)
     max_rows: int | None = Field(default=None, gt=0)
     # Unset falls back to the server's default row cap, never unlimited.
-    max_returned_rows: int | None = Field(default=None, gt=0)
+    max_returned_rows: int | None = Field(
+        default=None, gt=0, le=MAX_RETURNED_ROWS_CEILING
+    )
     # Enforced at execution time (U6); validated here so it is coherent.
     timeout_seconds: float | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls) -> "QueryBudget":
-        """Server-wide default budget from env; per-agent budgets arrive in U7."""
+        """Server-wide default budget from env; per-agent budgets arrive in U7.
+
+        Scan bytes and timeout fall back to defaults rather than to unlimited,
+        so a server started with no LAGAAM_* vars still has a gate.
+        """
         return cls(
-            max_scan_bytes=_int_env("LAGAAM_MAX_SCAN_BYTES"),
+            max_scan_bytes=_int_env("LAGAAM_MAX_SCAN_BYTES")
+            or DEFAULT_MAX_SCAN_BYTES,
             max_rows=_int_env("LAGAAM_MAX_ROWS"),
             max_returned_rows=_int_env("LAGAAM_MAX_RETURNED_ROWS"),
-            timeout_seconds=_float_env("LAGAAM_QUERY_TIMEOUT"),
+            timeout_seconds=_float_env("LAGAAM_QUERY_TIMEOUT")
+            or DEFAULT_TIMEOUT_SECONDS,
         )
 
 

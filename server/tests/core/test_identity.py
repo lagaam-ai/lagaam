@@ -2,6 +2,7 @@
 
 import pytest
 
+from lagaam.core.identifiers import IdentifierError
 from lagaam.core.identity import AgentIdentity
 
 
@@ -15,11 +16,23 @@ def test_from_env_parses_a_comma_list(monkeypatch: pytest.MonkeyPatch) -> None:
     assert identity.allowed_tables == {"tpch.tiny.orders", "tpch.tiny.lineitem"}
 
 
-def test_unset_allowlist_is_none_not_empty(
+def test_unset_allowlist_refuses_to_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A gate that opens when unconfigured is not a gate: unrestricted access
+    # has to be asked for, never inherited from an empty environment.
+    monkeypatch.delenv("LAGAAM_ALLOWED_TABLES", raising=False)
+    monkeypatch.delenv("LAGAAM_ALLOW_ALL_TABLES", raising=False)
+    with pytest.raises(IdentifierError, match="No table grant configured"):
+        AgentIdentity.from_env()
+
+
+def test_explicit_opt_out_is_unrestricted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("LAGAAM_ALLOWED_TABLES", raising=False)
     monkeypatch.delenv("LAGAAM_AGENT_NAME", raising=False)
+    monkeypatch.setenv("LAGAAM_ALLOW_ALL_TABLES", "true")
     identity = AgentIdentity.from_env()
     assert identity.allowed_tables is None  # unrestricted, not "no tables"
     assert identity.name == "anonymous"

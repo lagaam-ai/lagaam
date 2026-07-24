@@ -5,8 +5,15 @@ shrink the query (add a filter, a LIMIT), the same way the domain errors do.
 """
 
 import pytest
+from pydantic import ValidationError
 
-from lagaam.core.budget import QueryBudget, enforce_budget
+from lagaam.core.budget import (
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETURNED_ROWS_CEILING,
+    QueryBudget,
+    enforce_budget,
+)
 from lagaam.core.errors import BudgetExceededError
 from lagaam.core.models import CostEstimate
 
@@ -108,7 +115,11 @@ def test_scan_row_budget_does_not_gate_returned_rows() -> None:
     assert budget.max_returned_rows is None
 
 
-def test_from_env_defaults_to_no_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_falls_back_to_a_real_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unconfigured server still has a gate: scan bytes and timeout default
+    # to finite ceilings rather than to unlimited.
     for var in (
         "LAGAAM_MAX_SCAN_BYTES",
         "LAGAAM_MAX_ROWS",
@@ -117,7 +128,17 @@ def test_from_env_defaults_to_no_limits(monkeypatch: pytest.MonkeyPatch) -> None
     ):
         monkeypatch.delenv(var, raising=False)
     budget = QueryBudget.from_env()
-    assert budget == QueryBudget()
+    assert budget.max_scan_bytes == DEFAULT_MAX_SCAN_BYTES
+    assert budget.timeout_seconds == DEFAULT_TIMEOUT_SECONDS
+    assert budget.max_rows is None  # row scan stays ungated by default
+    assert budget.max_returned_rows is None  # server applies its own row cap
+
+
+def test_returned_row_cap_is_bounded_above() -> None:
+    # Returned rows are materialized in this process, so an unbounded cap is
+    # an OOM of the gate itself.
+    with pytest.raises(ValidationError):
+        QueryBudget(max_returned_rows=MAX_RETURNED_ROWS_CEILING + 1)
 
 
 def test_from_env_rejects_garbage_with_a_clear_message(
