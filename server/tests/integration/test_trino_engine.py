@@ -58,10 +58,12 @@ async def test_estimate_cost_quotes_a_real_scan(engine: TrinoEngine) -> None:
 
 
 async def test_count_star_is_not_quoted_as_free(engine: TrinoEngine) -> None:
-    # Regression: count(*) scans the whole table but Trino reports 0 bytes.
-    # Must NOT come back as high-confidence 0 — that would slip past a budget.
+    # count(*) scans the whole table but reads no columns, so Trino reports 0
+    # bytes. Quoting that as free slips past any budget; blocking it outright
+    # denies a query no rewrite can fix. It gets priced from its rows.
     est = await engine.estimate_cost("SELECT count(*) FROM tpch.sf1.orders")
-    assert est.confidence == "low"
+    assert est.scanned_bytes is not None and est.scanned_bytes > 0
+    assert est.row_estimate == 1_500_000
 
 
 async def test_self_join_is_not_quoted_as_a_single_scan(

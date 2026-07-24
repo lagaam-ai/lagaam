@@ -124,10 +124,10 @@ def test_infinity_is_rejected_not_summed_into_a_giant_number() -> None:
         assert parse_io_estimate(payload).confidence == "low"
 
 
-def test_columnless_scan_is_not_quoted_as_zero_bytes() -> None:
-    # count(*) / SELECT 1 project no columns: Trino reports 0 bytes for a full
-    # scan of 1.5M rows. A 0-byte high-confidence quote would let an expensive
-    # aggregate slip past the budget — must degrade to low.
+def test_columnless_scan_is_priced_from_its_rows() -> None:
+    # count(*) projects no columns, so Trino reports 0 bytes over real rows.
+    # Quoting that as free would clear any budget; blocking it outright would
+    # deny a query no rewrite can fix. Price it from the row count instead.
     payload = json.dumps(
         {
             "inputTableColumnInfos": [
@@ -137,8 +137,9 @@ def test_columnless_scan_is_not_quoted_as_zero_bytes() -> None:
         }
     )
     est = parse_io_estimate(payload)
-    assert est.confidence == "low"
-    assert est.scanned_bytes is None
+    assert est.confidence == "high"
+    assert est.scanned_bytes == 1_500_000
+    assert est.row_estimate == 1_500_000
 
 
 def test_zero_bytes_is_never_trustworthy() -> None:

@@ -185,3 +185,32 @@ async def test_engine_supplied_warnings_survive_verification() -> None:
         )
     warnings = (result.structuredContent or {})["warnings"]
     assert "partition statistics are stale" in warnings
+
+
+async def test_count_star_clears_a_budget_it_fits() -> None:
+    # Trino reports 0 bytes for count(*) because it reads no columns, not
+    # because it reads no data. Blocking it left the agent with a denial no
+    # rewrite could fix, so the row count prices it instead.
+    engine = FakeQueryEngine(
+        estimate=CostEstimate(scanned_bytes=15_000, row_estimate=15_000)
+    )
+    async with lagaam_client(
+        engine, budget=QueryBudget(max_scan_bytes=1_000_000)
+    ) as client:
+        result = await client.call_tool(
+            "query_data", {"sql": "SELECT count(*) FROM tpch.tiny.orders"}
+        )
+    assert not result.isError
+
+
+async def test_count_star_over_budget_is_still_blocked() -> None:
+    engine = FakeQueryEngine(
+        estimate=CostEstimate(scanned_bytes=5_000_000_000, row_estimate=5_000_000_000)
+    )
+    async with lagaam_client(
+        engine, budget=QueryBudget(max_scan_bytes=1_000_000)
+    ) as client:
+        result = await client.call_tool(
+            "query_data", {"sql": "SELECT count(*) FROM tpch.tiny.orders"}
+        )
+    assert result.isError

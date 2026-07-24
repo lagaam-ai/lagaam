@@ -104,15 +104,63 @@ def test_join_with_a_using_clause_is_priceable() -> None:
     )
 
 
-def test_unnest_generator_is_unpriceable() -> None:
-    # UNNEST contributes no inputTableColumnInfos entry, so it is invisible to
-    # the byte sum: a billion generated rows quote as free.
-    assert unpriceable(
-        "SELECT n FROM UNNEST(sequence(1, 1000000000)) AS t(n)"
+# --- a product is what the predicate does, not how the join is spelled ----
+
+
+def test_join_on_a_constant_is_unpriceable() -> None:
+    # ON 1=1 is a cartesian product wearing a JOIN..ON costume: both inputs
+    # are scanned once, so the byte sum is correct and says nothing.
+    assert unpriceable("SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON 1 = 1")
+    assert unpriceable("SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON true")
+
+
+def test_join_on_an_inequality_is_unpriceable() -> None:
+    # A nested loop: every row of one side compared against every row of the
+    # other, with no key to hash or merge on.
+    for predicate in ("a.k <> b.k", "a.k > b.k", "a.k BETWEEN b.lo AND b.hi"):
+        assert unpriceable(
+            f"SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON {predicate}"
+        )
+
+
+def test_outer_join_on_a_constant_is_unpriceable() -> None:
+    assert unpriceable("SELECT a.x FROM hive.s.t1 a LEFT JOIN hive.s.t2 b ON 1 = 1")
+
+
+def test_equi_join_with_extra_predicates_is_priceable() -> None:
+    assert not unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b "
+        "ON a.k = b.k AND a.d > b.d"
     )
 
 
-def test_unnest_against_a_real_table_is_unpriceable() -> None:
-    assert unpriceable(
-        "SELECT b.n FROM hive.s.big b CROSS JOIN UNNEST(sequence(1, 1000000)) AS t(n)"
+def test_comma_join_with_an_equality_in_where_is_priceable() -> None:
+    # Semantically the JOIN..ON form the planner rewrites it to; denying one
+    # while allowing the other would just teach the agent a syntax ritual.
+    assert not unpriceable(
+        "SELECT x FROM hive.s.a a, hive.s.b b WHERE a.k = b.k"
+    )
+
+
+def test_joining_a_constant_relation_is_priceable() -> None:
+    # `CROSS JOIN (SELECT 0.2 AS rate)` is how an agent parameterizes a query.
+    assert not unpriceable(
+        "SELECT a.x * r.rate FROM hive.s.t1 a CROSS JOIN (SELECT 0.2 AS rate) r"
+    )
+    assert not unpriceable(
+        "SELECT a.x FROM hive.s.t1 a CROSS JOIN (VALUES (1), (2)) AS v(n)"
+    )
+
+
+def test_unnest_of_a_generated_series_is_unpriceable() -> None:
+    # UNNEST contributes no inputTableColumnInfos entry, so it is invisible to
+    # the byte sum: a billion generated rows quote as free.
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 1000000000)) AS t(n)")
+
+
+def test_unnest_of_a_column_is_priceable() -> None:
+    # Reading a nested column expands rows of a table the plan already priced;
+    # it is the standard way to query an array column, not a generator.
+    assert not unpriceable(
+        "SELECT o.x FROM hive.s.orders o CROSS JOIN UNNEST(o.items) AS t(i)"
     )
