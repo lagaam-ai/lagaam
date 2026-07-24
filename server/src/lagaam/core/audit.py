@@ -6,6 +6,7 @@ raw session. Auditing is a side effect: a sink that fails must never take the
 query down with it, so record() swallows sink errors.
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,25 @@ def _file_sink(path: str) -> Sink:
             fh.write(line + "\n")
 
     return write
+
+
+# Agent SQL is unbounded (a big IN list is megabytes); a log line that size
+# is a disk-fill risk, not evidence. Enough to identify the query, plus a
+# hash so the full text is still matchable if it was captured elsewhere.
+_MAX_VALUE_CHARS = 4096
+
+
+def _truncated(detail: dict[str, Any]) -> dict[str, Any]:
+    """Cap oversized string values, marking what was cut."""
+    out: dict[str, Any] = {}
+    for key, value in detail.items():
+        if isinstance(value, str) and len(value) > _MAX_VALUE_CHARS:
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            out[key] = value[:_MAX_VALUE_CHARS]
+            out[f"{key}_truncated"] = {"chars": len(value), "sha256": digest}
+        else:
+            out[key] = value
+    return out
 
 
 class AuditLog:
@@ -51,16 +71,28 @@ class AuditLog:
         detail: dict[str, Any],
     ) -> None:
         """Emit one audit event. Never raises — auditing must not break serving."""
-        event = {
+        header = {
             "ts": self._clock(),
             "identity": identity,
             "tool": tool,
             "outcome": outcome,
-            "detail": detail,
         }
         try:
             # Compact, ASCII-safe, single line: JSONL invariant.
-            line = json.dumps(event, separators=(",", ":"), default=str)
+            line = json.dumps(
+                {**header, "detail": _truncated(detail)},
+                separators=(",", ":"),
+                default=str,
+            )
+        except Exception:
+            # An agent-influenced value must not be able to delete its own
+            # audit line: drop the detail, keep the event.
+            line = json.dumps(
+                {**header, "detail_error": "unserializable"},
+                separators=(",", ":"),
+                default=str,
+            )
+        try:
             self._sink(line)
         except Exception:
             # A failed audit write must not fail the request it describes.
