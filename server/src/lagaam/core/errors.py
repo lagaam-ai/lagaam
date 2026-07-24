@@ -10,6 +10,18 @@ class LagaamError(Exception):
     """Base for all domain errors."""
 
 
+class IdentifierError(LagaamError):
+    """A name that cannot be resolved to one comparable identifier."""
+
+
+class ConfigurationError(LagaamError):
+    """The server is misconfigured — an operator's problem, not an agent's.
+
+    Raised at startup, never mid-request, so it reaches a human on stderr
+    rather than an agent as a tool error.
+    """
+
+
 class TableNotFoundError(LagaamError):
     def __init__(self, catalog: str, schema: str, table: str) -> None:
         super().__init__(f"Table {catalog}.{schema}.{table} does not exist.")

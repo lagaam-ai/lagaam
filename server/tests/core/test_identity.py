@@ -2,7 +2,7 @@
 
 import pytest
 
-from lagaam.core.identifiers import IdentifierError
+from lagaam.core.errors import ConfigurationError
 from lagaam.core.identity import AgentIdentity
 
 
@@ -23,7 +23,7 @@ def test_unset_allowlist_refuses_to_start(
     # has to be asked for, never inherited from an empty environment.
     monkeypatch.delenv("LAGAAM_ALLOWED_TABLES", raising=False)
     monkeypatch.delenv("LAGAAM_ALLOW_ALL_TABLES", raising=False)
-    with pytest.raises(IdentifierError, match="No table grant configured"):
+    with pytest.raises(ConfigurationError, match="No table grant configured"):
         AgentIdentity.from_env()
 
 

@@ -102,7 +102,19 @@ def test_metadata_failures_use_message_not_repr() -> None:
             return "TrinoQueryError(message=..., query_id=20260716_abc)"
 
     assert _detail(FakeQueryError()) == "line 1:1: mismatched input"
-    assert _detail(OSError("connection refused")) == "connection refused"
+
+
+def test_unreachable_engine_does_not_name_the_host() -> None:
+    # OSError is what a refused connection raises, and its text carries the
+    # coordinator's address — internal topology the agent has no use for.
+    import trino.exceptions
+
+    from lagaam.adapters.trino.engine import _UNREACHABLE, _detail
+
+    leaky = OSError("connection refused to trino-coordinator.internal:8080")
+    assert _detail(leaky) == _UNREACHABLE
+    http = trino.exceptions.Http503Error("error 503: token=secret-value")
+    assert _detail(http) == _UNREACHABLE
 
 
 # --- SHOW STATS row counts ------------------------------------------------
@@ -167,4 +179,7 @@ async def test_http_error_becomes_a_domain_error() -> None:
     with pytest.raises(EngineError) as caught:
         await engine.list_catalogs()
     # The response body can carry credentials; the agent gets the class only.
+    from lagaam.adapters.trino.engine import _UNREACHABLE
+
     assert "secret-value" not in str(caught.value)
+    assert _UNREACHABLE in str(caught.value)

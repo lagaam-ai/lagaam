@@ -13,7 +13,8 @@ import trino.dbapi
 import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
-from lagaam.adapters.trino.explain import finite_number, parse_io_estimate
+from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.numbers import finite_number
 from lagaam.core.errors import (
     EngineError,
     LagaamError,
@@ -46,13 +47,16 @@ _HIDDEN_SCHEMAS = {"information_schema"}
 _ENGINE_FAILURES = (trino.exceptions.Error, trino.exceptions.HttpError, OSError)
 
 
+_UNREACHABLE = "the query engine is not reachable right now"
+
+
 def _detail(exc: Exception) -> str:
     """Agent-safe failure text: exc.message, never str(exc), which leaks
     the query id."""
-    if isinstance(exc, trino.exceptions.HttpError):
-        # HttpError.message carries the raw response body — a 401 body can
-        # hold token material, so the agent gets the status class only.
-        return "the query engine is not reachable right now"
+    if isinstance(exc, trino.exceptions.HttpError | OSError):
+        # An HttpError body can hold token material and an OSError names the
+        # host and port; neither is the agent's to see or act on.
+        return _UNREACHABLE
     return getattr(exc, "message", None) or str(exc)
 
 
@@ -255,9 +259,10 @@ class TrinoEngine:
             return None  # views and stats-less connectors have no SHOW STATS
         for row in rows:
             # The summary row has column_name None and carries row_count.
-            if row[0] is None:
+            if row and row[0] is None:
                 # SHOW STATS reports row_count as a DOUBLE, and a stats-less
-                # table reports NaN — round() raises on that.
-                count = finite_number(row[4])
+                # table reports NaN — round() raises on that. A connector may
+                # also return fewer columns than Trino's own five.
+                count = finite_number(row[4]) if len(row) > 4 else None
                 return round(count) if count is not None else None
         return None

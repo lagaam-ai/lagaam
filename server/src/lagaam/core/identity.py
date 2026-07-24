@@ -8,9 +8,17 @@ one agent per server process, which matches the pod-per-agent model.
 
 import os
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
-from lagaam.core.identifiers import IdentifierError, normalize_grant
+from lagaam.core.errors import ConfigurationError
+from lagaam.core.identifiers import normalize_grant
+
+
+def _first_message(exc: ValidationError) -> str:
+    """The rule that failed, without pydantic's location and URL noise."""
+    errors = exc.errors()
+    detail = errors[0]["msg"] if errors else str(exc)
+    return detail.removeprefix("Value error, ")
 
 _UNRESTRICTED_ENV = "LAGAAM_ALLOW_ALL_TABLES"
 
@@ -27,26 +35,26 @@ class AgentIdentity(BaseModel):
     means no tables at all. Unrestricted is never the default from env — a
     gate that opens when unconfigured is not a gate."""
 
+    # Frozen: the allowlist is an authorization input, so it must not be
+    # mutable after the validator has vouched for it.
+    model_config = ConfigDict(frozen=True, validate_assignment=True)
+
     name: str
-    allowed_tables: set[str] | None = None
+    allowed_tables: frozenset[str] | None = None
 
     @field_validator("allowed_tables")
     @classmethod
     def _grants_are_three_ascii_parts(
-        cls, value: set[str] | None
-    ) -> set[str] | None:
-        """Reject grants that could never match, at construction not at query."""
+        cls, value: frozenset[str] | None
+    ) -> frozenset[str] | None:
+        """Normalize at construction, so no query pays for it or trips on it."""
         if value is None:
             return None
-        for grant in value:
-            normalize_grant(grant)
-        return value
+        return frozenset(normalize_grant(grant) for grant in value)
 
-    def normalized_allowlist(self) -> set[str] | None:
+    def normalized_allowlist(self) -> frozenset[str] | None:
         """Case-folded allowlist for matching; None stays None."""
-        if self.allowed_tables is None:
-            return None
-        return {normalize_grant(t) for t in self.allowed_tables}
+        return self.allowed_tables
 
     @classmethod
     def from_env(cls) -> "AgentIdentity":
@@ -61,11 +69,17 @@ class AgentIdentity(BaseModel):
         )
         if raw is None:
             if not unrestricted:
-                raise IdentifierError(_NO_GRANT)
+                raise ConfigurationError(_NO_GRANT)
             allowed = None
         else:
-            allowed = {t.strip() for t in raw.split(",") if t.strip()}
-        return cls(
-            name=os.environ.get("LAGAAM_AGENT_NAME", "anonymous"),
-            allowed_tables=allowed,
-        )
+            allowed = frozenset(t.strip() for t in raw.split(",") if t.strip())
+        try:
+            return cls(
+                name=os.environ.get("LAGAAM_AGENT_NAME", "anonymous"),
+                allowed_tables=allowed,
+            )
+        except ValidationError as exc:
+            # An operator reading stderr needs the rule, not a pydantic dump.
+            raise ConfigurationError(
+                f"LAGAAM_ALLOWED_TABLES is not usable: {_first_message(exc)}"
+            ) from exc

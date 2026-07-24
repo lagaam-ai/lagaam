@@ -50,15 +50,26 @@ class QueryBudget(BaseModel):
         """Server-wide default budget from env; per-agent budgets arrive in U7.
 
         Scan bytes and timeout fall back to defaults rather than to unlimited,
-        so a server started with no LAGAAM_* vars still has a gate.
+        so a server started with no LAGAAM_* vars still has a gate. An
+        out-of-range returned-row cap is clamped, not rejected: a running
+        deployment must not fail to boot over a number we can safely lower.
         """
+        scan_bytes = _int_env("LAGAAM_MAX_SCAN_BYTES")
+        timeout = _float_env("LAGAAM_QUERY_TIMEOUT")
+        returned_rows = _int_env("LAGAAM_MAX_RETURNED_ROWS")
         return cls(
-            max_scan_bytes=_int_env("LAGAAM_MAX_SCAN_BYTES")
-            or DEFAULT_MAX_SCAN_BYTES,
+            max_scan_bytes=(
+                DEFAULT_MAX_SCAN_BYTES if scan_bytes is None else scan_bytes
+            ),
             max_rows=_int_env("LAGAAM_MAX_ROWS"),
-            max_returned_rows=_int_env("LAGAAM_MAX_RETURNED_ROWS"),
-            timeout_seconds=_float_env("LAGAAM_QUERY_TIMEOUT")
-            or DEFAULT_TIMEOUT_SECONDS,
+            max_returned_rows=(
+                None
+                if returned_rows is None
+                else min(returned_rows, MAX_RETURNED_ROWS_CEILING)
+            ),
+            timeout_seconds=(
+                DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout
+            ),
         )
 
 

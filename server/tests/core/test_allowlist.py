@@ -6,10 +6,9 @@ cannot resolve is denied, never waved through.
 """
 
 import pytest
-from pydantic import ValidationError
 
 from lagaam.core.allowlist import check_tables_allowed, filter_catalog_metadata
-from lagaam.core.errors import TableAccessDeniedError
+from lagaam.core.errors import IdentifierError, TableAccessDeniedError
 from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
@@ -146,23 +145,25 @@ def test_four_part_name_with_allowed_prefix_is_denied() -> None:
         )
 
 
-def test_quoted_identifier_keeps_its_case() -> None:
-    # Trino resolves "Orders" as a distinct object from orders; folding it
-    # would authorize one table and run the other.
-    with pytest.raises(TableAccessDeniedError, match="Orders"):
-        guard('SELECT x FROM tpch.tiny."Orders"', allowed={"tpch.tiny.orders"})
+def test_quoted_name_folds_the_way_trino_folds_it() -> None:
+    # Trino lowercases every identifier in a table position, quoted or not:
+    # "Orders" IS orders, and denying it would refuse a granted table.
+    guard('SELECT x FROM tpch.tiny."Orders"', allowed={"tpch.tiny.orders"})
 
 
-def test_fully_quoted_uppercase_name_is_denied() -> None:
-    with pytest.raises(TableAccessDeniedError):
-        guard(
-            'SELECT x FROM "TPCH"."TINY"."ORDERS"', allowed={"tpch.tiny.orders"}
-        )
+def test_fully_quoted_uppercase_name_matches_a_lowercase_grant() -> None:
+    guard('SELECT x FROM "TPCH"."TINY"."ORDERS"', allowed={"tpch.tiny.orders"})
 
 
 def test_quoted_lowercase_name_still_matches() -> None:
     # Quoting alone must not deny: "orders" and orders are the same object.
     guard('SELECT x FROM tpch.tiny."orders"', allowed={"tpch.tiny.orders"})
+
+
+def test_quoted_name_outside_the_grant_is_still_denied() -> None:
+    # Folding must not become a way in — only the granted name matches.
+    with pytest.raises(TableAccessDeniedError, match="PII"):
+        guard('SELECT x FROM tpch.secret."PII"', allowed={"tpch.tiny.orders"})
 
 
 def test_non_ascii_identifier_is_denied() -> None:
@@ -174,12 +175,12 @@ def test_non_ascii_identifier_is_denied() -> None:
 
 def test_non_ascii_grant_is_rejected_at_construction() -> None:
     # A grant that can never match is a configuration bug, not a silent denial.
-    with pytest.raises(ValidationError, match="non-ASCII"):
+    with pytest.raises(IdentifierError, match="non-ASCII"):
         AgentIdentity(name="agent-1", allowed_tables={"tpch.tiny.orderK"})
 
 
 def test_malformed_grant_is_rejected_at_construction() -> None:
-    with pytest.raises(ValidationError, match="catalog.schema.table"):
+    with pytest.raises(IdentifierError, match="catalog.schema.table"):
         AgentIdentity(name="agent-1", allowed_tables={"tiny.orders"})
 
 
@@ -223,14 +224,29 @@ def test_empty_allowlist_hides_everything() -> None:
     assert filter_catalog_metadata(_metadata(), identity).catalogs == []
 
 
-def test_filter_hides_a_physical_table_whose_case_differs_from_the_grant() -> None:
-    # A grant for 'orders' does not cover a physically distinct "Orders";
-    # showing it would ground the agent on a table it cannot query.
+def test_filter_folds_engine_names_the_way_the_engine_does() -> None:
+    # A connector that reports uppercase names (Oracle, Snowflake) must still
+    # ground an agent whose grant is written lowercase — otherwise
+    # list_catalogs shows nothing while query_data allows the same table.
+    metadata = CatalogMetadata(
+        catalogs=[
+            CatalogInfo(
+                name="ORCL",
+                schemas=[SchemaInfo(name="HR", tables=["EMPLOYEES", "SALARIES"])],
+            )
+        ]
+    )
+    identity = AgentIdentity(name="agent-1", allowed_tables={"orcl.hr.employees"})
+    filtered = filter_catalog_metadata(metadata, identity)
+    assert filtered.catalogs[0].schemas[0].tables == ["EMPLOYEES"]
+
+
+def test_filter_hides_a_non_ascii_table_no_grant_could_name() -> None:
     metadata = CatalogMetadata(
         catalogs=[
             CatalogInfo(
                 name="tpch",
-                schemas=[SchemaInfo(name="tiny", tables=["Orders", "orders"])],
+                schemas=[SchemaInfo(name="tiny", tables=["orders", "ord\u212Ars"])],
             )
         ]
     )

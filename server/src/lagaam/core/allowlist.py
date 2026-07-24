@@ -52,19 +52,21 @@ def check_tables_allowed(
             )
 
 
-def _engine_name_allowed(
-    catalog: str, schema: str, table: str, allowed: set[str]
+def table_parts_allowed(
+    catalog: str, schema: str, table: str, allowed: frozenset[str] | set[str]
 ) -> bool:
-    """Is this engine-reported name in the grant?
+    """Is this already-resolved three-part name in the grant?
 
-    Engine names are already resolved objects, so they match a grant only when
-    they are exactly the lowercase ASCII form a grant can express — a physical
-    ``Orders`` is a different table from ``orders`` and must stay hidden.
+    For names that arrive as parts rather than SQL — engine-reported metadata,
+    and describe_table's arguments. Folded the same way ``table_fqn`` folds
+    parsed SQL, so a connector reporting uppercase names (Oracle, Snowflake)
+    still grounds an agent whose grant is written lowercase. A name no grant
+    could express — non-ASCII, or one carrying a dot — matches nothing.
     """
-    parts = (catalog, schema, table)
-    if not all(p and p.isascii() and p == p.lower() for p in parts):
+    try:
+        return normalize_grant(f"{catalog}.{schema}.{table}") in allowed
+    except IdentifierError:
         return False
-    return ".".join(parts) in allowed
 
 
 def filter_catalog_metadata(
@@ -87,7 +89,7 @@ def filter_catalog_metadata(
             tables = [
                 t
                 for t in schema.tables
-                if _engine_name_allowed(catalog.name, schema.name, t, allowed)
+                if table_parts_allowed(catalog.name, schema.name, t, allowed)
             ]
             if tables:
                 schemas.append(SchemaInfo(name=schema.name, tables=tables))

@@ -154,3 +154,32 @@ def test_from_env_rejects_nonpositive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LAGAAM_MAX_ROWS", "0")
     with pytest.raises(ValueError):
         QueryBudget.from_env()
+
+
+def test_from_env_clamps_an_oversized_returned_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A deployment that worked yesterday must not fail to boot over a number
+    # we can safely lower.
+    monkeypatch.setenv("LAGAAM_MAX_RETURNED_ROWS", "500000")
+    assert QueryBudget.from_env().max_returned_rows == MAX_RETURNED_ROWS_CEILING
+
+
+def test_from_env_rejects_a_zero_scan_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit 0 once fell through `or` to the permissive default, giving
+    # an operator who asked to deny everything the opposite.
+    monkeypatch.setenv("LAGAAM_MAX_SCAN_BYTES", "0")
+    with pytest.raises(ValidationError):
+        QueryBudget.from_env()
+
+
+def test_from_env_honours_an_explicit_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAGAAM_MAX_SCAN_BYTES", "1024")
+    monkeypatch.setenv("LAGAAM_QUERY_TIMEOUT", "5")
+    budget = QueryBudget.from_env()
+    assert budget.max_scan_bytes == 1024
+    assert budget.timeout_seconds == 5.0

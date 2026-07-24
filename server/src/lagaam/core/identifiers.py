@@ -6,29 +6,33 @@ take no bind parameters), so quoting here is a security boundary, not a
 convenience. Adapters never build their own identifier strings.
 
 Normalization is the other half of the boundary. An allowlist that compares a
-lossy string projection of a parsed name — dropping parts, folding case a
-quoted identifier preserves, or applying Python's Unicode folding where the
-engine applies none — decides access for a different table than the one that
-executes. Every comparison goes through ``table_fqn``.
+lossy string projection of a parsed name — dropping parts, or applying
+Python's Unicode folding where the engine applies none — decides access for a
+different table than the one that executes. Every comparison goes through
+``table_fqn``.
+
+Case folding follows the engine, not SQL orthodoxy. Trino lowercases *every*
+identifier in a table position, quoted or not: `"TPCH"."TINY"."ORDERS"` and
+`tpch.tiny.orders` are the same table, and it cannot hold two tables that
+differ only by case. Preserving the case of quoted names would deny an agent
+the very table it was granted.
 """
 
 import unicodedata
 
 from sqlglot import exp
 
+from lagaam.core.errors import IdentifierError
 
-class IdentifierError(ValueError):
-    """A name that cannot be resolved to one comparable identifier."""
+__all__ = ["IdentifierError", "normalize_grant", "quote_identifier", "table_fqn"]
 
 
 def _fold(part: exp.Identifier) -> str:
     """Normalize one name part the way the engine resolves it.
 
-    Trino folds unquoted identifiers to lowercase and treats quoted ones as
-    literal, so folding a quoted part would authorize a different table than
-    the one that runs. Non-ASCII is rejected rather than folded: Python maps
-    characters the engine does not (U+212A KELVIN SIGN lowercases to ``k``),
-    so a folded match can name a different object than the rendered SQL.
+    Non-ASCII is rejected rather than folded: Python maps characters the
+    engine does not (U+212A KELVIN SIGN lowercases to ``k``), so a folded
+    match can name a different object than the rendered SQL.
     """
     text = part.name
     if not text:
@@ -37,11 +41,17 @@ def _fold(part: exp.Identifier) -> str:
         # NFKC first, so a name that is merely a compatibility spelling of an
         # ASCII one is reported as such instead of looking arbitrary.
         normalized = unicodedata.normalize("NFKC", text)
-        hint = f" (did you mean {normalized!r}?)" if normalized.isascii() else ""
-        raise IdentifierError(
-            f"identifier {text!r} contains non-ASCII characters{hint}"
+        codepoints = " ".join(
+            f"U+{ord(c):04X} {unicodedata.name(c, '?')}"
+            for c in text
+            if not c.isascii()
         )
-    return text if part.quoted else text.lower()
+        hint = f", did you mean {normalized!r}" if normalized.isascii() else ""
+        raise IdentifierError(
+            f"identifier {text!r} contains non-ASCII characters "
+            f"({codepoints}{hint})"
+        )
+    return text.lower()
 
 
 def table_fqn(table: exp.Table) -> str:
