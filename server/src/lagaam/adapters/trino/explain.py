@@ -17,7 +17,7 @@ from typing import Any
 from lagaam.core.models import CostEstimate
 
 
-def _number(value: Any) -> float | None:
+def finite_number(value: Any) -> float | None:
     """A finite, non-negative float, or None for NaN/Infinity/missing/junk.
 
     Infinity must be rejected too: Trino renders an unbounded cost as
@@ -40,21 +40,28 @@ def parse_io_estimate(io_json: str) -> CostEstimate:
         tables = plan["inputTableColumnInfos"]
     except (json.JSONDecodeError, TypeError, KeyError):
         return CostEstimate(confidence="low")
+    # A JSON null is valid JSON with the key present, so it survives the
+    # KeyError guard above and would break the iteration below.
+    if not isinstance(tables, list):
+        return CostEstimate(confidence="low")
 
     total_bytes = 0.0
     total_rows = 0.0
     trustworthy = bool(tables)
     for entry in tables:
-        est = entry.get("estimate", {}) if isinstance(entry, dict) else {}
-        size = _number(est.get("outputSizeInBytes"))
-        rows = _number(est.get("outputRowCount"))
+        est = entry.get("estimate") if isinstance(entry, dict) else None
+        if not isinstance(est, dict):
+            trustworthy = False
+            continue
+        size = finite_number(est.get("outputSizeInBytes"))
+        rows = finite_number(est.get("outputRowCount"))
         if size is None or rows is None:
             trustworthy = False
             continue
-        # count(*) / SELECT 1 project no columns: Trino reports 0 bytes for a
-        # full-table scan of many rows. The byte quote understates the scan —
-        # don't vouch for it.
-        if size == 0 and rows > 0:
+        # A scanned table never costs zero bytes: a stats-less connector
+        # reports 0.0/0.0, and count(*) reports 0 bytes over many rows. Either
+        # way the byte quote understates the scan — don't vouch for it.
+        if size == 0:
             trustworthy = False
             continue
         total_bytes += size

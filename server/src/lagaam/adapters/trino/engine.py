@@ -13,7 +13,7 @@ import trino.dbapi
 import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
-from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.explain import finite_number, parse_io_estimate
 from lagaam.core.errors import (
     EngineError,
     LagaamError,
@@ -40,9 +40,19 @@ _NOT_FOUND_ERRORS = {"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}
 _HIDDEN_SCHEMAS = {"information_schema"}
 
 
+# trino.exceptions.HttpError derives from Exception, not from Error, so it
+# escapes an `except Error` — and it is what a coordinator restart, an LB, or
+# expired auth raises.
+_ENGINE_FAILURES = (trino.exceptions.Error, trino.exceptions.HttpError, OSError)
+
+
 def _detail(exc: Exception) -> str:
     """Agent-safe failure text: exc.message, never str(exc), which leaks
     the query id."""
+    if isinstance(exc, trino.exceptions.HttpError):
+        # HttpError.message carries the raw response body — a 401 body can
+        # hold token material, so the agent gets the status class only.
+        return "the query engine is not reachable right now"
     return getattr(exc, "message", None) or str(exc)
 
 
@@ -86,7 +96,7 @@ class TrinoEngine:
     async def list_catalogs(self) -> CatalogMetadata:
         try:
             return await anyio.to_thread.run_sync(self._list_catalogs)
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise EngineError(_detail(exc)) from exc
 
     async def describe_table(
@@ -96,7 +106,7 @@ class TrinoEngine:
             return await anyio.to_thread.run_sync(
                 self._describe_table, catalog, schema, table
             )
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise EngineError(_detail(exc)) from exc
 
     def dialect(self) -> DialectCard:
@@ -105,7 +115,7 @@ class TrinoEngine:
     async def estimate_cost(self, sql: str) -> CostEstimate:
         try:
             return await anyio.to_thread.run_sync(self._estimate_cost, sql)
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise _translate_error(exc) from exc
 
     async def execute(
@@ -115,7 +125,7 @@ class TrinoEngine:
             return await anyio.to_thread.run_sync(
                 self._execute, sql, max_rows, timeout_seconds
             )
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise _translate_error(exc) from exc
 
     def _connect(
@@ -230,8 +240,10 @@ class TrinoEngine:
         with self._connect() as conn:
             cur = conn.cursor()
             cur.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {sql}")
-            io_json = cur.fetchone()[0]
-        return parse_io_estimate(io_json)
+            row = cur.fetchone()
+        # A cancelled or degenerate plan returns no row; that is no quote, not
+        # a crash, and no quote fails safe at the gate.
+        return parse_io_estimate(row[0]) if row else CostEstimate(confidence="low")
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:
@@ -243,6 +255,9 @@ class TrinoEngine:
             return None  # views and stats-less connectors have no SHOW STATS
         for row in rows:
             # The summary row has column_name None and carries row_count.
-            if row[0] is None and row[4] is not None:
-                return round(row[4])
+            if row[0] is None:
+                # SHOW STATS reports row_count as a DOUBLE, and a stats-less
+                # table reports NaN — round() raises on that.
+                count = finite_number(row[4])
+                return round(count) if count is not None else None
         return None

@@ -83,3 +83,28 @@ def test_from_env_uses_a_file_when_configured(
     lines = path.read_text().strip().splitlines()
     assert len(lines) == 2
     assert json.loads(lines[0])["identity"] == "a"
+
+
+def test_unserializable_detail_still_emits_an_event() -> None:
+    # An agent-influenced value must not be able to delete its own audit line.
+    class Hostile:
+        def __str__(self) -> str:
+            raise RuntimeError("no string for you")
+
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"x": Hostile()})
+    record = json.loads(lines[0])
+    assert record["outcome"] == "allowed"
+    assert record["detail_error"] == "unserializable"
+
+
+def test_oversized_value_is_truncated_with_a_hash() -> None:
+    # A megabyte IN-list is a disk-fill risk, not evidence.
+    sql = "SELECT a FROM c.s.t WHERE k IN (" + ",".join(["1"] * 200_000) + ")"
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"sql": sql})
+    detail = json.loads(lines[0])["detail"]
+    assert len(detail["sql"]) == 4096
+    assert detail["sql_truncated"]["chars"] == len(sql)
+    assert len(detail["sql_truncated"]["sha256"]) == 16
+    assert len(lines[0]) < 10_000
