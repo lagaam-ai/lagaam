@@ -103,3 +103,68 @@ def test_metadata_failures_use_message_not_repr() -> None:
 
     assert _detail(FakeQueryError()) == "line 1:1: mismatched input"
     assert _detail(OSError("connection refused")) == "connection refused"
+
+
+# --- SHOW STATS row counts ------------------------------------------------
+
+
+class _StatsCursor:
+    """A cursor that replays one SHOW STATS result."""
+
+    def __init__(self, rows: list[list[Any]]) -> None:
+        self._rows = rows
+
+    def execute(self, sql: str) -> None:
+        pass
+
+    def fetchall(self) -> list[list[Any]]:
+        return self._rows
+
+
+def _row_estimate(rows: list[list[Any]]) -> int | None:
+    return TrinoEngine._row_estimate(_StatsCursor(rows), '"c"."s"."t"')
+
+
+def test_row_estimate_reads_the_summary_row() -> None:
+    # SHOW STATS: (column_name, data_size, distinct, nulls, row_count, ...)
+    assert _row_estimate([["a", 1.0, 1.0, 0.0, None], [None, None, None, None, 15000.0]]) == 15000
+
+
+def test_row_estimate_survives_a_nan_row_count() -> None:
+    # Stats-less tables report NaN, and round(nan) raises — a cosmetic missing
+    # estimate must not become a hard describe_table failure.
+    assert _row_estimate([[None, None, None, None, float("nan")]]) is None
+
+
+def test_row_estimate_survives_an_infinite_row_count() -> None:
+    assert _row_estimate([[None, None, None, None, float("inf")]]) is None
+
+
+def test_row_estimate_with_no_summary_row_is_none() -> None:
+    assert _row_estimate([["a", 1.0, 1.0, 0.0, None]]) is None
+
+
+def test_row_estimate_with_no_rows_is_none() -> None:
+    assert _row_estimate([]) is None
+
+
+# --- HTTP failures are engine failures ------------------------------------
+
+
+async def test_http_error_becomes_a_domain_error() -> None:
+    # trino.exceptions.HttpError derives from Exception, not Error, so it once
+    # escaped every except clause: unaudited, and raw text to the agent.
+    import trino.exceptions
+
+    from lagaam.core.errors import EngineError
+
+    engine = TrinoEngine()
+
+    def boom() -> None:
+        raise trino.exceptions.Http503Error("error 503: token=secret-value")
+
+    engine._list_catalogs = boom  # type: ignore[method-assign]
+    with pytest.raises(EngineError) as caught:
+        await engine.list_catalogs()
+    # The response body can carry credentials; the agent gets the class only.
+    assert "secret-value" not in str(caught.value)

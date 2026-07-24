@@ -141,8 +141,10 @@ def test_columnless_scan_is_not_quoted_as_zero_bytes() -> None:
     assert est.scanned_bytes is None
 
 
-def test_genuinely_empty_scan_stays_trustworthy() -> None:
-    # 0 rows AND 0 bytes is an honest empty result, not a hidden scan.
+def test_zero_bytes_is_never_trustworthy() -> None:
+    # 0 rows AND 0 bytes reads as an honest empty table, but a stats-less
+    # connector reports the same shape for a full scan. Blocking a truly
+    # empty table is recoverable; clearing an unpriced scan is not.
     payload = json.dumps(
         {
             "inputTableColumnInfos": [
@@ -151,8 +153,8 @@ def test_genuinely_empty_scan_stays_trustworthy() -> None:
         }
     )
     est = parse_io_estimate(payload)
-    assert est.confidence == "high"
-    assert est.scanned_bytes == 0
+    assert est.confidence == "low"
+    assert est.scanned_bytes is None
 
 
 def test_negative_size_is_rejected() -> None:
@@ -165,3 +167,24 @@ def test_negative_size_is_rejected() -> None:
         }
     )
     assert parse_io_estimate(payload).confidence == "low"
+
+
+def test_null_estimate_member_fails_safe() -> None:
+    # A JSON null is valid JSON with the key present, so it survives the
+    # KeyError guard — .get() returns None, not the default.
+    payload = json.dumps({"inputTableColumnInfos": [{"estimate": None}]})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
+    assert est.scanned_bytes is None
+
+
+def test_null_table_list_fails_safe() -> None:
+    payload = json.dumps({"inputTableColumnInfos": None})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
+
+
+def test_non_dict_table_list_fails_safe() -> None:
+    payload = json.dumps({"inputTableColumnInfos": "not a list"})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
