@@ -98,13 +98,49 @@ def test_unserializable_detail_still_emits_an_event() -> None:
     assert record["detail_error"] == "unserializable"
 
 
-def test_oversized_value_is_truncated_with_a_hash() -> None:
-    # A megabyte IN-list is a disk-fill risk, not evidence.
-    sql = "SELECT a FROM c.s.t WHERE k IN (" + ",".join(["1"] * 200_000) + ")"
+def test_oversized_value_keeps_both_ends_with_a_hash() -> None:
+    # A megabyte IN-list is a disk-fill risk, not evidence — but the head and
+    # tail are the evidence, so a padded middle must be what gets dropped.
+    sql = "SELECT a FROM c.s.t WHERE k IN (" + ",".join(["1"] * 200_000) + ") LIMIT 7"
     lines: list[str] = []
     AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"sql": sql})
     detail = json.loads(lines[0])["detail"]
-    assert len(detail["sql"]) == 4096
-    assert detail["sql_truncated"]["chars"] == len(sql)
-    assert len(detail["sql_truncated"]["sha256"]) == 16
+    assert detail["sql"].startswith("SELECT a FROM c.s.t WHERE k IN (")
+    assert detail["sql"].endswith(") LIMIT 7")
+    assert "elided" in detail["sql"]
+    assert detail["_truncated"]["sql"]["chars"] == len(sql)
+    assert len(detail["_truncated"]["sql"]["sha256"]) == 16
     assert len(lines[0]) < 10_000
+
+
+def test_a_padded_prefix_cannot_push_the_query_out_of_the_record() -> None:
+    # Comments are stripped before this, but any long leading value must not
+    # be able to hide what follows it.
+    sql = "/* " + "x" * 6000 + " */ SELECT a FROM c.s.secret WHERE k = 1"
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"sql": sql})
+    logged = json.loads(lines[0])["detail"]["sql"]
+    assert "c.s.secret" in logged and "WHERE k = 1" in logged
+
+
+def test_oversized_values_nested_in_dicts_and_lists_are_capped() -> None:
+    # json.dumps(default=str) runs after the guard, so anything it would
+    # stringify has to be capped here or the bound is not a bound.
+    class Sprawling:
+        def __str__(self) -> str:
+            return "z" * 300_000
+
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a",
+        "query_data",
+        "allowed",
+        {
+            "estimate": {"note": "n" * 200_000},
+            "rows": ["r" * 200_000],
+            "obj": Sprawling(),
+        },
+    )
+    assert len(lines[0]) < 20_000
+    marks = json.loads(lines[0])["detail"]["_truncated"]
+    assert set(marks) == {"estimate.note", "rows[0]", "obj"}

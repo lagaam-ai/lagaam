@@ -94,4 +94,6 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     if tree.args.get("limit") is None:
         tree = tree.limit(default_limit)
 
-    return tree.sql(dialect=dialect)
+    # Comments carry nothing the engine needs, and kilobytes of them are how
+    # an agent pushes the real query out of a truncated audit line.
+    return tree.sql(dialect=dialect, comments=False)

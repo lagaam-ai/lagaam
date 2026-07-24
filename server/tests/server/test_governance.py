@@ -7,6 +7,8 @@ or denied — with enough to reconstruct what happened.
 
 import json
 
+import anyio
+
 from lagaam.core.audit import AuditLog
 from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import QueryResult
@@ -152,3 +154,89 @@ async def test_audit_records_the_sql_that_actually_ran() -> None:
     assert detail["executed_sql"] == "SELECT a FROM tpch.tiny.orders LIMIT 1001"
     assert detail["estimate"]["scanned_bytes"] == 1_000_000
     assert detail["row_count"] == 1
+
+
+class SlowEngine(FakeQueryEngine):
+    """Interleaves calls, so a leaking audit channel would cross-contaminate."""
+
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult:
+        await anyio.sleep(0.02)
+        self.executed.append(sql)
+        return QueryResult(columns=["n"], rows=[[1]], row_count=1)
+
+
+async def test_concurrent_calls_each_audit_their_own_sql() -> None:
+    # The audit detail is per-call state on a shared decorator; overlapping
+    # agents must never end up in each other's trail.
+    lines: list[str] = []
+    async with lagaam_client(
+        SlowEngine(), audit=AuditLog(sink=lines.append)
+    ) as client:
+        async with anyio.create_task_group() as tg:
+            for i in range(20):
+                tg.start_soon(
+                    client.call_tool,
+                    "query_data",
+                    {"sql": f"SELECT c{i} FROM tpch.tiny.orders"},
+                )
+    records = [json.loads(line) for line in lines]
+    assert len(records) == 20
+    for record in records:
+        column = record["detail"]["sql"].split()[1]
+        assert column in record["detail"]["executed_sql"]
+    assert len({r["detail"]["sql"] for r in records}) == 20
+
+
+async def test_a_cancelled_call_is_still_audited() -> None:
+    # The SQL reached the engine; nobody is listening for the answer. The
+    # trail is the only place that call still exists.
+    lines: list[str] = []
+    engine = SlowEngine()
+    async with lagaam_client(engine, audit=AuditLog(sink=lines.append)) as client:
+        with anyio.move_on_after(0.005):
+            await client.call_tool(
+                "query_data", {"sql": "SELECT a FROM tpch.tiny.orders"}
+            )
+    records = [json.loads(line) for line in lines]
+    assert [r["outcome"] for r in records] == ["cancelled"]
+    assert "tpch.tiny.orders" in records[0]["detail"]["executed_sql"]
+
+
+async def test_describe_table_authorizes_the_parts_it_will_query() -> None:
+    # Round-tripping the parts through SQL text checked a name the adapter
+    # never runs: "orders -- " parses as `orders` but is quoted verbatim.
+    async with lagaam_client(
+        FakeQueryEngine(),
+        identity=_agent({"tpch.tiny.orders"}),
+        audit=AuditLog(sink=lambda line: None),
+    ) as client:
+        result = await client.call_tool(
+            "describe_table",
+            {"catalog": "tpch", "schema": "tiny", "table": "orders -- "},
+        )
+    assert result.isError
+    assert "not permitted" in result.content[0].text
+
+
+async def test_describe_table_still_works_for_a_granted_table() -> None:
+    async with lagaam_client(
+        FakeQueryEngine(),
+        identity=_agent({"tpch.tiny.orders"}),
+        audit=AuditLog(sink=lambda line: None),
+    ) as client:
+        result = await client.call_tool(
+            "describe_table",
+            {"catalog": "tpch", "schema": "tiny", "table": "orders"},
+        )
+    assert not result.isError
+
+
+async def test_describe_table_grant_check_folds_case() -> None:
+    # An agent that spells the name in caps has still named its granted table.
+    from lagaam.core.allowlist import table_parts_allowed
+
+    assert table_parts_allowed("TPCH", "Tiny", "ORDERS", {"tpch.tiny.orders"})
+    assert not table_parts_allowed("tpch", "tiny", "orders -- ", {"tpch.tiny.orders"})
+    assert not table_parts_allowed("tpch", "tiny", "pii", {"tpch.tiny.orders"})
