@@ -166,3 +166,22 @@ async def test_scan_row_budget_does_not_shrink_the_returned_row_cap() -> None:
             "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
         )
     assert "LIMIT 1001" in engine.executed[0].upper()
+
+
+async def test_engine_supplied_warnings_survive_verification() -> None:
+    # warnings is a public field on the port's return type: an adapter may
+    # attach its own notes, and verification must add to them, not replace.
+    engine = FakeQueryEngine(
+        result=QueryResult(
+            columns=["orderkey"],
+            rows=[[1]],
+            row_count=1,
+            warnings=["partition statistics are stale"],
+        )
+    )
+    async with lagaam_client(engine) as client:
+        result = await client.call_tool(
+            "query_data", {"sql": "SELECT orderkey FROM tpch.tiny.orders"}
+        )
+    warnings = (result.structuredContent or {})["warnings"]
+    assert "partition statistics are stale" in warnings

@@ -6,6 +6,7 @@ wiring (see __main__) injects the Trino adapter.
 
 import functools
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from typing import Any, TypeVar
 
 from mcp.server.fastmcp import FastMCP
@@ -34,28 +35,54 @@ _RECOVERY_HINTS: dict[type[LagaamError], str] = {
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
+# FastMCP calls tools with keywords, but a positional call would otherwise
+# audit an empty detail — name the parameters so args land in the record too.
+_ARG_NAMES: dict[str, tuple[str, ...]] = {
+    "list_catalogs": (),
+    "describe_table": ("catalog", "schema", "table"),
+    "query_data": ("sql",),
+}
+
+# The in-flight audit detail, so a tool can add what it actually did.
+_AUDIT_DETAIL: ContextVar[dict[str, Any]] = ContextVar("audit_detail")
+
 
 def _instrumented(tool: str, identity: AgentIdentity, audit: AuditLog) -> Callable[[F], F]:
     """Boundary every tool gets: translate domain errors AND audit the call.
 
     Domain errors reach the agent as our teachable text (never a stack trace)
     and are logged as a denial with the reason; success is logged as allowed.
+    An unexpected exception is logged as an error and replaced with generic
+    text — a bug must not become an unaudited call or a leaked internal path.
     A failed audit write can't break the call — AuditLog swallows sink errors.
     """
 
     def decorate(func: F) -> F:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # Tools record what they actually did (executed SQL, the quote
+            # that cleared the gate); kwargs alone is only what was asked for.
+            detail: dict[str, Any] = {**dict(zip(_ARG_NAMES[tool], args)), **kwargs}
+            _AUDIT_DETAIL.set(detail)
             try:
                 result = await func(*args, **kwargs)
-                audit.record(identity.name, tool, "allowed", dict(kwargs))
+                audit.record(identity.name, tool, "allowed", detail)
                 return result
             except LagaamError as exc:
                 audit.record(
-                    identity.name, tool, "denied", {**kwargs, "reason": str(exc)}
+                    identity.name, tool, "denied", {**detail, "reason": str(exc)}
                 )
                 hint = _RECOVERY_HINTS.get(type(exc))
                 raise ToolError(f"{exc} {hint}" if hint else str(exc)) from exc
+            except Exception as exc:
+                # Type only: the message can carry hostnames, paths, or tokens.
+                audit.record(
+                    identity.name, tool, "error", {**detail, "error": type(exc).__name__}
+                )
+                raise ToolError(
+                    "The server hit an internal error handling this call. "
+                    "Retry, and report it if it persists."
+                ) from exc
 
         return wrapper  # type: ignore[return-value]
 
@@ -111,12 +138,19 @@ def create_server(
         # execute. Inject cap +1 so execute can flag truncation; it returns
         # at most row_cap.
         dialect = engine.dialect().sqlglot_dialect
+        detail = _AUDIT_DETAIL.get({})
         safe_sql = validate_query(sql, dialect, default_limit=row_cap + 1)
+        # The forensic question is what the engine ran, not what was asked.
+        detail["executed_sql"] = safe_sql
         check_tables_allowed(safe_sql, dialect, identity)
         estimate = await engine.estimate_cost(safe_sql)
+        detail["estimate"] = estimate.model_dump()
         enforce_budget(estimate, budget)
         result = await engine.execute(safe_sql, row_cap, budget.timeout_seconds)
-        result.warnings = verify_result(result)
+        detail["row_count"] = result.row_count
+        detail["truncated"] = result.truncated
+        # Extend: an engine may have attached warnings of its own.
+        result.warnings = [*result.warnings, *verify_result(result)]
         return result
 
     def _require_table_allowed(catalog: str, schema: str, table: str) -> None:
