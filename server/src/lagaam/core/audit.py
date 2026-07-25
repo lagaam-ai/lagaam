@@ -35,6 +35,10 @@ def _file_sink(path: str) -> Sink:
 _MAX_VALUE_CHARS = 4096
 _HALF = _MAX_VALUE_CHARS // 2
 _ELISION = "…[{cut} chars elided]…"
+# Per-value capping bounds one string, not the record: a detail with 100k
+# small entries is the same disk-fill by another route.
+_MAX_ENTRIES = 100
+_MAX_DEPTH = 20
 
 
 def _cap(value: str) -> tuple[str, dict[str, Any]] | None:
@@ -51,36 +55,65 @@ def _cap(value: str) -> tuple[str, dict[str, Any]] | None:
     return kept, {"chars": len(value), "sha256": digest}
 
 
-def _bounded(value: Any, marks: dict[str, Any], path: str) -> Any:
-    """Recursively cap strings anywhere in the detail, recording what was cut.
-
-    Non-JSON values are stringified here rather than left to json.dumps's
-    ``default=str``, which would run *after* this guard and reintroduce the
-    unbounded string it exists to prevent.
-    """
-    if isinstance(value, dict):
-        return {
-            str(k): _bounded(v, marks, f"{path}.{k}" if path else str(k))
-            for k, v in value.items()
-        }
-    if isinstance(value, list | tuple):
-        return [
-            _bounded(v, marks, f"{path}[{i}]") for i, v in enumerate(value)
-        ]
-    if isinstance(value, str | int | float | bool) or value is None:
-        if not isinstance(value, str):
-            return value
-        capped = _cap(value)
-        if capped is None:
-            return value
-        marks[path] = capped[1]
-        return capped[0]
-    text = str(value)
+def _capped(text: str, marks: dict[str, Any], path: str) -> str:
+    """Shorten one string and note the cut under its path."""
     capped = _cap(text)
     if capped is None:
         return text
     marks[path] = capped[1]
     return capped[0]
+
+
+def _bounded(
+    value: Any,
+    marks: dict[str, Any],
+    path: str,
+    seen: frozenset[int] = frozenset(),
+    depth: int = 0,
+) -> Any:
+    """Recursively cap strings anywhere in the detail, recording what was cut.
+
+    Non-JSON values are stringified here rather than left to json.dumps's
+    ``default=str``, which would run *after* this guard and reintroduce the
+    unbounded string it exists to prevent. Cycles, depth and container length
+    are bounded too: an audit record that cannot be built is an audit record
+    that goes missing, which is the failure this whole function prevents.
+    """
+    if isinstance(value, dict | list | tuple):
+        if id(value) in seen:
+            return "<circular>"
+        if depth >= _MAX_DEPTH:
+            return "<too deeply nested>"
+        seen = seen | {id(value)}
+    if isinstance(value, dict):
+        items = list(value.items())[:_MAX_ENTRIES]
+        out = {
+            _capped(str(k), marks, f"{path}.<key>" if path else "<key>"): _bounded(
+                v, marks, f"{path}.{k}" if path else str(k), seen, depth + 1
+            )
+            for k, v in items
+        }
+        if len(value) > _MAX_ENTRIES:
+            marks[path or "<root>"] = {"entries": len(value)}
+        return out
+    if isinstance(value, list | tuple):
+        out_list = [
+            _bounded(v, marks, f"{path}[{i}]", seen, depth + 1)
+            for i, v in enumerate(value[:_MAX_ENTRIES])
+        ]
+        if len(value) > _MAX_ENTRIES:
+            marks[path] = {"entries": len(value)}
+        return out_list
+    if isinstance(value, str):
+        return _capped(value, marks, path)
+    if isinstance(value, int | float | bool) or value is None:
+        return value
+    try:
+        text = str(value)
+    except Exception:
+        # A value that cannot describe itself must not take the record with it.
+        return f"<unstringable {type(value).__name__}>"
+    return _capped(text, marks, path)
 
 
 def _truncated(detail: dict[str, Any]) -> dict[str, Any]:
@@ -115,9 +148,17 @@ class AuditLog:
         outcome: str,
         detail: dict[str, Any],
     ) -> None:
-        """Emit one audit event. Never raises — auditing must not break serving."""
+        """Emit one audit event. Never raises — auditing must not break serving.
+
+        The contract is load-bearing: the tool boundary records from a finally,
+        so anything escaping here would replace the exception being handled.
+        """
+        try:
+            timestamp = self._clock()
+        except Exception:
+            timestamp = 0.0
         header = {
-            "ts": self._clock(),
+            "ts": timestamp,
             "identity": identity,
             "tool": tool,
             "outcome": outcome,

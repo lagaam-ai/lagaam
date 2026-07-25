@@ -50,3 +50,21 @@ def test_empty_allowlist_env_means_no_tables(
 def test_normalized_allowlist_is_case_folded() -> None:
     identity = AgentIdentity(name="a", allowed_tables={"TPCH.Tiny.ORDERS"})
     assert identity.normalized_allowlist() == {"tpch.tiny.orders"}
+
+
+def test_a_malformed_grant_from_env_is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # pydantic only wraps ValueError subclasses, so an IdentifierError that is
+    # not one escapes the validator as a traceback instead of a config error.
+    monkeypatch.setenv("LAGAAM_ALLOWED_TABLES", "tiny.orders")
+    with pytest.raises(ConfigurationError, match="catalog.schema.table"):
+        AgentIdentity.from_env()
+
+
+def test_a_non_ascii_grant_from_env_is_a_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAGAAM_ALLOWED_TABLES", "tpch.tiny.ordеrs")
+    with pytest.raises(ConfigurationError, match="non-ASCII"):
+        AgentIdentity.from_env()

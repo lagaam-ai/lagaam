@@ -85,17 +85,60 @@ def test_from_env_uses_a_file_when_configured(
     assert json.loads(lines[0])["identity"] == "a"
 
 
-def test_unserializable_detail_still_emits_an_event() -> None:
-    # An agent-influenced value must not be able to delete its own audit line.
+def test_a_value_that_cannot_describe_itself_loses_only_itself() -> None:
+    # One hostile field must not take the rest of the record with it — the
+    # sibling keys are the evidence.
     class Hostile:
         def __str__(self) -> str:
             raise RuntimeError("no string for you")
 
     lines: list[str] = []
-    AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"x": Hostile()})
-    record = json.loads(lines[0])
-    assert record["outcome"] == "allowed"
-    assert record["detail_error"] == "unserializable"
+    AuditLog(sink=lines.append).record(
+        "a", "query_data", "allowed", {"sql": "SELECT a FROM c.s.t", "x": Hostile()}
+    )
+    detail = json.loads(lines[0])["detail"]
+    assert detail["sql"] == "SELECT a FROM c.s.t"
+    assert detail["x"] == "<unstringable Hostile>"
+
+
+def test_a_cycle_does_not_blind_the_record() -> None:
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a", "query_data", "allowed", {"sql": "SELECT a FROM c.s.t", "c": cyclic}
+    )
+    detail = json.loads(lines[0])["detail"]
+    assert detail["sql"] == "SELECT a FROM c.s.t"
+    assert detail["c"]["self"] == "<circular>"
+
+
+def test_deep_nesting_does_not_blind_the_record() -> None:
+    deep: dict[str, object] = {}
+    node = deep
+    for _ in range(5000):
+        child: dict[str, object] = {}
+        node["n"] = child
+        node = child
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a", "query_data", "allowed", {"sql": "SELECT a FROM c.s.t", "d": deep}
+    )
+    detail = json.loads(lines[0])["detail"]
+    assert detail["sql"] == "SELECT a FROM c.s.t"
+    assert "too deeply nested" in json.dumps(detail["d"])
+
+
+def test_a_huge_key_and_a_huge_container_are_both_bounded() -> None:
+    # Per-value capping bounds one string; the record needs bounding too.
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a",
+        "query_data",
+        "allowed",
+        {"K" * 20_000: 1, "many": {str(i): "v" for i in range(100_000)}},
+    )
+    assert len(lines[0]) < 30_000
 
 
 def test_oversized_value_keeps_both_ends_with_a_hash() -> None:

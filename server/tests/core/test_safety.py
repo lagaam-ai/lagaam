@@ -155,3 +155,12 @@ def test_tokenizer_error_fails_closed() -> None:
     # An unterminated literal raises TokenError, not ParseError — still ours.
     with pytest.raises(SqlValidationError, match="could not be parsed"):
         validate("'''")
+
+
+def test_comments_are_stripped_from_the_executed_sql() -> None:
+    # Comments carry nothing the engine needs, and kilobytes of them are how
+    # an agent pushes the real query out of a truncated audit line.
+    padded = "SELECT /* " + "x" * 5000 + " */ a FROM c.s.t WHERE k = 1"
+    safe = validate_query(padded, dialect="trino", default_limit=10)
+    assert "xxxx" not in safe
+    assert safe == "SELECT a FROM c.s.t WHERE k = 1 LIMIT 10"

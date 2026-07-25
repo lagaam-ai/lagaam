@@ -69,9 +69,10 @@ def _instrumented(
 
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
-            bound = signature.bind(*args, **kwargs)
             # Derived from the real signature, so it cannot drift from it and
             # a positional call audits the same detail a keyword call does.
+            bound = signature.bind_partial(*args, **kwargs)
+            bound.apply_defaults()
             detail: dict[str, Any] = dict(bound.arguments)
             _AUDIT_DETAIL.set(detail)
             recorded = False

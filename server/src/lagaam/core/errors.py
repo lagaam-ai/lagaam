@@ -10,8 +10,13 @@ class LagaamError(Exception):
     """Base for all domain errors."""
 
 
-class IdentifierError(LagaamError):
-    """A name that cannot be resolved to one comparable identifier."""
+class IdentifierError(LagaamError, ValueError):
+    """A name that cannot be resolved to one comparable identifier.
+
+    Also a ValueError so pydantic wraps it when a field validator raises it —
+    otherwise a malformed grant escapes as a traceback instead of the config
+    error the operator needs to read.
+    """
 
 
 class ConfigurationError(LagaamError):

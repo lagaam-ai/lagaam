@@ -6,9 +6,10 @@ cannot resolve is denied, never waved through.
 """
 
 import pytest
+from pydantic import ValidationError
 
 from lagaam.core.allowlist import check_tables_allowed, filter_catalog_metadata
-from lagaam.core.errors import IdentifierError, TableAccessDeniedError
+from lagaam.core.errors import TableAccessDeniedError
 from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
@@ -175,12 +176,12 @@ def test_non_ascii_identifier_is_denied() -> None:
 
 def test_non_ascii_grant_is_rejected_at_construction() -> None:
     # A grant that can never match is a configuration bug, not a silent denial.
-    with pytest.raises(IdentifierError, match="non-ASCII"):
+    with pytest.raises(ValidationError, match="non-ASCII"):
         AgentIdentity(name="agent-1", allowed_tables={"tpch.tiny.orderK"})
 
 
 def test_malformed_grant_is_rejected_at_construction() -> None:
-    with pytest.raises(IdentifierError, match="catalog.schema.table"):
+    with pytest.raises(ValidationError, match="catalog.schema.table"):
         AgentIdentity(name="agent-1", allowed_tables={"tiny.orders"})
 
 
