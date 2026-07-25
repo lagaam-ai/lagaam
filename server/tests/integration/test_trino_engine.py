@@ -66,16 +66,31 @@ async def test_count_star_is_not_quoted_as_free(engine: TrinoEngine) -> None:
     assert est.row_estimate == 1_500_000
 
 
-async def test_self_join_is_not_quoted_as_a_single_scan(
+async def test_a_self_join_is_billed_for_both_scans(engine: TrinoEngine) -> None:
+    # Trino emits one IO entry per distinct (table, column-set), so two scans
+    # reading the SAME columns collapse into one and the plan bills half the
+    # work. The quote is scaled by the repeat count to make up the difference.
+    single = await engine.estimate_cost("SELECT orderkey FROM tpch.tiny.lineitem")
+    self_join = await engine.estimate_cost(
+        "SELECT a.orderkey FROM tpch.tiny.lineitem a "
+        "JOIN tpch.tiny.lineitem b ON a.orderkey = b.orderkey"
+    )
+    assert self_join.confidence == "high"
+    assert single.scanned_bytes is not None
+    assert self_join.scanned_bytes == single.scanned_bytes * 2
+
+
+async def test_a_product_join_is_refused_however_it_is_spelled(
     engine: TrinoEngine,
 ) -> None:
-    # Two physical scans of lineitem; the IO plan bills one. Quoting it high
-    # would undercount by 2x — must degrade to low.
-    est = await engine.estimate_cost(
-        "SELECT a.orderkey FROM tpch.sf1.lineitem a "
-        "JOIN tpch.sf1.lineitem b ON a.orderkey = b.orderkey"
-    )
-    assert est.confidence == "low"
+    # Both inputs are scanned once, so the byte sum is correct and says
+    # nothing about the quadratic row work it hides.
+    for predicate in ("1 = 1", "a.orderkey <> b.custkey", "a.custkey = b.custkey OR 1 = 1"):
+        est = await engine.estimate_cost(
+            f"SELECT a.orderkey FROM tpch.sf1.orders a "
+            f"JOIN tpch.sf1.customer b ON {predicate}"
+        )
+        assert est.confidence == "low", predicate
 
 
 async def test_estimate_cost_of_join_sums_both_scans(engine: TrinoEngine) -> None:

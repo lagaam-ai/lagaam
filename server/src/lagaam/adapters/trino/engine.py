@@ -23,7 +23,7 @@ from lagaam.core.errors import (
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
-from lagaam.core.scans import has_unpriceable_shape
+from lagaam.core.scans import has_unpriceable_shape, scan_multiplier
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
@@ -58,6 +58,25 @@ def _detail(exc: Exception) -> str:
         # host and port; neither is the agent's to see or act on.
         return _UNREACHABLE
     return getattr(exc, "message", None) or str(exc)
+
+
+def _scaled(estimate: CostEstimate, multiplier: int) -> CostEstimate:
+    """Charge a quote for every scan the plan may have collapsed into one."""
+    if multiplier <= 1 or estimate.confidence == "low":
+        return estimate
+    return CostEstimate(
+        scanned_bytes=(
+            None
+            if estimate.scanned_bytes is None
+            else estimate.scanned_bytes * multiplier
+        ),
+        row_estimate=(
+            None
+            if estimate.row_estimate is None
+            else estimate.row_estimate * multiplier
+        ),
+        confidence=estimate.confidence,
+    )
 
 
 def _translate_error(exc: Exception) -> LagaamError:
@@ -236,9 +255,10 @@ class TrinoEngine:
         )
 
     def _estimate_cost(self, sql: str) -> CostEstimate:
-        # Repeated scans, cross joins, and row generators all break the IO
-        # plan's byte sum — don't vouch for a quote it would misprice.
-        if has_unpriceable_shape(sql, TRINO_DIALECT_CARD.sqlglot_dialect):
+        dialect = TRINO_DIALECT_CARD.sqlglot_dialect
+        # Product joins and row generators break the byte sum in ways no
+        # scaling can repair — don't vouch for a quote at all.
+        if has_unpriceable_shape(sql, dialect):
             return CostEstimate(confidence="low")
         # TYPE IO plans the query without running it; NEVER use ANALYZE here.
         with self._connect() as conn:
@@ -247,7 +267,9 @@ class TrinoEngine:
             row = cur.fetchone()
         # A cancelled or degenerate plan returns no row; that is no quote, not
         # a crash, and no quote fails safe at the gate.
-        return parse_io_estimate(row[0]) if row else CostEstimate(confidence="low")
+        if row is None:
+            return CostEstimate(confidence="low")
+        return _scaled(parse_io_estimate(row[0]), scan_multiplier(sql, dialect))
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:

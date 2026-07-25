@@ -1,12 +1,13 @@
 """Detecting queries whose IO estimate would misprice the real scan.
 
-Trino's IO plan reports one entry per distinct table and the quote is their
-sum, so a repeated scan undercounts, a cross join reports a sum where the work
-is a product, and a row generator does not appear at all. The cost gate
-degrades such quotes to low confidence; this module spots them from the SQL.
+The quote is the sum of the IO plan's per-scan entries. A join without an
+equality reports a sum where the work is a product, and a row generator does
+not appear at all. A table read twice is fine — Trino emits one entry per scan
+operator, so the sum already counts it. The cost gate degrades a misprice-able
+quote to low confidence; this module spots the shapes from the SQL.
 """
 
-from lagaam.core.scans import has_unpriceable_shape
+from lagaam.core.scans import has_unpriceable_shape, scan_multiplier
 
 
 def unpriceable(sql: str) -> bool:
@@ -30,30 +31,32 @@ def test_cte_referenced_once_is_priceable() -> None:
     )
 
 
-def test_self_join_is_unpriceable() -> None:
-    assert unpriceable(
+def test_self_join_is_priceable() -> None:
+    # The obvious worry, and measurably wrong: Trino's IO plan emits one entry
+    # per scan operator, so a self-join reports two and the sum is already
+    # right. Blocking it denied year-over-year comparison for nothing.
+    assert not unpriceable(
         "SELECT a.orderkey FROM tpch.tiny.lineitem a "
         "JOIN tpch.tiny.lineitem b ON a.orderkey = b.orderkey"
     )
 
 
-def test_union_of_same_table_is_unpriceable() -> None:
-    assert unpriceable(
-        "SELECT orderkey FROM tpch.tiny.orders "
-        "UNION ALL SELECT orderkey FROM tpch.tiny.orders"
+def test_union_of_same_table_is_priceable() -> None:
+    assert not unpriceable(
+        "SELECT orderkey FROM tpch.tiny.orders WHERE totalprice > 100 "
+        "UNION ALL SELECT orderkey FROM tpch.tiny.orders WHERE totalprice < 50"
     )
 
 
-def test_cte_referenced_twice_is_unpriceable() -> None:
-    # The CTE re-scans its source table on each reference.
-    assert unpriceable(
-        "WITH x AS (SELECT orderkey FROM tpch.tiny.orders) "
-        "SELECT a.orderkey FROM x a JOIN x b ON a.orderkey = b.orderkey"
+def test_cte_referenced_twice_is_priceable() -> None:
+    assert not unpriceable(
+        "WITH x AS (SELECT orderkey, custkey FROM tpch.tiny.orders) "
+        "SELECT a.orderkey FROM x a JOIN x b ON a.custkey = b.custkey"
     )
 
 
-def test_scalar_subquery_over_same_table_is_unpriceable() -> None:
-    assert unpriceable(
+def test_scalar_subquery_over_same_table_is_priceable() -> None:
+    assert not unpriceable(
         "SELECT o.orderkey, (SELECT max(totalprice) FROM tpch.tiny.orders) "
         "FROM tpch.tiny.orders o"
     )
@@ -164,3 +167,132 @@ def test_unnest_of_a_column_is_priceable() -> None:
     assert not unpriceable(
         "SELECT o.x FROM hive.s.orders o CROSS JOIN UNNEST(o.items) AS t(i)"
     )
+
+
+# --- an equality only counts if it constrains the join --------------------
+
+
+def test_a_disjoined_equality_does_not_constrain() -> None:
+    # `OR 1=1` satisfies every row pair, so the equality never binds. A bare
+    # subtree search for exp.EQ launders a cartesian product through it.
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON a.k = b.k OR 1 = 1"
+    )
+
+
+def test_a_negated_equality_does_not_constrain() -> None:
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON NOT (a.k = b.k)"
+    )
+
+
+def test_an_equality_inside_a_case_does_not_constrain() -> None:
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b "
+        "ON CASE WHEN a.k = b.k THEN TRUE ELSE TRUE END"
+    )
+
+
+def test_an_equality_between_expressions_does_not_constrain() -> None:
+    # The engine cannot hash on a computed key; it compares every pair.
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON a.k + b.k = 5"
+    )
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON greatest(a.k, b.k) = 1"
+    )
+
+
+def test_an_equality_against_a_subquery_does_not_constrain() -> None:
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b "
+        "ON a.k = (SELECT max(z.k) FROM hive.s.t3 z)"
+    )
+
+
+def test_an_equality_within_one_source_does_not_constrain() -> None:
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON a.k <> b.k AND a.k = a.j"
+    )
+
+
+def test_one_predicate_does_not_clear_every_comma_join() -> None:
+    # Three tables, one equality: the third is joined to nothing.
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a, hive.s.t2 b, hive.s.t3 c WHERE a.k = b.k"
+    )
+
+
+def test_every_comma_joined_source_needs_its_own_equality() -> None:
+    assert not unpriceable(
+        "SELECT a.x FROM hive.s.t1 a, hive.s.t2 b, hive.s.t3 c "
+        "WHERE a.k = b.k AND b.j = c.j"
+    )
+
+
+def test_an_equality_in_a_nested_select_does_not_clear_the_outer_join() -> None:
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a, hive.s.t2 b WHERE a.k IN "
+        "(SELECT z.k FROM hive.s.t3 z, hive.s.t4 p WHERE z.k = p.k)"
+    )
+
+
+def test_repeat_manufactures_rows_despite_a_column_feed() -> None:
+    # repeat(col, 10000) reads a column and invents 10000 rows per input row,
+    # so "fed by a column" does not mean "bounded by the table".
+    assert unpriceable(
+        "SELECT t.n FROM hive.s.orders a "
+        "CROSS JOIN UNNEST(repeat(a.orderkey, 10000)) AS t(n)"
+    )
+
+
+def test_unnest_of_a_literal_array_is_priceable() -> None:
+    # A two-element lookup table written inline invents nothing.
+    assert not unpriceable(
+        "SELECT s.v FROM hive.s.orders o CROSS JOIN UNNEST(ARRAY['O', 'F']) AS s(v)"
+    )
+
+
+# --- scaling a quote the plan may have collapsed --------------------------
+
+
+def multiplier(sql: str) -> int:
+    return scan_multiplier(sql, dialect="trino")
+
+
+def test_a_single_scan_needs_no_scaling() -> None:
+    assert multiplier("SELECT orderkey FROM tpch.tiny.orders") == 1
+
+
+def test_two_scans_of_one_table_double_the_quote() -> None:
+    # Trino collapses two scans of the same table reading the same columns
+    # into one IO entry, so the plan bills half the work.
+    assert multiplier(
+        "SELECT a.orderkey FROM tpch.tiny.orders a "
+        "JOIN tpch.tiny.orders b ON a.orderkey = b.orderkey"
+    ) == 2
+
+
+def test_a_scalar_subquery_over_the_same_table_doubles_it() -> None:
+    assert multiplier(
+        "SELECT o.orderkey, (SELECT max(totalprice) FROM tpch.tiny.orders) "
+        "FROM tpch.tiny.orders o"
+    ) == 2
+
+
+def test_distinct_tables_are_not_scaled() -> None:
+    assert multiplier(
+        "SELECT o.orderkey FROM tpch.tiny.orders o "
+        "JOIN tpch.tiny.lineitem l ON o.orderkey = l.orderkey"
+    ) == 1
+
+
+def test_same_name_in_different_catalogs_is_not_scaled() -> None:
+    assert multiplier(
+        "SELECT p.id FROM prod.s.orders p JOIN stg.s.orders s ON p.id = s.id"
+    ) == 1
+
+
+def test_unparseable_sql_is_not_scaled() -> None:
+    # The shape check has already refused it; scaling nothing is correct.
+    assert multiplier("not valid sql !!!") == 1
