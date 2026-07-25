@@ -7,7 +7,7 @@ confidence rather than throwing or inventing a number.
 
 import json
 
-from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 
 # Trimmed but real shape of EXPLAIN (TYPE IO, FORMAT JSON) on Trino 476.
 _IO_WITH_STATS = json.dumps(
@@ -101,12 +101,14 @@ def test_empty_or_malformed_json_fails_safe() -> None:
     assert parse_io_estimate("not json").confidence == "low"
 
 
-def test_no_input_tables_is_low_confidence_not_a_crash() -> None:
-    # SELECT 1 scans nothing; low confidence is the safe read, and it must
-    # not throw. (Real Trino emits inputTableColumnInfos: [].)
+def test_a_query_touching_no_table_is_free_not_unpriceable() -> None:
+    # SELECT 1 and UNNEST over a local array scan nothing, and Trino emits
+    # inputTableColumnInfos: []. Blocking them as un-estimable denied queries
+    # that cannot exceed a scan budget by construction.
     est = parse_io_estimate(json.dumps({"inputTableColumnInfos": []}))
-    assert est.confidence == "low"
-    assert est.scanned_bytes is None
+    assert est.confidence == "high"
+    assert est.scanned_bytes == 0
+    assert est.row_estimate == 0
 
 
 def test_infinity_is_rejected_not_summed_into_a_giant_number() -> None:
@@ -189,3 +191,32 @@ def test_non_dict_table_list_fails_safe() -> None:
     payload = json.dumps({"inputTableColumnInfos": "not a list"})
     est = parse_io_estimate(payload)
     assert est.confidence == "low"
+
+
+def test_plan_entry_counts_reads_the_table_identity() -> None:
+    payload = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {"outputRowCount": 1.0, "outputSizeInBytes": 1.0},
+                },
+                {
+                    "table": {
+                        "catalog": "TPCH",
+                        "schemaTable": {"schema": "TINY", "table": "ORDERS"},
+                    },
+                    "estimate": {"outputRowCount": 1.0, "outputSizeInBytes": 1.0},
+                },
+            ]
+        }
+    )
+    assert plan_entry_counts(payload) == {"tpch.tiny.orders": 2}
+
+
+def test_plan_entry_counts_of_a_malformed_plan_is_empty() -> None:
+    assert plan_entry_counts("not json") == {}
+    assert plan_entry_counts(json.dumps({"inputTableColumnInfos": None})) == {}

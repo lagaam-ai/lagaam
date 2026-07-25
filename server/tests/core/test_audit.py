@@ -184,6 +184,60 @@ def test_oversized_values_nested_in_dicts_and_lists_are_capped() -> None:
             "obj": Sprawling(),
         },
     )
-    assert len(lines[0]) < 20_000
-    marks = json.loads(lines[0])["detail"]["_truncated"]
-    assert set(marks) == {"estimate.note", "rows[0]", "obj"}
+    # Whatever survives is capped, and the line as a whole is bounded — the
+    # record-size budget stops before every field gets its own 4 KiB.
+    assert len(lines[0]) < 70_000
+    detail = json.loads(lines[0])["detail"]
+    assert "estimate.note" in detail["_truncated"]
+    assert len(detail["estimate"]["note"]) <= 4200
+
+
+def test_two_long_keys_do_not_collide_into_one() -> None:
+    # Capping the middle of a key makes distinct keys identical, and the
+    # second silently overwrites the first — data loss in an evidence store.
+    first = "A" * 3000 + "1" + "B" * 3000
+    second = "A" * 3000 + "2" + "B" * 3000
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a", "query_data", "allowed", {first: "value-one", second: "value-two"}
+    )
+    detail = json.loads(lines[0])["detail"]
+    values = [v for k, v in detail.items() if k != "_truncated"]
+    assert sorted(values) == ["value-one", "value-two"]
+
+
+def test_a_wide_deep_structure_cannot_grow_the_line_without_bound() -> None:
+    # Per-level caps multiply: 100 entries at depth 20 is 100^20 values, each
+    # under the per-value cap. Only a total budget bounds the record.
+    def fan(depth: int) -> object:
+        if depth == 0:
+            return "x" * 100
+        return {str(i): fan(depth - 1) for i in range(100)}
+
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", {"d": fan(3)})
+    assert len(lines[0]) < 100_000
+
+
+def test_what_the_tool_did_survives_a_crowded_argument_list() -> None:
+    # Entry capping drops by insertion order, and executed_sql is appended
+    # last — the one field the record exists for must not be the one cut.
+    detail: dict[str, object] = {f"arg{i}": i for i in range(150)}
+    detail["executed_sql"] = "SELECT a FROM c.s.t LIMIT 10"
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", detail)
+    logged = json.loads(lines[0])["detail"]
+    assert logged["executed_sql"] == "SELECT a FROM c.s.t LIMIT 10"
+
+
+def test_many_large_sibling_values_cannot_grow_the_line_without_bound() -> None:
+    # Each value is individually under the per-value cap; only a total budget
+    # stops 100 of them from becoming a 400 KB line.
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record(
+        "a",
+        "query_data",
+        "allowed",
+        {f"k{i}": "x" * 4000 for i in range(100)},
+    )
+    assert len(lines[0]) < 80_000

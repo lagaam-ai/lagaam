@@ -39,6 +39,11 @@ _ELISION = "…[{cut} chars elided]…"
 # small entries is the same disk-fill by another route.
 _MAX_ENTRIES = 100
 _MAX_DEPTH = 20
+_MAX_RECORD_CHARS = 64 * 1024
+
+# What a tool contributes about what it actually did — emitted ahead of the
+# agent's own arguments so no argument list can crowd it out.
+_RESERVED_KEYS = ("executed_sql", "estimate", "row_count", "truncated", "reason")
 
 
 def _cap(value: str) -> tuple[str, dict[str, Any]] | None:
@@ -64,10 +69,39 @@ def _capped(text: str, marks: dict[str, Any], path: str) -> str:
     return capped[0]
 
 
+def _capped_key(text: str, marks: dict[str, Any], path: str) -> str:
+    """Shorten a dict key, keeping distinct keys distinct.
+
+    Two keys sharing a head and tail cap to the same string and silently
+    overwrite each other, so the hash of the original goes in the key itself.
+    """
+    if len(text) <= _MAX_VALUE_CHARS:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    return f"{_capped(text, marks, path)}#{digest}"
+
+
+class _Budget:
+    """A running character allowance for one record.
+
+    Per-level caps multiply: 100 entries at depth 20 is 100^20 values, each
+    under the per-value cap and together unbounded. Only a total bounds the
+    line.
+    """
+
+    def __init__(self, total: int) -> None:
+        self.left = total
+
+    def take(self, text: str) -> bool:
+        self.left -= len(text)
+        return self.left > 0
+
+
 def _bounded(
     value: Any,
     marks: dict[str, Any],
     path: str,
+    budget: _Budget,
     seen: frozenset[int] = frozenset(),
     depth: int = 0,
 ) -> Any:
@@ -79,6 +113,8 @@ def _bounded(
     are bounded too: an audit record that cannot be built is an audit record
     that goes missing, which is the failure this whole function prevents.
     """
+    if budget.left <= 0:
+        return "<record size limit>"
     if isinstance(value, dict | list | tuple):
         if id(value) in seen:
             return "<circular>"
@@ -86,25 +122,36 @@ def _bounded(
             return "<too deeply nested>"
         seen = seen | {id(value)}
     if isinstance(value, dict):
-        items = list(value.items())[:_MAX_ENTRIES]
-        out = {
-            _capped(str(k), marks, f"{path}.<key>" if path else "<key>"): _bounded(
-                v, marks, f"{path}.{k}" if path else str(k), seen, depth + 1
+        out: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= _MAX_ENTRIES or budget.left <= 0:
+                marks[path or "<root>"] = {"entries": len(value)}
+                break
+            key_text = str(key)
+            budget.take(key_text)
+            out[_capped_key(key_text, marks, f"{path}.<key>" if path else "<key>")] = (
+                _bounded(
+                    item,
+                    marks,
+                    f"{path}.{key}" if path else key_text,
+                    budget,
+                    seen,
+                    depth + 1,
+                )
             )
-            for k, v in items
-        }
-        if len(value) > _MAX_ENTRIES:
-            marks[path or "<root>"] = {"entries": len(value)}
         return out
     if isinstance(value, list | tuple):
-        out_list = [
-            _bounded(v, marks, f"{path}[{i}]", seen, depth + 1)
-            for i, v in enumerate(value[:_MAX_ENTRIES])
-        ]
-        if len(value) > _MAX_ENTRIES:
-            marks[path] = {"entries": len(value)}
+        out_list: list[Any] = []
+        for index, item in enumerate(value):
+            if index >= _MAX_ENTRIES or budget.left <= 0:
+                marks[path] = {"entries": len(value)}
+                break
+            out_list.append(
+                _bounded(item, marks, f"{path}[{index}]", budget, seen, depth + 1)
+            )
         return out_list
     if isinstance(value, str):
+        budget.take(value)
         return _capped(value, marks, path)
     if isinstance(value, int | float | bool) or value is None:
         return value
@@ -113,13 +160,21 @@ def _bounded(
     except Exception:
         # A value that cannot describe itself must not take the record with it.
         return f"<unstringable {type(value).__name__}>"
+    budget.take(text)
     return _capped(text, marks, path)
 
 
 def _truncated(detail: dict[str, Any]) -> dict[str, Any]:
-    """Cap oversized values anywhere in the detail, marking what was cut."""
+    """Cap oversized values anywhere in the detail, marking what was cut.
+
+    Keys a tool contributes are emitted first, so a caller cannot bury the
+    executed SQL behind enough arguments to push it past the entry cap.
+    """
+    ordered = {
+        key: detail[key] for key in _RESERVED_KEYS if key in detail
+    } | {key: value for key, value in detail.items() if key not in _RESERVED_KEYS}
     marks: dict[str, Any] = {}
-    out = _bounded(detail, marks, "")
+    out = _bounded(ordered, marks, "", _Budget(_MAX_RECORD_CHARS))
     if marks:
         # One reserved key, so an agent-supplied field cannot forge a marker.
         out["_truncated"] = marks

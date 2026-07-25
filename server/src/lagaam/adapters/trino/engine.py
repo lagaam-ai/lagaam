@@ -13,7 +13,7 @@ import trino.dbapi
 import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
-from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 from lagaam.adapters.trino.numbers import finite_number
 from lagaam.core.errors import (
     EngineError,
@@ -23,7 +23,7 @@ from lagaam.core.errors import (
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
-from lagaam.core.scans import has_unpriceable_shape, scan_multiplier
+from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
@@ -60,20 +60,34 @@ def _detail(exc: Exception) -> str:
     return getattr(exc, "message", None) or str(exc)
 
 
-def _scaled(estimate: CostEstimate, multiplier: int) -> CostEstimate:
-    """Charge a quote for every scan the plan may have collapsed into one."""
-    if multiplier <= 1 or estimate.confidence == "low":
+def _collapse_factor(sql_counts: dict[str, int], plan_counts: dict[str, int]) -> int:
+    """How many scans the plan folded into one entry, at worst.
+
+    The plan collapses two scans of the same table when they read the same
+    columns, and reports them separately when they don't — so the SQL's
+    reference count alone over-charges. Only the shortfall between what the
+    SQL reads and what the plan reported needs making up.
+    """
+    factors = [
+        count // plan_counts[table]
+        for table, count in sql_counts.items()
+        if plan_counts.get(table)
+    ]
+    return max(factors, default=1)
+
+
+def _scaled(estimate: CostEstimate, factor: int) -> CostEstimate:
+    """Charge a quote for every scan the plan collapsed into one entry."""
+    if factor <= 1 or estimate.confidence == "low":
         return estimate
     return CostEstimate(
         scanned_bytes=(
             None
             if estimate.scanned_bytes is None
-            else estimate.scanned_bytes * multiplier
+            else estimate.scanned_bytes * factor
         ),
         row_estimate=(
-            None
-            if estimate.row_estimate is None
-            else estimate.row_estimate * multiplier
+            None if estimate.row_estimate is None else estimate.row_estimate * factor
         ),
         confidence=estimate.confidence,
     )
@@ -269,7 +283,11 @@ class TrinoEngine:
         # a crash, and no quote fails safe at the gate.
         if row is None:
             return CostEstimate(confidence="low")
-        return _scaled(parse_io_estimate(row[0]), scan_multiplier(sql, dialect))
+        io_json = row[0]
+        factor = _collapse_factor(
+            table_scan_counts(sql, dialect), plan_entry_counts(io_json)
+        )
+        return _scaled(parse_io_estimate(io_json), factor)
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:

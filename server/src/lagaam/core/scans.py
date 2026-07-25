@@ -30,16 +30,29 @@ from sqlglot import exp
 
 _GENERATORS = (exp.Unnest, exp.Explode, exp.Posexplode)
 
-# Functions whose row count comes from an argument rather than from the data:
-# a column reference among their arguments bounds nothing. repeat(col, 10000)
-# manufactures 10000 rows per input row while looking column-fed.
-_CARDINALITY_FUNCS = {
-    "sequence",
-    "generate_series",
-    "generate_timestamp_array",
-    "repeat",
-    "array_repeat",
-    "ngrams",
+# A relation an agent spells out inline is a lookup table, not a multiplier.
+# Past this many rows it stops being one: crossing a 1.5M-row scan against
+# 20,000 inline values is 30 billion rows the plan prices as one scan.
+_MAX_INLINE_ROWS = 1000
+
+# Functions that reshape an array without changing how many rows it yields.
+# Anything else feeding a generator is assumed to invent rows: a denylist is
+# unsound here, because a function sqlglot does not model natively parses as
+# Anonymous and would simply be invisible.
+_ROW_PRESERVING_FUNCS = {
+    "array_sort",
+    "array_distinct",
+    "reverse",
+    "shuffle",
+    "slice",
+    "trim_array",
+    "filter",
+    "transform",
+    "cast",
+    "try_cast",
+    "coalesce",
+    "if",
+    "nullif",
 }
 
 
@@ -58,21 +71,38 @@ def _conjuncts(node: exp.Expr) -> Iterator[exp.Expr]:
         yield node
 
 
-def _joined_sources(predicate: exp.Expr) -> tuple[str, str] | None:
-    """The two aliases a bare column-to-column equality relates, if any.
+def _predicate_sources(side: exp.Expr) -> set[str] | None:
+    """The sources one side of an equality reads, or None if unhashable.
 
-    Both sides must be plain columns: `a.k + b.k = 5` and `a.k = (SELECT ...)`
-    are equalities the engine cannot hash on, so they leave a nested loop.
+    A scalar subquery is opaque to the planner's join criteria, so an equality
+    against one leaves a nested loop however it is written.
+    """
+    if side.find(exp.Select, exp.Subquery) is not None:
+        return None
+    return {
+        column.table.lower()
+        for column in side.find_all(exp.Column)
+        if column.table
+    }
+
+
+def _joined_sources(predicate: exp.Expr) -> tuple[str, str] | None:
+    """The two sources an equality lets the engine hash on, if any.
+
+    Each side must read exactly one source, and the two must differ — that is
+    what Trino compiles into join criteria. The keys themselves may be
+    expressions: `ON year(a.d) = year(b.d) + 1` is a hash join, while
+    `ON a.k + b.k = 5` mixes both sources into one side and is a nested loop.
     """
     if not isinstance(predicate, exp.EQ):
         return None
-    left, right = predicate.left, predicate.right
-    if not (isinstance(left, exp.Column) and isinstance(right, exp.Column)):
+    left = _predicate_sources(predicate.left)
+    right = _predicate_sources(predicate.right)
+    if left is None or right is None:
         return None
-    if not (left.table and right.table):
+    if len(left) != 1 or len(right) != 1 or left == right:
         return None
-    one, two = left.table.lower(), right.table.lower()
-    return None if one == two else (one, two)
+    return (left.pop(), right.pop())
 
 
 def _equi_join_pairs(condition: exp.Expr | None) -> set[frozenset[str]]:
@@ -87,37 +117,75 @@ def _equi_join_pairs(condition: exp.Expr | None) -> set[frozenset[str]]:
     return pairs
 
 
+def _func_name(func: exp.Func) -> str:
+    """The function's source name. Anonymous holds it in .name, and its
+    sql_name() is the useless literal "ANONYMOUS" — read .name first."""
+    return (func.name or func.sql_name() or "").lower()
+
+
 def _generates_rows(tree: exp.Expr) -> bool:
     """True if the query invents rows the IO plan cannot see.
 
     UNNEST over a column expands rows of a table already in the plan; UNNEST
-    over sequence(...) or repeat(...) manufactures them from an argument.
+    over sequence(...) or repeat(col, 10000) manufactures them from an
+    argument. Anything the gate cannot recognise counts as manufacturing:
+    the plan prices scans, and a generator is not one.
     """
     for generator in tree.find_all(*_GENERATORS):
-        for func in generator.find_all(exp.Func):
-            name = (func.sql_name() or func.name or "").lower()
-            if name in _CARDINALITY_FUNCS:
-                return True
         if _expands_a_bounded_value(generator):
             continue
-        if not list(generator.find_all(exp.Column)):
-            # No column feeding it: whatever it expands is literal or computed.
-            return True
+        return True
     return False
 
 
 def _expands_a_bounded_value(generator: exp.Expr) -> bool:
-    """True if the generator's input spells out its own length.
+    """True if the generator's input is bounded by something already priced.
 
-    UNNEST(ARRAY['O','F']) is a two-row lookup table an agent writes inline;
-    it invents nothing the plan needs to price.
+    Two bounded shapes: a literal the agent spelled out (UNNEST(ARRAY['O','F'])
+    is a two-row lookup table), and a column of a table the IO plan already
+    counted, reshaped by functions that cannot change its length.
     """
-    inputs = [generator.this, *(generator.expressions or [])]
-    return bool(inputs) and all(
-        isinstance(value, exp.Array | exp.Struct)
-        for value in inputs
+    inputs = [
+        value
+        for value in (generator.this, *(generator.expressions or []))
         if value is not None
-    )
+    ]
+    if not inputs:
+        return False
+    return all(_is_bounded_input(value) for value in inputs)
+
+
+def _is_bounded_input(value: exp.Expr) -> bool:
+    """True if this generator argument yields a length something else fixes."""
+    if isinstance(value, exp.Array | exp.Struct):
+        # A literal spells out its own length — but spelling out 20,000 of
+        # them multiplies every scanned row by 20,000 just the same.
+        if len(value.expressions or []) > _MAX_INLINE_ROWS:
+            return False
+        # The elements themselves must be literal: ARRAY[sequence(1, 1e9)]
+        # spells out one element and yields a billion rows.
+        return all(
+            isinstance(element, exp.Literal)
+            for element in (value.expressions or [])
+        )
+    if isinstance(value, exp.Column):
+        return True
+    if isinstance(value, exp.Func):
+        if _func_name(value) not in _ROW_PRESERVING_FUNCS:
+            return False
+        # Anonymous keeps the function's own name in .this, not an argument.
+        positional = value.expressions or []
+        if not isinstance(value, exp.Anonymous):
+            positional = [value.this, *positional]
+        arguments = [
+            argument
+            for argument in positional
+            if argument is not None and not isinstance(argument, exp.Literal)
+        ]
+        # A reshaping function with no argument left to check is reshaping a
+        # literal, which cannot add rows.
+        return all(_is_bounded_input(argument) for argument in arguments)
+    return False
 
 
 def _source_alias(source: exp.Expr) -> str | None:
@@ -129,8 +197,30 @@ def _source_alias(source: exp.Expr) -> str | None:
     return None
 
 
+def _has_ambiguous_alias(tree: exp.Expr) -> bool:
+    """True if two sources in one FROM answer to the same name.
+
+    An alias is how a predicate names a source, so two sources sharing one
+    means an equality that appears to constrain a join may constrain a
+    different source entirely, leaving this one a product.
+    """
+    for select in tree.find_all(exp.Select):
+        sources = [select.args.get("from")] + list(select.args.get("joins") or [])
+        names = [
+            _source_alias(part.this)
+            for part in sources
+            if part is not None and part.this is not None
+        ]
+        present = [name for name in names if name is not None]
+        if len(present) != len(set(present)):
+            return True
+    return False
+
+
 def _has_product_join(tree: exp.Expr) -> bool:
     """True if any join pairs rows without an equality to match them on."""
+    if _has_ambiguous_alias(tree):
+        return True
     for join in tree.find_all(exp.Join):
         if join.args.get("using") is not None:
             continue
@@ -165,10 +255,45 @@ def _bounded_source(source: exp.Expr) -> bool:
     if isinstance(source, _GENERATORS):
         return not _generates_rows(source)
     if isinstance(source, exp.Values):
-        return True
+        return len(source.expressions or []) <= _MAX_INLINE_ROWS
     if isinstance(source, exp.Query):
         # A subquery reading no table can only produce the rows it spells out.
         return not list(source.find_all(exp.Table))
+    return False
+
+
+def _has_nested_loop_correlation(tree: exp.Expr) -> bool:
+    """True if a correlated subquery is joined to its outer query by anything
+    but an equality.
+
+    A subquery that references an outer column runs once per outer row — the
+    same product a join makes, with no exp.Join node anywhere to notice it.
+    An equality lets the planner decorrelate it into a hash join; an
+    inequality leaves the nested loop.
+    """
+    for subquery in tree.find_all(exp.Select):
+        parent_select = subquery.parent_select
+        if parent_select is None:
+            continue
+        own = {
+            _source_alias(part.this)
+            for part in [subquery.args.get("from")]
+            + list(subquery.args.get("joins") or [])
+            if part is not None and part.this is not None
+        }
+        where = subquery.args.get("where")
+        if where is None:
+            continue
+        outer_refs = {
+            column.table.lower()
+            for column in where.find_all(exp.Column)
+            if column.table and column.table.lower() not in own
+        }
+        if not outer_refs:
+            continue
+        pairs = _equi_join_pairs(where.this)
+        if not any(outer_refs & set(pair) for pair in pairs):
+            return True
     return False
 
 
@@ -185,29 +310,32 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
 
     if _generates_rows(tree):
         return True
+    if _has_nested_loop_correlation(tree):
+        return True
     return _has_product_join(tree)
 
 
-def scan_multiplier(sql: str, dialect: str) -> int:
-    """How many times over the IO byte sum may undercount this query.
+def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
+    """How many times the SQL reads each fully-qualified table.
 
-    Measured against Trino 476: the plan emits one entry per distinct
-    (table, column-set), so two scans of the same table reading the *same*
-    columns collapse into one entry — `orders a JOIN orders b ON
-    a.orderkey = b.orderkey` reports a single scan and bills half the work.
-    Two scans reading different columns get an entry each and need no
-    correction, but the plan does not say which case it is, so the quote is
-    scaled by the worst one the SQL admits.
+    The IO plan collapses scans that read the same columns of the same table
+    into one entry, so its byte sum can undercount. Comparing these counts
+    against the entries the plan actually returned says by how much. CTE
+    references are excluded: they name a result, not another scan.
 
-    Returns 1 for unparseable SQL: the shape check has already refused it.
+    Returns {} for unparseable SQL — the shape check has already refused it.
     """
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
     except sqlglot.errors.SqlglotError:
-        return 1
+        return {}
 
+    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
     counts: dict[str, int] = {}
     for table in tree.find_all(exp.Table):
-        key = ".".join(part.name for part in table.parts).lower()
+        parts = [part.name for part in table.parts]
+        if len(parts) == 1 and parts[0].lower() in ctes:
+            continue
+        key = ".".join(parts).lower()
         counts[key] = counts.get(key, 0) + 1
-    return max(counts.values(), default=1)
+    return counts

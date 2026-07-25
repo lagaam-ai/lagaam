@@ -7,7 +7,7 @@ operator, so the sum already counts it. The cost gate degrades a misprice-able
 quote to low confidence; this module spots the shapes from the SQL.
 """
 
-from lagaam.core.scans import has_unpriceable_shape, scan_multiplier
+from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
 
 
 def unpriceable(sql: str) -> bool:
@@ -257,7 +257,8 @@ def test_unnest_of_a_literal_array_is_priceable() -> None:
 
 
 def multiplier(sql: str) -> int:
-    return scan_multiplier(sql, dialect="trino")
+    counts = table_scan_counts(sql, dialect="trino")
+    return max(counts.values(), default=1)
 
 
 def test_a_single_scan_needs_no_scaling() -> None:
@@ -296,3 +297,102 @@ def test_same_name_in_different_catalogs_is_not_scaled() -> None:
 def test_unparseable_sql_is_not_scaled() -> None:
     # The shape check has already refused it; scaling nothing is correct.
     assert multiplier("not valid sql !!!") == 1
+
+
+# --- what an inline relation and an alias actually bound ------------------
+
+
+def test_a_huge_inline_array_is_a_multiplier_not_a_lookup() -> None:
+    # ARRAY['O','F'] is a lookup table; 20,000 elements crossed into a 1.5M
+    # row scan is 30 billion rows the plan still prices as one scan.
+    elements = ",".join(str(i) for i in range(20_000))
+    assert unpriceable(
+        f"SELECT count(x) FROM hive.s.orders a "
+        f"CROSS JOIN UNNEST(ARRAY[{elements}]) AS t(x)"
+    )
+
+
+def test_a_huge_inline_values_relation_is_unpriceable() -> None:
+    rows = ",".join(f"({i})" for i in range(20_000))
+    assert unpriceable(
+        f"SELECT count(v.x) FROM hive.s.orders a "
+        f"CROSS JOIN (VALUES {rows}) AS v(x)"
+    )
+
+
+def test_two_sources_sharing_an_alias_are_unpriceable() -> None:
+    # An alias is how a predicate names a source. Two sources answering to
+    # one name means an equality may constrain a different source entirely.
+    assert unpriceable(
+        "SELECT count(a.k) FROM hive.s.orders a, hive.s.lineitem b, "
+        "hive.s.customer b WHERE a.k = b.k"
+    )
+
+
+def test_a_correlated_subquery_without_an_equality_is_unpriceable() -> None:
+    # A nested-loop product with no exp.Join node anywhere to notice it.
+    assert unpriceable(
+        "SELECT count(o.k) FROM hive.s.orders o WHERE "
+        "(SELECT count(*) FROM hive.s.lineitem l WHERE l.q > o.p) > 0"
+    )
+
+
+def test_a_correlated_subquery_on_an_equality_is_priceable() -> None:
+    # The planner decorrelates this into a hash join.
+    assert not unpriceable(
+        "SELECT c.n, (SELECT count(*) FROM hive.s.orders o WHERE o.ck = c.ck) "
+        "FROM hive.s.customer c"
+    )
+
+
+# --- generators the parser does not model natively ------------------------
+
+
+def test_an_unmodelled_generator_function_is_unpriceable() -> None:
+    # sqlglot parses an unknown function as Anonymous, whose sql_name() is the
+    # literal "ANONYMOUS" — a denylist of names cannot see it at all.
+    for call in ("ngrams(a.words, 2)", "array_repeat(a.k, 10000)", "mystery(a.k)"):
+        assert unpriceable(
+            f"SELECT t.n FROM hive.s.orders a CROSS JOIN UNNEST({call}) AS t(n)"
+        ), call
+
+
+def test_a_reshaping_function_over_a_column_is_priceable() -> None:
+    # shuffle/array_sort cannot change how many rows the array yields.
+    assert not unpriceable(
+        "SELECT t.i FROM hive.s.orders o CROSS JOIN UNNEST(shuffle(o.items)) AS t(i)"
+    )
+
+
+def test_a_generator_hidden_inside_a_literal_array_is_unpriceable() -> None:
+    assert unpriceable(
+        "SELECT t.n FROM hive.s.orders a "
+        "CROSS JOIN UNNEST(ARRAY[sequence(1, 1000000)]) AS t(n)"
+    )
+
+
+# --- expression equi-joins are joins ---------------------------------------
+
+
+def test_an_equality_on_computed_keys_is_priceable() -> None:
+    # Trino compiles each of these to a hash InnerJoin with real criteria;
+    # demanding bare columns denied ordinary year-over-year and normalized
+    # joins for nothing.
+    for predicate in (
+        "year(a.d) = year(b.d) + 1",
+        "lower(a.k) = lower(b.k)",
+        "date_trunc('month', a.d) = date_trunc('month', b.d)",
+        "CAST(a.k AS VARCHAR) = CAST(b.k AS VARCHAR)",
+        "coalesce(a.k, 0) = b.k",
+    ):
+        assert not unpriceable(
+            f"SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON {predicate}"
+        ), predicate
+
+
+def test_an_equality_mixing_both_sources_on_one_side_is_unpriceable() -> None:
+    # a.k + b.k = 5 reads both sources on the left, so there is no key to
+    # hash: the engine still compares every pair.
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON a.k + b.k = 5"
+    )
