@@ -5,6 +5,7 @@ are part of the API, like the domain errors.
 """
 
 import pytest
+import sqlglot
 
 from lagaam.core.errors import SqlValidationError
 from lagaam.core.safety import validate_query
@@ -164,3 +165,41 @@ def test_comments_are_stripped_from_the_executed_sql() -> None:
     safe = validate_query(padded, dialect="trino", default_limit=10)
     assert "xxxx" not in safe
     assert safe == "SELECT a FROM c.s.t WHERE k = 1 LIMIT 10"
+
+
+def test_grouping_sets_survive_the_parser_gap() -> None:
+    # sqlglot 30.12/30.13 cannot read a LIMIT directly after GROUP BY
+    # ROLLUP/CUBE/GROUPING SETS, though Trino runs it. Denying core BI SQL
+    # over a parser bug is a gate failure, not strictness.
+    for group in (
+        "ROLLUP (a)",
+        "CUBE (a, b)",
+        "GROUPING SETS ((a), ())",
+    ):
+        for tail in ("", " LIMIT 10"):
+            sql = f"SELECT a, count(*) FROM c.s.t GROUP BY {group}{tail}"
+            safe = validate_query(sql, dialect="trino", default_limit=1001)
+            # Every downstream gate re-parses this; it must read back.
+            assert sqlglot.parse_one(safe, dialect="trino") is not None, sql
+
+
+def test_a_user_limit_on_a_grouping_set_is_honoured() -> None:
+    safe = validate_query(
+        "SELECT a, count(*) FROM c.s.t GROUP BY ROLLUP (a) LIMIT 7",
+        dialect="trino",
+        default_limit=1001,
+    )
+    assert "LIMIT 7" in safe
+    assert "1001" not in safe
+
+
+def test_the_parser_workaround_does_not_excuse_bad_sql() -> None:
+    # The fallback fires only on that exact tail, and only after the SQL has
+    # already failed to parse — it is not a second chance for anything else.
+    for sql in (
+        "SELECT FROM WHERE GROUP BY ROLLUP (a) LIMIT 5",
+        "DELETE FROM c.s.t",
+        "SELECT * FROM c.s.t GROUP BY ROLLUP (a) LIMIT 5",
+    ):
+        with pytest.raises(SqlValidationError):
+            validate_query(sql, dialect="trino", default_limit=1001)

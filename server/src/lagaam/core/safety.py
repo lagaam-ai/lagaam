@@ -8,6 +8,8 @@ This is parse-level safety, not authorization — table permissions (U7) and
 engine-side access control remain the real enforcement layers.
 """
 
+import re
+
 import sqlglot
 from sqlglot import exp
 
@@ -28,6 +30,36 @@ _DENY_NODES = (
 )
 
 
+_GROUPING_LIMIT = re.compile(
+    r"(GROUP\s+BY\s+(?:ROLLUP|CUBE|GROUPING\s+SETS)\b.*?)\s+(LIMIT\s+\d+)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _parse_statements(sql: str, dialect: str) -> list[exp.Expr | None]:
+    """Parse the agent's SQL, working around one parser gap.
+
+    sqlglot 30.12 and 30.13 cannot read a LIMIT directly after GROUP BY
+    ROLLUP/CUBE/GROUPING SETS, though Trino runs it. Rejecting it would deny
+    a core BI shape over a parser bug, so the LIMIT is re-attached to the
+    tree after parsing the query without it. Only that exact tail is touched,
+    and only after the unmodified SQL has already failed.
+    """
+    try:
+        return list(sqlglot.parse(sql, dialect=dialect))
+    except sqlglot.errors.ParseError:
+        match = _GROUPING_LIMIT.search(sql)
+        if match is None:
+            raise
+        statements = list(sqlglot.parse(sql[: match.end(1)], dialect=dialect))
+        rows = int(re.sub(r"\D", "", match.group(2)))
+        tail = statements[-1] if statements else None
+        if not isinstance(tail, exp.Query):
+            raise
+        statements[-1] = tail.limit(rows)
+        return statements
+
+
 def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     """Validate one read-only SELECT and return the canonical SQL to execute.
 
@@ -37,7 +69,7 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     the outer query has none.
     """
     try:
-        statements = sqlglot.parse(sql, dialect=dialect)
+        statements = _parse_statements(sql, dialect)
     except sqlglot.errors.ParseError as errs:
         first = errs.errors[0] if errs.errors else {}
         where = f" (line {first.get('line')}, col {first.get('col')})" if first else ""
@@ -96,4 +128,43 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
 
     # Comments carry nothing the engine needs, and kilobytes of them are how
     # an agent pushes the real query out of a truncated audit line.
-    return tree.sql(dialect=dialect, comments=False)
+    rendered = tree.sql(dialect=dialect, comments=False)
+    return _reparseable(rendered, tree, dialect)
+
+
+def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
+    """The validated SQL in a form the parser can read back.
+
+    Every downstream gate re-parses this string and denies what it cannot
+    read, so a shape sqlglot emits but cannot re-read is a shape the server
+    refuses outright. sqlglot 30.12 and 30.13 cannot parse a LIMIT directly
+    after GROUP BY ROLLUP/CUBE/GROUPING SETS — which is ordinary BI SQL, not
+    an attack — so the LIMIT moves outside a wrapper the parser accepts.
+    """
+    try:
+        sqlglot.parse_one(rendered, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        pass
+    else:
+        return rendered
+
+    limit = tree.args.get("limit")
+    if limit is None or not isinstance(tree, exp.Query):
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        )
+    inner = tree.copy()
+    inner.set("limit", None)
+    wrapped = (
+        exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(limit.expression)
+    )
+    rendered = wrapped.sql(dialect=dialect, comments=False)
+    try:
+        sqlglot.parse_one(rendered, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        ) from None
+    return rendered
