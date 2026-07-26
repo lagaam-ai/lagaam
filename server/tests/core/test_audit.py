@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from lagaam.core.audit import AuditLog
+from lagaam.core.audit import AuditLog, _truncated
 
 
 def test_event_is_one_json_line_with_the_core_fields() -> None:
@@ -241,3 +241,21 @@ def test_many_large_sibling_values_cannot_grow_the_line_without_bound() -> None:
         {f"k{i}": "x" * 4000 for i in range(100)},
     )
     assert len(lines[0]) < 80_000
+
+
+def test_a_supplied_truncation_marker_cannot_be_forged() -> None:
+    # A forged marker would show a forensic reader an elision and a fake hash
+    # on SQL that was in fact logged in full.
+    out = _truncated(
+        {
+            "executed_sql": "SELECT a FROM c.s.t",
+            "_truncated": {"executed_sql": {"chars": 999999, "sha256": "deadbeef"}},
+        }
+    )
+    assert "_truncated" not in out
+    assert out["executed_sql"] == "SELECT a FROM c.s.t"
+
+
+def test_a_real_truncation_still_marks_itself() -> None:
+    out = _truncated({"executed_sql": "x" * 9000})
+    assert out["_truncated"]["executed_sql"]["chars"] == 9000

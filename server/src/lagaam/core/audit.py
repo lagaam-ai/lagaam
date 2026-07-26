@@ -45,6 +45,10 @@ _MAX_RECORD_CHARS = 64 * 1024
 # agent's own arguments so no argument list can crowd it out.
 _RESERVED_KEYS = ("executed_sql", "estimate", "row_count", "truncated", "reason")
 
+# The marker _truncated() writes to say what it cut. Reserved so a supplied
+# field cannot forge an elision on SQL that was in fact logged in full.
+_MARKER_KEY = "_truncated"
+
 
 def _cap(value: str) -> tuple[str, dict[str, Any]] | None:
     """Shorten one oversized string, keeping both ends.
@@ -170,14 +174,14 @@ def _truncated(detail: dict[str, Any]) -> dict[str, Any]:
     Keys a tool contributes are emitted first, so a caller cannot bury the
     executed SQL behind enough arguments to push it past the entry cap.
     """
+    supplied = {key: value for key, value in detail.items() if key != _MARKER_KEY}
     ordered = {
-        key: detail[key] for key in _RESERVED_KEYS if key in detail
-    } | {key: value for key, value in detail.items() if key not in _RESERVED_KEYS}
+        key: supplied[key] for key in _RESERVED_KEYS if key in supplied
+    } | {key: value for key, value in supplied.items() if key not in _RESERVED_KEYS}
     marks: dict[str, Any] = {}
     out = _bounded(ordered, marks, "", _Budget(_MAX_RECORD_CHARS))
     if marks:
-        # One reserved key, so an agent-supplied field cannot forge a marker.
-        out["_truncated"] = marks
+        out[_MARKER_KEY] = marks
     return dict(out)
 
 
