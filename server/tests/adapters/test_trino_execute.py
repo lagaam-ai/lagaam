@@ -200,6 +200,15 @@ def test_collapse_factor_makes_up_what_the_plan_folded() -> None:
     assert _collapse_factor({"c.s.t": 3}, {}) == 1  # nothing to compare against
 
 
+def test_a_partial_collapse_rounds_up() -> None:
+    # 3 references over 2 entries is a real 1.5x shortfall; floor division
+    # would call it 1 and charge nothing for it.
+    from lagaam.adapters.trino.engine import _collapse_factor
+
+    assert _collapse_factor({"c.s.t": 3}, {"c.s.t": 2}) == 2
+    assert _collapse_factor({"c.s.t": 7}, {"c.s.t": 4}) == 2
+
+
 def test_scaled_multiplies_both_gated_dimensions() -> None:
     from lagaam.adapters.trino.engine import _scaled
     from lagaam.core.models import CostEstimate

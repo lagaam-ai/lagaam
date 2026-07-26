@@ -63,13 +63,16 @@ def _detail(exc: Exception) -> str:
 def _collapse_factor(sql_counts: dict[str, int], plan_counts: dict[str, int]) -> int:
     """How many scans the plan folded into one entry, at worst.
 
-    The plan collapses two scans of the same table when they read the same
-    columns, and reports them separately when they don't — so the SQL's
-    reference count alone over-charges. Only the shortfall between what the
-    SQL reads and what the plan reported needs making up.
+    The plan folds repeated reads of a table together — measured on Trino 476,
+    a 3-way self-join and a 4-times-referenced CTE each report one entry while
+    processing 3x and 4x the rows. Only the shortfall between what the SQL
+    reads and what the plan reported needs making up.
+
+    Rounded up: 3 references over 2 entries is a real 1.5x shortfall, and
+    floor division would discard it as no shortfall at all.
     """
     factors = [
-        count // plan_counts[table]
+        -(-count // plan_counts[table])
         for table, count in sql_counts.items()
         if plan_counts.get(table)
     ]

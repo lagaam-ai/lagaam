@@ -11,10 +11,11 @@ sum a lie, and both are about rows rather than bytes:
   manufactures rows from an argument and contributes no table entry at all,
   so it is invisible to the byte sum entirely.
 
-A table read twice is NOT one of them, despite the obvious worry: measured
-against Trino 476, the IO plan emits one entry per *scan operator*, so a
-self-join, a UNION of a table with itself, and a twice-referenced CTE each
-report two entries and the sum is already right.
+A table read twice is a third: measured against Trino 476, the IO plan emits
+one entry per *table*, not per scan — a self-join, a UNION of a table with
+itself, and a twice-referenced CTE each report a single entry while
+processing twice the rows. table_scan_counts() below recovers that shortfall
+by counting the SQL's own references for the caller to scale the quote by.
 
 We can't recover the true cost from the IO JSON, so we detect these shapes
 from the SQL and fail safe. The rules below deliberately exempt the shapes
@@ -399,10 +400,14 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
 def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
     """How many times the SQL reads each fully-qualified table.
 
-    The IO plan collapses scans that read the same columns of the same table
-    into one entry, so its byte sum can undercount. Comparing these counts
-    against the entries the plan actually returned says by how much. CTE
-    references are excluded: they name a result, not another scan.
+    Measured against Trino 476, the IO plan reports one entry per table no
+    matter how often the query reads it — a 4-times-referenced CTE and a
+    3-way self-join both return a single entry, while processing 4x and 3x
+    the rows. Comparing these counts against the entries the plan returned is
+    what recovers the shortfall.
+
+    A CTE reference is not skipped: it re-reads whatever the CTE body scans,
+    so the body's tables count once per reference to it.
 
     Returns {} for unparseable SQL — the shape check has already refused it.
     """
@@ -411,12 +416,33 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
     except sqlglot.errors.SqlglotError:
         return {}
 
-    ctes = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
     counts: dict[str, int] = {}
-    for table in tree.find_all(exp.Table):
-        parts = [part.name for part in table.parts]
-        if len(parts) == 1 and parts[0].lower() in ctes:
-            continue
-        key = ".".join(parts).lower()
-        counts[key] = counts.get(key, 0) + 1
+
+    def walk(node: exp.Expr, weight: int, pending: frozenset[str]) -> None:
+        for table in node.find_all(exp.Table):
+            parts = [part.name for part in table.parts]
+            name = parts[0].lower()
+            if len(parts) == 1 and name in bodies:
+                # A CTE that references itself would recurse forever, and its
+                # depth is the engine's business, not the quote's.
+                if name in pending:
+                    continue
+                walk(bodies[name], weight, pending | {name})
+                continue
+            key = ".".join(parts).lower()
+            counts[key] = counts.get(key, 0) + weight
+
+    # From the query with its WITH detached: a CTE body counts once per
+    # reference to it, not once where it is defined.
+    walk(_without_cte_bodies(tree), 1, frozenset())
     return counts
+
+
+def _without_cte_bodies(tree: exp.Expr) -> exp.Expr:
+    """The query with its WITH clause detached, so CTE bodies are counted
+    where they are referenced rather than once where they are defined."""
+    copy = tree.copy()
+    for with_clause in list(copy.find_all(exp.With)):
+        with_clause.pop()
+    return copy

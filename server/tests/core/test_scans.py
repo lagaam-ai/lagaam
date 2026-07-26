@@ -299,6 +299,47 @@ def test_unparseable_sql_is_not_scaled() -> None:
     assert multiplier("not valid sql !!!") == 1
 
 
+def test_a_cte_body_is_counted_once_per_reference() -> None:
+    # Measured on Trino 476: a 4-times-referenced CTE reports one IO entry
+    # and processes 4x the rows. Skipping CTE references as "a result, not a
+    # scan" left the shortfall invisible to the very factor meant to fix it.
+    cte = "WITH c AS (SELECT orderkey FROM tpch.tiny.orders) "
+    assert multiplier(cte + "SELECT orderkey FROM c a") == 1
+    assert (
+        multiplier(
+            cte + "SELECT a.orderkey FROM c a JOIN c b ON a.orderkey = b.orderkey"
+        )
+        == 2
+    )
+    assert (
+        multiplier(
+            cte + "SELECT count(*) FROM (SELECT * FROM c UNION ALL "
+            "SELECT * FROM c UNION ALL SELECT * FROM c) z"
+        )
+        == 3
+    )
+
+
+def test_an_unreferenced_cte_body_is_not_counted() -> None:
+    # A CTE nobody selects from is never scanned; counting it at its
+    # definition would charge for work the engine skips.
+    assert (
+        multiplier(
+            "WITH unused AS (SELECT orderkey FROM tpch.tiny.orders) "
+            "SELECT custkey FROM tpch.tiny.customer"
+        )
+        == 1
+    )
+
+
+def test_a_self_referencing_cte_terminates() -> None:
+    # Recursion depth is the engine's business; the quote must not hang.
+    assert multiplier(
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r "
+        "WHERE n < 5) SELECT n FROM r"
+    ) == 1
+
+
 # --- what an inline relation and an alias actually bound ------------------
 
 
