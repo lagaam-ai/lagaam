@@ -55,6 +55,10 @@ _ROW_PRESERVING_FUNCS = {
     "coalesce",
     "if",
     "nullif",
+    # MAP(ARRAY[...], ARRAY[...]) is a lookup table written inline; its rows
+    # are its key array's length, which the bounded-input check already caps.
+    "map",
+    "map_from_entries",
 }
 
 
@@ -242,8 +246,13 @@ def _source_parts(select: exp.Select) -> list[exp.Expr]:
 
 
 def _source_alias(source: exp.Expr) -> str | None:
-    """The name a predicate would use to refer to this join input."""
-    if isinstance(source, exp.Alias | exp.Subquery) and source.alias:
+    """The name a predicate would use to refer to this join input.
+
+    Lateral is included: without it every CROSS JOIN LATERAL reads as
+    unaliased, and the product check can never clear it — which denied the
+    canonical per-row-aggregate shape however well correlated it was.
+    """
+    if isinstance(source, exp.Alias | exp.Subquery | exp.Lateral) and source.alias:
         return str(source.alias).lower()
     if isinstance(source, exp.Table):
         return (source.alias or source.name).lower()
@@ -273,14 +282,24 @@ def _has_product_join(tree: exp.Expr) -> bool:
     """True if any join pairs rows without an equality to match them on."""
     if _has_ambiguous_alias(tree):
         return True
+    # One memo for the whole walk: a per-join one re-derives the same nested
+    # sources for every join above them, which is quadratic in nesting depth.
+    memo: dict[object, object] = {}
     for join in tree.find_all(exp.Join):
         if join.args.get("using") is not None:
             continue
-        if _bounded_source(join.this):
+        if _bounded_source(join.this, memo):
             continue
         alias = _source_alias(join.this)
         pairs = _equi_join_pairs(join.args.get("on"))
+        if _pins_to_one_row(join.this, join.args.get("on")):
+            continue
         if join.args.get("on") is None:
+            if _is_bound_lateral(join.this):
+                # A LATERAL carries its correlation inside itself, in neither
+                # the ON nor the enclosing WHERE. Bound by an equality, the
+                # planner decorrelates it exactly as it would a join.
+                continue
             # A comma join carries its equality in the enclosing WHERE, and
             # reads identically to the JOIN..ON form the planner rewrites it
             # to — but only for the source that equality actually names.
@@ -294,8 +313,149 @@ def _has_product_join(tree: exp.Expr) -> bool:
     return False
 
 
+def _pins_to_one_row(source: exp.Expr, on: exp.Expr | None) -> bool:
+    """True if the join pins this source to a single row by a constant.
+
+    `ON c.m = 1` against a derived table grouped by m is how a BI query
+    compares against one bucket, and Trino plans it as a bounded LeftJoin.
+    It is only bounded because the grouping makes the pinned key unique:
+    measured on Trino 476, the same shape against a bare table
+    (`ON b.linenumber = 1`) is a 15,000x product, so the grouping is the
+    whole reason and not an incidental detail.
+    """
+    if on is None:
+        return False
+    if isinstance(source, exp.Alias):
+        source = source.this
+    inner = _pinned_body(source)
+    if inner is None:
+        return False
+    group = inner.args.get("group")
+    if group is None:
+        return False
+    grouped = {
+        str(alias.alias).lower()
+        for alias in inner.expressions
+        if isinstance(alias, exp.Alias) and _groups_on(inner, alias)
+    }
+    alias = _source_alias(source)
+    for conjunct in _conjuncts(on):
+        if not isinstance(conjunct, exp.EQ):
+            continue
+        for side, other in ((conjunct.left, conjunct.right), (conjunct.right, conjunct.left)):
+            if not isinstance(other, exp.Literal):
+                continue
+            if not isinstance(side, exp.Column):
+                continue
+            if side.table.lower() == alias and side.name.lower() in grouped:
+                return True
+    return False
+
+
+def _with_clause(select: exp.Select) -> exp.With | None:
+    """This SELECT's own WITH clause.
+
+    sqlglot names it "with_", as it does "from_"; args.get() on a wrong key
+    returns None rather than raising, which reads as "no CTEs here".
+    """
+    clause = select.args.get("with_")
+    if clause is None and select.args.get("with") is not None:
+        raise AssertionError("sqlglot renamed the WITH arg key")
+    return clause if isinstance(clause, exp.With) else None
+
+
+def _pinned_body(source: exp.Expr) -> exp.Select | None:
+    """The SELECT behind this join input: the derived table itself, or the
+    body of the CTE it names. A CTE is how the same shape is written when the
+    result is reused, and it must not read as a bare table."""
+    if isinstance(source, exp.Subquery):
+        inner = source.this
+        return inner if isinstance(inner, exp.Select) else None
+    if isinstance(source, exp.Table) and len(source.parts) == 1:
+        root = source.find_ancestor(exp.Select)
+        while root is not None:
+            with_clause = _with_clause(root)
+            for cte in (with_clause.expressions or []) if with_clause else []:
+                if cte.alias_or_name.lower() == source.name.lower():
+                    body = cte.this
+                    return body if isinstance(body, exp.Select) else None
+            root = root.parent_select
+    return None
+
+
+def _groups_on(select: exp.Select, alias: exp.Alias) -> bool:
+    """True if this projection is the SELECT's only grouping key.
+
+    Only then does a constant pin select one row. Grouped by (a, b), pinning
+    b alone leaves every distinct a — measured on Trino 476 as a 15,000x
+    product, the very thing this exemption must not admit.
+    """
+    group = select.args.get("group")
+    keys = (group.expressions or []) if group is not None else []
+    return len(keys) == 1 and keys[0].sql() == alias.this.sql()
+
+
+def _is_bound_lateral(source: exp.Expr) -> bool:
+    """True if this LATERAL is tied to the outer query by an equality.
+
+    _has_nested_loop_correlation already refuses one tied by an inequality or
+    by nothing; this only has to recognise that the binding exists, since it
+    lives inside the subquery rather than in a predicate the join carries.
+    """
+    if not isinstance(source, exp.Lateral):
+        return False
+    inner = source.this
+    if isinstance(inner, exp.Subquery):
+        inner = inner.this
+    if not isinstance(inner, exp.Select):
+        return False
+    own = {
+        _source_alias(part.this)
+        for part in _source_parts(inner)
+        if part.this is not None
+    }
+    where = inner.args.get("where")
+    if where is None:
+        return False
+    for pair in _equi_join_pairs(where.this):
+        if any(name not in own for name in pair):
+            return True
+    return False
+
+
+# Distinct from a cached None ("not an inline relation"): one means not yet
+# walked, the other that we are inside walking it and hit a cycle.
+_UNVISITED = object()
+_IN_PROGRESS = object()
+_READS_TABLE = "reads_table"
+
+def _reads_a_table(node: exp.Expr, memo: dict[object, object]) -> bool:
+    """True if any table is read anywhere under this node, memoized.
+
+    Shares the caller's memo under a distinct key so one bounded walk answers
+    for every nesting level, rather than each level rescanning the subtree.
+    """
+    key = (_READS_TABLE, id(node))
+    cached = memo.get(key)
+    if cached is not None:
+        return bool(cached)
+    found = False
+    for child in node.args.values():
+        for item in child if isinstance(child, list) else [child]:
+            if isinstance(item, exp.Table):
+                found = True
+            elif isinstance(item, exp.Expr) and _reads_a_table(item, memo):
+                found = True
+            if found:
+                break
+        if found:
+            break
+    memo[key] = found
+    return found
+
+
 def _inline_cardinality(
-    source: exp.Expr, memo: dict[int, int | None] | None = None
+    source: exp.Expr, memo: dict[object, object] | None = None
 ) -> int | None:
     """How many rows this join input contributes on its own, if a fixed count.
 
@@ -310,9 +470,15 @@ def _inline_cardinality(
     """
     if memo is None:
         memo = {}
-    if id(source) in memo:
-        return memo[id(source)]
-    memo[id(source)] = None
+    cached = memo.get(id(source), _UNVISITED)
+    if cached is not _UNVISITED:
+        # _IN_PROGRESS marks a cycle: a source cannot be its own row count.
+        return cached if isinstance(cached, int) else None
+    # Keyed on what was asked about, not on what it unwraps to: writing the
+    # answer under the unwrapped node leaves the marker on the original for
+    # good, and every later reader of it reads a cycle that isn't there.
+    key = id(source)
+    memo[key] = _IN_PROGRESS
 
     if isinstance(source, exp.Alias | exp.Subquery):
         source = source.this
@@ -323,7 +489,9 @@ def _inline_cardinality(
         rows = len(source.expressions or [])
     elif isinstance(source, exp.Query):
         # A subquery reading no table can only produce the rows it spells out.
-        if not any(True for _ in source.find_all(exp.Table)):
+        # Asked of each nesting level, this rescans the whole subtree every
+        # time, which is quadratic in depth however well the rest is memoized.
+        if not _reads_a_table(source, memo):
             # A wrapper yields the product of what it reads, not the widest of
             # them, or nesting would launder the multiplier one level down.
             # Its own direct sources only: a nested one is counted when that
@@ -337,7 +505,7 @@ def _inline_cardinality(
                     if part.this is not None:
                         branch *= max(_inline_cardinality(part.this, memo) or 1, 1)
                 rows += branch
-    memo[id(source)] = rows
+    memo[key] = rows
     return rows
 
 
@@ -362,15 +530,21 @@ def _direct_selects(query: exp.Query) -> list[exp.Select]:
 
 def _generator_rows(generator: exp.Expr) -> int:
     """Rows a bounded generator yields: a literal array's length, or 1 for a
-    column, whose rows belong to a table the plan already priced."""
+    column, whose rows belong to a table the plan already priced.
+
+    Every literal array under the generator counts, not only a direct child:
+    MAP(ARRAY[...], ARRAY[...]) yields its key array's length, and reading
+    only the top node would price a 5000-entry lookup as one row.
+    """
     widest = 1
-    for value in (generator.this, *(generator.expressions or [])):
-        if isinstance(value, exp.Array | exp.Struct):
-            widest = max(widest, len(value.expressions or []))
+    for value in generator.find_all(exp.Array, exp.Struct):
+        widest = max(widest, len(value.expressions or []))
     return widest
 
 
-def _bounded_source(source: exp.Expr) -> bool:
+def _bounded_source(
+    source: exp.Expr, memo: dict[object, object] | None = None
+) -> bool:
     """True if this join input contributes a fixed or already-counted number
     of rows, so pairing against it is not a product.
 
@@ -378,7 +552,7 @@ def _bounded_source(source: exp.Expr) -> bool:
     and `CROSS JOIN UNNEST(o.items)` is how it reads a nested column — the
     rows come from a table the IO plan already priced.
     """
-    rows = _inline_cardinality(source)
+    rows = _inline_cardinality(source, memo)
     return rows is not None and rows <= _MAX_INLINE_ROWS
 
 
@@ -389,7 +563,7 @@ def _has_inline_row_product(tree: exp.Expr) -> bool:
     a scanned table is a million-fold multiplier the plan prices as one scan.
     Their product is the multiplier, so the product is what must be capped.
     """
-    memo: dict[int, int | None] = {}
+    memo: dict[object, object] = {}
     for select in tree.find_all(exp.Select):
         product = 1
         for part in _source_parts(select):
@@ -459,6 +633,7 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
         tree = sqlglot.parse_one(sql, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         return True
+
 
     if _generates_rows(tree):
         return True

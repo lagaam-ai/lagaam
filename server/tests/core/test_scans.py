@@ -10,6 +10,8 @@ confidence; this module spots the shapes from the SQL.
 
 import time
 
+import sqlglot
+
 from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
 
 
@@ -417,13 +419,18 @@ def test_deeply_nested_subqueries_do_not_burn_the_gate() -> None:
     # unmemoized walk re-descends it and goes exponential in nesting depth:
     # 49 KB of SQL cost 7.3s before this was memoized. A gate that can be
     # made to burn CPU is the unbounded work it exists to refuse.
+    #
+    # The size ceiling in safety.validate_query is what bounds this in the
+    # server, since sqlglot's own parse is superlinear too; this pins the
+    # walk itself, on an input under that ceiling.
     inner = "(VALUES (1))"
-    for _ in range(12):
+    for _ in range(11):
         inner = f"(SELECT 1 AS x FROM {inner} AS a CROSS JOIN {inner} AS b)"
     sql = f"SELECT z.x FROM {inner} AS z"
+    tree = sqlglot.parse_one(sql, dialect="trino")
     started = time.monotonic()
     # One row squared any number of times is still one row: not a product.
-    assert not unpriceable(sql)
+    assert not has_unpriceable_shape(tree.sql(dialect="trino"), dialect="trino")
     assert time.monotonic() - started < 5.0
 
 
@@ -547,6 +554,95 @@ def test_every_row_preserving_function_reshapes_a_column_freely() -> None:
         assert not unpriceable(
             f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
         ), call
+
+
+def test_null_and_boolean_arguments_do_not_block_a_reshape() -> None:
+    # A constant carries no rows, so it must not be checked as if it fed the
+    # generator: null handling is ordinary and would otherwise read as a
+    # manufactured row source.
+    for call in (
+        "coalesce(o.items, NULL)",
+        "nullif(o.items, NULL)",
+        "if(o.k > 1, o.items, NULL)",
+        "if(true, o.items, ARRAY[1])",
+        "coalesce(o.items, true)",
+    ):
+        assert not unpriceable(
+            f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
+        ), call
+
+
+def test_a_map_written_inline_is_a_bounded_lookup() -> None:
+    # MAP(ARRAY[...], ARRAY[...]) is how an agent writes a lookup table; its
+    # rows are the key array's length, which the inline cap already bounds.
+    assert not unpriceable(
+        "SELECT t.k FROM hive.s.orders o CROSS JOIN "
+        "UNNEST(MAP(ARRAY['low','high'], ARRAY[1,2])) AS t(k, v)"
+    )
+    wide = ",".join(f"'k{i}'" for i in range(1001))
+    values = ",".join(str(i) for i in range(1001))
+    assert unpriceable(
+        f"SELECT t.k FROM hive.s.orders o CROSS JOIN "
+        f"UNNEST(MAP(ARRAY[{wide}], ARRAY[{values}])) AS t(k, v)"
+    )
+    assert unpriceable(
+        "SELECT t.k FROM hive.s.orders o CROSS JOIN "
+        "UNNEST(MAP(sequence(1, 99999), sequence(1, 99999))) AS t(k, v)"
+    )
+
+
+def test_a_lateral_bound_by_an_equality_is_priceable() -> None:
+    # LATERAL carries its correlation inside itself, in neither the ON nor
+    # the enclosing WHERE — the canonical per-row-aggregate shape, which read
+    # as an unaliased product while exp.Lateral had no alias.
+    assert not unpriceable(
+        "SELECT c.n, x.t FROM hive.s.customer c CROSS JOIN LATERAL "
+        "(SELECT sum(o.p) AS t FROM hive.s.orders o WHERE o.ck = c.ck) x"
+    )
+    assert unpriceable(
+        "SELECT c.n, x.t FROM hive.s.customer c CROSS JOIN LATERAL "
+        "(SELECT sum(o.p) AS t FROM hive.s.orders o WHERE o.ck < c.ck) x"
+    )
+    assert unpriceable(
+        "SELECT c.n, x.t FROM hive.s.customer c CROSS JOIN LATERAL "
+        "(SELECT sum(o.p) AS t FROM hive.s.orders o) x"
+    )
+    # A LATERAL answering to a name already taken is the same ambiguity as
+    # any other source sharing an alias — it has to report one to be seen.
+    assert unpriceable(
+        "SELECT c.n FROM hive.s.customer c CROSS JOIN LATERAL "
+        "(SELECT sum(o.p) AS t FROM hive.s.orders o WHERE o.ck = c.ck) c"
+    )
+
+
+def test_a_constant_pin_bounds_only_a_singly_grouped_source() -> None:
+    # ON c.m = 1 against a source grouped by m alone selects one row, and
+    # Trino 476 plans it as a bounded LeftJoin. The grouping is the whole
+    # reason: the same shape against a bare table measured 15,000x.
+    grouped = (
+        "SELECT month(o.d) AS m, sum(o.p) AS t FROM hive.s.orders o "
+        "GROUP BY month(o.d)"
+    )
+    assert not unpriceable(
+        f"SELECT a.k FROM hive.s.orders a LEFT JOIN ({grouped}) c ON c.m = 1"
+    )
+    assert not unpriceable(
+        f"WITH monthly AS ({grouped}) SELECT a.m, c.t FROM monthly a "
+        "LEFT JOIN monthly c ON c.m = 1"
+    )
+    # A bare table, an ungrouped derived table, and one grouping key of two
+    # all leave many rows matching the constant.
+    assert unpriceable(
+        "SELECT a.k FROM hive.s.orders a JOIN hive.s.lineitem b ON b.ln = 1"
+    )
+    assert unpriceable(
+        "SELECT a.k FROM hive.s.orders a JOIN "
+        "(SELECT l.ln AS m FROM hive.s.lineitem l) c ON c.m = 1"
+    )
+    assert unpriceable(
+        "SELECT a.k FROM hive.s.orders a JOIN (SELECT l.ok AS m, l.ln AS n "
+        "FROM hive.s.lineitem l GROUP BY l.ok, l.ln) c ON c.n = 1"
+    )
 
 
 def test_a_generator_hidden_in_any_argument_is_unpriceable() -> None:

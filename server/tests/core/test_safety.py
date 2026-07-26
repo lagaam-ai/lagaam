@@ -4,6 +4,8 @@ Every rejection message must tell the agent what to change — these texts
 are part of the API, like the domain errors.
 """
 
+import time
+
 import pytest
 import sqlglot
 
@@ -203,3 +205,28 @@ def test_the_parser_workaround_does_not_excuse_bad_sql() -> None:
     ):
         with pytest.raises(SqlValidationError):
             validate_query(sql, dialect="trino", default_limit=1001)
+
+
+def test_oversized_sql_is_refused_before_parsing() -> None:
+    # sqlglot's parse is superlinear in nesting depth — 3 MB of nested
+    # subqueries cost 5s and 12 MB cost 25s, before any check of ours runs.
+    # The refusal has to come first, or the gate is the unbounded work.
+    inner = "(VALUES (1))"
+    for _ in range(14):
+        inner = f"(SELECT 1 AS x FROM {inner} AS a CROSS JOIN {inner} AS b)"
+    started = time.monotonic()
+    with pytest.raises(SqlValidationError, match="characters"):
+        validate_query(f"SELECT z.x FROM {inner} AS z", dialect="trino")
+    assert time.monotonic() - started < 2.0
+
+
+def test_a_long_but_ordinary_query_is_not_refused() -> None:
+    # A big IN list is how a BI tool passes a filter set; Trino accepts far
+    # more than this ceiling, so it must not catch real work.
+    values = ",".join(str(i) for i in range(5000))
+    safe = validate_query(
+        f"SELECT o.k FROM c.s.orders o WHERE o.k IN ({values})",
+        dialect="trino",
+        default_limit=1001,
+    )
+    assert "LIMIT 1001" in safe

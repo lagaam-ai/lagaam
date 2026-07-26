@@ -30,6 +30,14 @@ _DENY_NODES = (
 )
 
 
+# Parsing is superlinear in nesting depth: measured on sqlglot 30.12, 3 MB of
+# nested subqueries cost 5s and 12 MB cost 25s, before any check of ours runs.
+# The bound belongs here, ahead of the parse — a gate an agent can make burn
+# CPU is the unbounded work it exists to refuse. Trino itself accepts more
+# than this, so the ceiling is generous: a 200k-character query is a machine
+# padding the input, not an analyst asking a question.
+_MAX_SQL_CHARS = 200_000
+
 _GROUPING_LIMIT = re.compile(
     r"(GROUP\s+BY\s+(?:ROLLUP|CUBE|GROUPING\s+SETS)\b.*?)\s+(LIMIT\s+\d+)\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -68,6 +76,12 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     the tree, and ``*`` projections. Injects ``LIMIT default_limit`` when
     the outer query has none.
     """
+    if len(sql) > _MAX_SQL_CHARS:
+        raise SqlValidationError(
+            f"The SQL is {len(sql):,} characters, over the "
+            f"{_MAX_SQL_CHARS:,} this server parses. Select fewer columns, "
+            "shorten any IN list, or split the query."
+        )
     try:
         statements = _parse_statements(sql, dialect)
     except sqlglot.errors.ParseError as errs:
