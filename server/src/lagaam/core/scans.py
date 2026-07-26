@@ -188,6 +188,23 @@ def _is_bounded_input(value: exp.Expr) -> bool:
     return False
 
 
+def _source_parts(select: exp.Select) -> list[exp.Expr]:
+    """Every relation this SELECT reads directly: its FROM and its joins.
+
+    sqlglot names the FROM arg "from_", and args.get() on a wrong key returns
+    None rather than raising, which silently empties this list. Not find():
+    that reaches into a subquery and would report its sources as ours.
+    """
+    from_part = select.args.get("from_")
+    if from_part is None and select.args.get("from") is not None:
+        raise AssertionError("sqlglot renamed the FROM arg key")
+    return [
+        part
+        for part in [from_part, *(select.args.get("joins") or [])]
+        if part is not None
+    ]
+
+
 def _source_alias(source: exp.Expr) -> str | None:
     """The name a predicate would use to refer to this join input."""
     if isinstance(source, exp.Alias | exp.Subquery) and source.alias:
@@ -205,11 +222,10 @@ def _has_ambiguous_alias(tree: exp.Expr) -> bool:
     different source entirely, leaving this one a product.
     """
     for select in tree.find_all(exp.Select):
-        sources = [select.args.get("from")] + list(select.args.get("joins") or [])
         names = [
             _source_alias(part.this)
-            for part in sources
-            if part is not None and part.this is not None
+            for part in _source_parts(select)
+            if part.this is not None
         ]
         present = [name for name in names if name is not None]
         if len(present) != len(set(present)):
@@ -242,6 +258,46 @@ def _has_product_join(tree: exp.Expr) -> bool:
     return False
 
 
+def _inline_cardinality(source: exp.Expr) -> int | None:
+    """How many rows this join input contributes on its own, if a fixed count.
+
+    None means "not an inline relation" — a real table, whose rows the IO plan
+    already counted. A number is what the agent spelled out or generated, none
+    of which the plan can see.
+    """
+    if isinstance(source, exp.Alias | exp.Subquery):
+        source = source.this
+    if isinstance(source, _GENERATORS):
+        if _generates_rows(source):
+            return None
+        return _generator_rows(source)
+    if isinstance(source, exp.Values):
+        return len(source.expressions or [])
+    if isinstance(source, exp.Query):
+        # A subquery reading no table can only produce the rows it spells out.
+        if list(source.find_all(exp.Table)):
+            return None
+        # A wrapper yields the product of what it reads, not the widest of
+        # them, or nesting would launder the multiplier one level down.
+        rows = 1
+        for select in source.find_all(exp.Select):
+            for part in _source_parts(select):
+                if part.this is not None:
+                    rows *= max(_inline_cardinality(part.this) or 1, 1)
+        return rows
+    return None
+
+
+def _generator_rows(generator: exp.Expr) -> int:
+    """Rows a bounded generator yields: a literal array's length, or 1 for a
+    column, whose rows belong to a table the plan already priced."""
+    widest = 1
+    for value in (generator.this, *(generator.expressions or [])):
+        if isinstance(value, exp.Array | exp.Struct):
+            widest = max(widest, len(value.expressions or []))
+    return widest
+
+
 def _bounded_source(source: exp.Expr) -> bool:
     """True if this join input contributes a fixed or already-counted number
     of rows, so pairing against it is not a product.
@@ -250,15 +306,28 @@ def _bounded_source(source: exp.Expr) -> bool:
     and `CROSS JOIN UNNEST(o.items)` is how it reads a nested column — the
     rows come from a table the IO plan already priced.
     """
-    if isinstance(source, exp.Alias | exp.Subquery):
-        source = source.this
-    if isinstance(source, _GENERATORS):
-        return not _generates_rows(source)
-    if isinstance(source, exp.Values):
-        return len(source.expressions or []) <= _MAX_INLINE_ROWS
-    if isinstance(source, exp.Query):
-        # A subquery reading no table can only produce the rows it spells out.
-        return not list(source.find_all(exp.Table))
+    rows = _inline_cardinality(source)
+    return rows is not None and rows <= _MAX_INLINE_ROWS
+
+
+def _has_inline_row_product(tree: exp.Expr) -> bool:
+    """True if one SELECT's inline relations multiply past the row cap.
+
+    Each is bounded alone and nothing pairs them: two 1000-row VALUES against
+    a scanned table is a million-fold multiplier the plan prices as one scan.
+    Their product is the multiplier, so the product is what must be capped.
+    """
+    for select in tree.find_all(exp.Select):
+        product = 1
+        for part in _source_parts(select):
+            if part.this is None:
+                continue
+            rows = _inline_cardinality(part.this)
+            if rows is None:
+                continue
+            product *= max(rows, 1)
+            if product > _MAX_INLINE_ROWS:
+                return True
     return False
 
 
@@ -277,21 +346,31 @@ def _has_nested_loop_correlation(tree: exp.Expr) -> bool:
             continue
         own = {
             _source_alias(part.this)
-            for part in [subquery.args.get("from")]
-            + list(subquery.args.get("joins") or [])
-            if part is not None and part.this is not None
+            for part in _source_parts(subquery)
+            if part.this is not None
         }
+        # An outer column binds the subquery wherever it appears, not just in
+        # WHERE: in a JOIN's ON it decorrelates to a join with no equality —
+        # the same nested loop, one rewrite further away.
         where = subquery.args.get("where")
-        if where is None:
+        predicates = [where.this if where is not None else None]
+        having = subquery.args.get("having")
+        predicates.append(having.this if having is not None else None)
+        predicates.extend(
+            join.args.get("on") for join in subquery.args.get("joins") or []
+        )
+        present = [predicate for predicate in predicates if predicate is not None]
+        if not present:
             continue
         outer_refs = {
             column.table.lower()
-            for column in where.find_all(exp.Column)
+            for predicate in present
+            for column in predicate.find_all(exp.Column)
             if column.table and column.table.lower() not in own
         }
         if not outer_refs:
             continue
-        pairs = _equi_join_pairs(where.this)
+        pairs = {pair for predicate in present for pair in _equi_join_pairs(predicate)}
         if not any(outer_refs & set(pair) for pair in pairs):
             return True
     return False
@@ -309,6 +388,8 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
         return True
 
     if _generates_rows(tree):
+        return True
+    if _has_inline_row_product(tree):
         return True
     if _has_nested_loop_correlation(tree):
         return True

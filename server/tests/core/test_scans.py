@@ -320,6 +320,57 @@ def test_a_huge_inline_values_relation_is_unpriceable() -> None:
     )
 
 
+def test_inline_relations_multiplying_past_the_cap_are_unpriceable() -> None:
+    # Each is bounded alone, so a per-relation cap waves both through while
+    # the plan prices one scan: measured on Trino 476, a 1.5M-row table
+    # against two 1000-row VALUES is 1.5e12 rows quoted at 1.5e6.
+    rows = ",".join(f"({i})" for i in range(1000))
+    literal = "ARRAY[" + ",".join(str(i) for i in range(1000)) + "]"
+    assert unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a "
+        f"CROSS JOIN (VALUES {rows}) AS v(x) CROSS JOIN (VALUES {rows}) AS w(y)"
+    )
+    assert unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a "
+        f"CROSS JOIN (VALUES {rows}) AS v(x) CROSS JOIN UNNEST({literal}) AS u(z)"
+    )
+    # A subquery reading no table is exempt as a whole, so the product has to
+    # be counted inside it too.
+    assert unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a CROSS JOIN "
+        f"(SELECT v.x FROM (VALUES {rows}) AS v(x) "
+        f"CROSS JOIN (VALUES {rows}) AS w(y)) AS s"
+    )
+
+
+def test_a_wrapper_subquery_carries_its_inner_product_outward() -> None:
+    # The outer SELECT sees one subquery source. What that source yields is
+    # the product of what it reads, or a nested wrapper launders the
+    # multiplier one level down and each level looks bounded alone.
+    small = ",".join(f"({i})" for i in range(10))
+    assert unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a CROSS JOIN "
+        f"(SELECT p.x FROM (SELECT v.x FROM (VALUES {small}) AS v(x) "
+        f"CROSS JOIN (VALUES {small}) AS w(y)) AS p "
+        f"CROSS JOIN (VALUES {small}) AS q(r)) AS s "
+        f"CROSS JOIN (VALUES {small}) AS u(m)"
+    )
+
+
+def test_inline_relations_under_the_cap_stay_priceable() -> None:
+    # The cap is on the product, not the count: two small lookup tables are
+    # how an agent parameterizes a query.
+    small = ",".join(f"({i})" for i in range(10))
+    assert not unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a "
+        f"CROSS JOIN (VALUES {small}) AS v(x) CROSS JOIN (VALUES {small}) AS w(y)"
+    )
+    assert not unpriceable(
+        "SELECT t.n FROM hive.s.orders a CROSS JOIN UNNEST(a.items) AS t(n) "
+        "CROSS JOIN UNNEST(ARRAY['O','F']) AS s(f)"
+    )
+
+
 def test_two_sources_sharing_an_alias_are_unpriceable() -> None:
     # An alias is how a predicate names a source. Two sources answering to
     # one name means an equality may constrain a different source entirely.
@@ -342,6 +393,46 @@ def test_a_correlated_subquery_on_an_equality_is_priceable() -> None:
     assert not unpriceable(
         "SELECT c.n, (SELECT count(*) FROM hive.s.orders o WHERE o.ck = c.ck) "
         "FROM hive.s.customer c"
+    )
+
+
+def test_a_subquery_reading_only_its_own_sources_is_priceable() -> None:
+    # No outer column appears, so there is nothing to correlate on. Reading
+    # the subquery's own FROM is what tells these apart from the shape above.
+    assert not unpriceable(
+        "SELECT count(o.k) FROM hive.s.orders o WHERE o.ck IN "
+        "(SELECT c.ck FROM hive.s.customer c WHERE c.nk = 7)"
+    )
+    assert not unpriceable(
+        "SELECT count(n.k) FROM hive.s.nation n WHERE n.rk NOT IN "
+        "(SELECT r.rk FROM hive.s.region r WHERE r.name = 'ASIA')"
+    )
+
+
+def test_an_outer_column_outside_the_subquery_where_is_unpriceable() -> None:
+    # An outer reference binds the subquery wherever it sits. In a JOIN's ON
+    # it decorrelates to a join carrying only an inequality — the same nested
+    # loop, one planner rewrite further away.
+    assert unpriceable(
+        "SELECT count(o.k) FROM hive.s.orders o WHERE o.p > "
+        "(SELECT count(*) FROM hive.s.lineitem l JOIN hive.s.partsupp p "
+        "ON l.pk = p.pk AND p.aq < o.ck)"
+    )
+    assert unpriceable(
+        "SELECT count(o.k) FROM hive.s.orders o WHERE o.p > "
+        "(SELECT count(*) FROM hive.s.lineitem l GROUP BY l.pk "
+        "HAVING count(*) < o.ck)"
+    )
+
+
+def test_two_sources_sharing_an_alias_across_a_join_are_unpriceable() -> None:
+    # The shadowed pair carries a real binding equality, so only the alias
+    # collision itself makes this a product — the FROM source has to be read
+    # for the collision to be visible at all.
+    assert unpriceable(
+        "SELECT count(x.k) FROM hive.s.orders x "
+        "JOIN hive.s.lineitem y ON x.ok = y.ok "
+        "JOIN hive.s.customer y ON y.ck = x.ck"
     )
 
 
