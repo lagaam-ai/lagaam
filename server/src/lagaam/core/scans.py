@@ -45,7 +45,8 @@ _ROW_PRESERVING_FUNCS = {
     "array_distinct",
     "reverse",
     "shuffle",
-    "slice",
+    # Trino's slice() parses as ArraySlice, whose sql_name is array_slice.
+    "array_slice",
     "trim_array",
     "filter",
     "transform",
@@ -119,9 +120,47 @@ def _equi_join_pairs(condition: exp.Expr | None) -> set[frozenset[str]]:
 
 
 def _func_name(func: exp.Func) -> str:
-    """The function's source name. Anonymous holds it in .name, and its
-    sql_name() is the useless literal "ANONYMOUS" — read .name first."""
-    return (func.name or func.sql_name() or "").lower()
+    """The function's source name.
+
+    Anonymous holds it in .name and its sql_name() is the useless literal
+    "ANONYMOUS"; every other node holds its name in sql_name() while .name
+    returns an *argument's* name — CAST(o.items AS ...) reports "items".
+    """
+    if isinstance(func, exp.Anonymous):
+        return str(func.name or "").lower()
+    return str(func.sql_name() or "").lower()
+
+
+# Arguments that carry no rows of their own: a lambda is applied per element
+# (confirmed on Trino 476 — transform(a, x -> sequence(1,10)) nests, it does
+# not lengthen), and a datatype, a constant or a condition describes the
+# reshaping rather than feeds it.
+_NOT_A_ROW_SOURCE = (
+    exp.Lambda,
+    exp.DataType,
+    exp.Literal,
+    exp.Boolean,
+    exp.Null,
+    exp.Predicate,
+)
+
+
+def _func_arguments(func: exp.Func) -> list[exp.Expr]:
+    """Every expression a function call feeds on.
+
+    Reading .this and .expressions alone misses whole shapes: IF holds its
+    branches under "true"/"false", so an unbounded one would go unchecked.
+    Anonymous is the exception — its .this is the function's own name.
+    """
+    skip = {"this"} if isinstance(func, exp.Anonymous) else set()
+    arguments: list[exp.Expr] = []
+    for key, value in func.args.items():
+        if key in skip:
+            continue
+        for item in value if isinstance(value, list) else [value]:
+            if isinstance(item, exp.Expr):
+                arguments.append(item)
+    return arguments
 
 
 def _generates_rows(tree: exp.Expr) -> bool:
@@ -174,14 +213,10 @@ def _is_bounded_input(value: exp.Expr) -> bool:
     if isinstance(value, exp.Func):
         if _func_name(value) not in _ROW_PRESERVING_FUNCS:
             return False
-        # Anonymous keeps the function's own name in .this, not an argument.
-        positional = value.expressions or []
-        if not isinstance(value, exp.Anonymous):
-            positional = [value.this, *positional]
         arguments = [
             argument
-            for argument in positional
-            if argument is not None and not isinstance(argument, exp.Literal)
+            for argument in _func_arguments(value)
+            if not isinstance(argument, _NOT_A_ROW_SOURCE)
         ]
         # A reshaping function with no argument left to check is reshaping a
         # literal, which cannot add rows.

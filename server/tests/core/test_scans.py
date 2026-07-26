@@ -216,6 +216,17 @@ def test_an_equality_within_one_source_does_not_constrain() -> None:
     )
 
 
+def test_a_column_equal_to_itself_does_not_constrain() -> None:
+    # Confirmed on Trino 476: ON b.k = b.k plans as CrossJoin[]. A predicate
+    # naming one source on both sides is constant-true, not join criteria.
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a JOIN hive.s.t2 b ON b.k = b.k"
+    )
+    assert unpriceable(
+        "SELECT a.x FROM hive.s.t1 a, hive.s.t2 b WHERE b.k = b.k"
+    )
+
+
 def test_one_predicate_does_not_clear_every_comma_join() -> None:
     # Three tables, one equality: the third is joined to nothing.
     assert unpriceable(
@@ -478,6 +489,47 @@ def test_two_sources_sharing_an_alias_across_a_join_are_unpriceable() -> None:
 
 
 # --- generators the parser does not model natively ------------------------
+
+
+def test_every_row_preserving_function_reshapes_a_column_freely() -> None:
+    # Each name is asserted on its own: a member whose parsed node reports a
+    # different name is silently inert, and the set as a whole still passes.
+    for call in (
+        "array_sort(o.items)",
+        "array_distinct(o.items)",
+        "reverse(o.items)",
+        "shuffle(o.items)",
+        "slice(o.items, 1, 10)",
+        "trim_array(o.items, 1)",
+        "filter(o.items, x -> x > 1)",
+        "transform(o.items, x -> x + 1)",
+        "CAST(o.items AS ARRAY(INTEGER))",
+        "TRY_CAST(o.items AS ARRAY(INTEGER))",
+        "coalesce(o.items, ARRAY[1])",
+        "if(o.k > 1, o.items, o.other)",
+        "nullif(o.items, ARRAY[1])",
+    ):
+        assert not unpriceable(
+            f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
+        ), call
+
+
+def test_a_generator_hidden_in_any_argument_is_unpriceable() -> None:
+    # IF keeps its branches under "true"/"false", not "expressions": walking
+    # .this and .expressions alone would wave the generator through.
+    for call in (
+        "if(true, sequence(1, 100000), o.items)",
+        "if(false, o.items, sequence(1, 99999))",
+        "if(o.k > 1, sequence(1, 99999), o.items)",
+        "coalesce(sequence(1, 99999), o.items)",
+        "nullif(sequence(1, 99999), ARRAY[1])",
+        "CAST(sequence(1, 100000) AS ARRAY(INTEGER))",
+        "slice(sequence(1, 100000), 1, 50000)",
+        "filter(sequence(1, 99999), x -> x > 1)",
+    ):
+        assert unpriceable(
+            f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
+        ), call
 
 
 def test_an_unmodelled_generator_function_is_unpriceable() -> None:
