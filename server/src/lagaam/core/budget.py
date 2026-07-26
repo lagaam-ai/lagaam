@@ -95,8 +95,9 @@ def _float_env(name: str) -> float | None:
 
 _UNESTIMABLE = (
     "Add a filter on a partition or key column, join on a key instead of "
-    "crossing tables, avoid reading the same table twice, and query a table "
-    "with statistics so the cost can be predicted."
+    "crossing tables, avoid reading the same table twice, avoid expanding a "
+    "value into rows (UNNEST over split(), sequence() or repeat()), and query "
+    "a table with statistics so the cost can be predicted."
 )
 
 
