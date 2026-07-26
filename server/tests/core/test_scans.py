@@ -2,10 +2,13 @@
 
 The quote is the sum of the IO plan's per-scan entries. A join without an
 equality reports a sum where the work is a product, and a row generator does
-not appear at all. A table read twice is fine — Trino emits one entry per scan
-operator, so the sum already counts it. The cost gate degrades a misprice-able
-quote to low confidence; this module spots the shapes from the SQL.
+not appear at all. A table read twice reports one entry however often it is
+read, so the sum undercounts by the reference count — table_scan_counts
+recovers that. The cost gate degrades a misprice-able quote to low
+confidence; this module spots the shapes from the SQL.
 """
+
+import time
 
 from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
 
@@ -32,9 +35,9 @@ def test_cte_referenced_once_is_priceable() -> None:
 
 
 def test_self_join_is_priceable() -> None:
-    # The obvious worry, and measurably wrong: Trino's IO plan emits one entry
-    # per scan operator, so a self-join reports two and the sum is already
-    # right. Blocking it denied year-over-year comparison for nothing.
+    # Not a product: both sides hash on orderkey. The plan does undercount it
+    # (one entry for two reads), but that is table_scan_counts' job to scale
+    # — blocking it here denied year-over-year comparison for nothing.
     assert not unpriceable(
         "SELECT a.orderkey FROM tpch.tiny.lineitem a "
         "JOIN tpch.tiny.lineitem b ON a.orderkey = b.orderkey"
@@ -267,9 +270,12 @@ def test_unnest_of_a_literal_array_is_priceable() -> None:
 # --- scaling a quote the plan may have collapsed --------------------------
 
 
+def counts(sql: str) -> dict[str, int]:
+    return table_scan_counts(sql, dialect="trino")
+
+
 def multiplier(sql: str) -> int:
-    counts = table_scan_counts(sql, dialect="trino")
-    return max(counts.values(), default=1)
+    return max(counts(sql).values(), default=1)
 
 
 def test_a_single_scan_needs_no_scaling() -> None:
@@ -314,33 +320,30 @@ def test_a_cte_body_is_counted_once_per_reference() -> None:
     # Measured on Trino 476: a 4-times-referenced CTE reports one IO entry
     # and processes 4x the rows. Skipping CTE references as "a result, not a
     # scan" left the shortfall invisible to the very factor meant to fix it.
+    #
+    # Asserted on the whole dict, not on max(): with the CTE walk disabled the
+    # alias is counted as if it were a table, so the maximum still reads 2 and
+    # a max()-only assertion passes while the key is "c". plan_entry_counts
+    # emits fully-qualified keys, so a wrong key means no match and a factor
+    # that silently collapses to 1.
     cte = "WITH c AS (SELECT orderkey FROM tpch.tiny.orders) "
-    assert multiplier(cte + "SELECT orderkey FROM c a") == 1
-    assert (
-        multiplier(
-            cte + "SELECT a.orderkey FROM c a JOIN c b ON a.orderkey = b.orderkey"
-        )
-        == 2
-    )
-    assert (
-        multiplier(
-            cte + "SELECT count(*) FROM (SELECT * FROM c UNION ALL "
-            "SELECT * FROM c UNION ALL SELECT * FROM c) z"
-        )
-        == 3
-    )
+    assert counts(cte + "SELECT orderkey FROM c a") == {"tpch.tiny.orders": 1}
+    assert counts(
+        cte + "SELECT a.orderkey FROM c a JOIN c b ON a.orderkey = b.orderkey"
+    ) == {"tpch.tiny.orders": 2}
+    assert counts(
+        cte + "SELECT count(*) FROM (SELECT * FROM c UNION ALL "
+        "SELECT * FROM c UNION ALL SELECT * FROM c) z"
+    ) == {"tpch.tiny.orders": 3}
 
 
 def test_an_unreferenced_cte_body_is_not_counted() -> None:
     # A CTE nobody selects from is never scanned; counting it at its
     # definition would charge for work the engine skips.
-    assert (
-        multiplier(
-            "WITH unused AS (SELECT orderkey FROM tpch.tiny.orders) "
-            "SELECT custkey FROM tpch.tiny.customer"
-        )
-        == 1
-    )
+    assert counts(
+        "WITH unused AS (SELECT orderkey FROM tpch.tiny.orders) "
+        "SELECT custkey FROM tpch.tiny.customer"
+    ) == {"tpch.tiny.customer": 1}
 
 
 def test_a_self_referencing_cte_terminates() -> None:
@@ -406,6 +409,38 @@ def test_a_wrapper_subquery_carries_its_inner_product_outward() -> None:
         f"CROSS JOIN (VALUES {small}) AS w(y)) AS p "
         f"CROSS JOIN (VALUES {small}) AS q(r)) AS s "
         f"CROSS JOIN (VALUES {small}) AS u(m)"
+    )
+
+
+def test_deeply_nested_subqueries_do_not_burn_the_gate() -> None:
+    # A subquery is reachable from every one of its ancestors, so an
+    # unmemoized walk re-descends it and goes exponential in nesting depth:
+    # 49 KB of SQL cost 7.3s before this was memoized. A gate that can be
+    # made to burn CPU is the unbounded work it exists to refuse.
+    inner = "(VALUES (1))"
+    for _ in range(12):
+        inner = f"(SELECT 1 AS x FROM {inner} AS a CROSS JOIN {inner} AS b)"
+    sql = f"SELECT z.x FROM {inner} AS z"
+    started = time.monotonic()
+    # One row squared any number of times is still one row: not a product.
+    assert not unpriceable(sql)
+    assert time.monotonic() - started < 5.0
+
+
+def test_a_set_operation_adds_its_branches_rather_than_crossing_them() -> None:
+    # UNION ALL stacks rows; only sources within one branch cross. Counting
+    # the whole thing as a product would block an ordinary stacked lookup.
+    small = ",".join(f"({i})" for i in range(400))
+    assert not unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a CROSS JOIN "
+        f"(SELECT v.x FROM (VALUES {small}) AS v(x) UNION ALL "
+        f"SELECT w.y FROM (VALUES {small}) AS w(y)) AS s"
+    )
+    # ...but crossing inside one branch still multiplies.
+    assert unpriceable(
+        f"SELECT count(a.k) FROM hive.s.orders a CROSS JOIN "
+        f"(SELECT v.x FROM (VALUES {small}) AS v(x) "
+        f"CROSS JOIN (VALUES {small}) AS w(y) UNION ALL SELECT 1) AS s"
     )
 
 

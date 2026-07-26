@@ -294,34 +294,70 @@ def _has_product_join(tree: exp.Expr) -> bool:
     return False
 
 
-def _inline_cardinality(source: exp.Expr) -> int | None:
+def _inline_cardinality(
+    source: exp.Expr, memo: dict[int, int | None] | None = None
+) -> int | None:
     """How many rows this join input contributes on its own, if a fixed count.
 
     None means "not an inline relation" — a real table, whose rows the IO plan
     already counted. A number is what the agent spelled out or generated, none
     of which the plan can see.
+
+    Memoized per call tree: a subquery is reachable from every one of its
+    ancestors, so re-descending it makes the walk exponential in nesting
+    depth — a gate that can be made to burn CPU is the unbounded work it
+    exists to refuse.
     """
+    if memo is None:
+        memo = {}
+    if id(source) in memo:
+        return memo[id(source)]
+    memo[id(source)] = None
+
     if isinstance(source, exp.Alias | exp.Subquery):
         source = source.this
+    rows: int | None = None
     if isinstance(source, _GENERATORS):
-        if _generates_rows(source):
-            return None
-        return _generator_rows(source)
-    if isinstance(source, exp.Values):
-        return len(source.expressions or [])
-    if isinstance(source, exp.Query):
+        rows = None if _generates_rows(source) else _generator_rows(source)
+    elif isinstance(source, exp.Values):
+        rows = len(source.expressions or [])
+    elif isinstance(source, exp.Query):
         # A subquery reading no table can only produce the rows it spells out.
-        if list(source.find_all(exp.Table)):
-            return None
-        # A wrapper yields the product of what it reads, not the widest of
-        # them, or nesting would launder the multiplier one level down.
-        rows = 1
-        for select in source.find_all(exp.Select):
-            for part in _source_parts(select):
-                if part.this is not None:
-                    rows *= max(_inline_cardinality(part.this) or 1, 1)
-        return rows
-    return None
+        if not any(True for _ in source.find_all(exp.Table)):
+            # A wrapper yields the product of what it reads, not the widest of
+            # them, or nesting would launder the multiplier one level down.
+            # Its own direct sources only: a nested one is counted when that
+            # level is walked, and counting it here too is the exponential.
+            # A set operation stacks its branches, so they add; the sources
+            # within one branch cross, so those multiply.
+            rows = 0
+            for select in _direct_selects(source):
+                branch = 1
+                for part in _source_parts(select):
+                    if part.this is not None:
+                        branch *= max(_inline_cardinality(part.this, memo) or 1, 1)
+                rows += branch
+    memo[id(source)] = rows
+    return rows
+
+
+def _direct_selects(query: exp.Query) -> list[exp.Select]:
+    """The SELECTs this query is built from, not those nested inside them.
+
+    A set operation is several SELECTs at one level; anything deeper is a
+    source of one of them and is counted when that source is walked.
+    """
+    if isinstance(query, exp.Select):
+        return [query]
+    if isinstance(query, exp.SetOperation):
+        return [
+            select
+            for side in (query.this, query.expression)
+            if isinstance(side, exp.Query)
+            for select in _direct_selects(side)
+        ]
+    inner = query.this
+    return _direct_selects(inner) if isinstance(inner, exp.Query) else []
 
 
 def _generator_rows(generator: exp.Expr) -> int:
@@ -353,12 +389,13 @@ def _has_inline_row_product(tree: exp.Expr) -> bool:
     a scanned table is a million-fold multiplier the plan prices as one scan.
     Their product is the multiplier, so the product is what must be capped.
     """
+    memo: dict[int, int | None] = {}
     for select in tree.find_all(exp.Select):
         product = 1
         for part in _source_parts(select):
             if part.this is None:
                 continue
-            rows = _inline_cardinality(part.this)
+            rows = _inline_cardinality(part.this, memo)
             if rows is None:
                 continue
             product *= max(rows, 1)
