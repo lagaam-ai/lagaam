@@ -240,8 +240,10 @@ def _nested(depth: int) -> str:
 
 
 def test_an_ordinary_nesting_depth_is_accepted() -> None:
-    # Deeper than any human query, well inside what sqlglot can render.
-    validate_query(_nested(20), "trino")
+    # Deeper than any human query, well inside the cap. The cap itself is
+    # tuned to the worst-case shape (nested ARRAY literals go quadratic
+    # around bracket depth 14), not to this shape's own, much higher, limit.
+    validate_query(_nested(10), "trino")
 
 
 def test_a_deeply_nested_query_is_refused_not_crashed() -> None:
@@ -283,7 +285,39 @@ def test_deeply_nested_function_calls_are_refused_not_crashed() -> None:
 
 def test_deeply_nested_case_expressions_are_refused_not_crashed() -> None:
     # Measured: nested CASE WHEN ... THEN (...) blows the parser's stack at
-    # 27 levels of bracket nesting — the worst-case shape measured.
+    # 27 levels of bracket nesting.
     with pytest.raises(SqlValidationError) as err:
         validate_query(_nested_case(27), "trino")
     assert "nested" in str(err.value).lower()
+
+
+def _nested_array(depth: int) -> str:
+    expr = "1"
+    for _ in range(depth):
+        expr = f"ARRAY[{expr}]"
+    return f"SELECT {expr}"
+
+
+def test_deeply_nested_arrays_are_refused_not_crashed() -> None:
+    # ARRAY[...] nests exactly like a function call but was missed by a
+    # guard that counted only ()/() — a 141-character query at depth 18
+    # measured over 5s of CPU before this was caught. Depth 44 mirrors the
+    # abs() test: far past the cap, and fast to reject.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(_nested_array(44), "trino")
+    assert "nested" in str(err.value).lower()
+
+
+def test_bracket_inside_a_string_literal_is_not_counted_as_nesting() -> None:
+    # A bracket inside quoted text is data, not nesting depth.
+    validate_query("SELECT s FROM t WHERE s = '((([[['", "trino")
+
+
+def test_a_moderately_nested_array_is_refused_quickly_not_left_to_hang() -> None:
+    # Nested ARRAY[...] goes quadratic fast: depth 15 measured at 0.76s and
+    # depth 18 over 5s, on a 141-character query. The cap has to sit below
+    # where that curve turns expensive, not just below where it crashes.
+    started = time.monotonic()
+    with pytest.raises(SqlValidationError):
+        validate_query(_nested_array(16), "trino")
+    assert time.monotonic() - started < 1.0

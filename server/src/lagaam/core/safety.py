@@ -38,13 +38,16 @@ _DENY_NODES = (
 # padding the input, not an analyst asking a question.
 _MAX_SQL_CHARS = 200_000
 
-# sqlglot's own recursive-descent parser blows the stack on deep bracket
-# nesting well before a query gets big enough to trip _MAX_SQL_CHARS — and
-# the break point depends on grammar shape, not bracket count alone: nested
-# CASE WHEN ... THEN (...) broke the parser at 27 brackets, nested abs() at
-# 44, nested subqueries not until 118 (all measured under pytest). The cap
-# has to sit below the worst of those, not the most generous.
-_MAX_BRACKET_DEPTH = 20
+# sqlglot's own recursive-descent parser blows the stack, or goes
+# quadratic-or-worse, on deep bracket nesting well before a query gets big
+# enough to trip _MAX_SQL_CHARS — and the break point depends on grammar
+# shape, not bracket count alone. RecursionError shapes are the shallower
+# worry: nested CASE WHEN ... THEN (...) broke the parser at 27 brackets,
+# nested abs() at 44. The binding constraint turned out to be slowness, not
+# a crash: nested ARRAY[...] parses in 0.03s at depth 10 but 0.76s at depth
+# 15 and hangs past 5s by depth 18 (all measured under pytest, fresh
+# process per depth). The cap sits below where that curve turns expensive.
+_MAX_BRACKET_DEPTH = 12
 
 # sqlglot's generator recurses once per AST level, so a *small* query nested
 # deeply enough blows the stack inside tree.sql(): measured under pytest,
@@ -61,21 +64,46 @@ _GROUPING_LIMIT = re.compile(
 )
 
 
+_OPENERS = frozenset("([")
+_CLOSERS = frozenset(")]")
+
+
 def _bracket_depth(sql: str) -> int:
-    """Deepest ``(``/``)`` nesting in the raw text, scanned iteratively.
+    """Deepest nesting of ``(``/``)``/``[``/``]`` in the raw text.
 
     Runs before parsing, since sqlglot's recursive-descent parser can blow
-    the stack on bracket nesting alone — a RecursionError the parser raises
-    itself, which no post-parse check can catch.
+    the stack on nesting depth alone — a RecursionError the parser raises
+    itself, which no post-parse check can catch. Both parens and square
+    brackets feed that recursion (ARRAY[...] nests exactly like a function
+    call), so both count toward one combined depth, matching what the
+    parser's own call stack tracks. A delimiter inside a string literal or a
+    quoted identifier is data, not nesting, so quoting is tracked and those
+    characters are skipped.
     """
     depth = 0
     peak = 0
-    for char in sql:
-        if char == "(":
+    quote: str | None = None
+    i = 0
+    length = len(sql)
+    while i < length:
+        char = sql[i]
+        if quote is not None:
+            if char == quote:
+                # A doubled quote ('' or "") is an escaped quote, still inside the literal.
+                if i + 1 < length and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in _OPENERS:
             depth += 1
             peak = max(peak, depth)
-        elif char == ")":
+        elif char in _CLOSERS:
             depth -= 1
+        i += 1
     return peak
 
 
