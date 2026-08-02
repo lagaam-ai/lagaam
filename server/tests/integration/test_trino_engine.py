@@ -90,13 +90,21 @@ async def test_a_product_join_is_refused_however_it_is_spelled(
     engine: TrinoEngine,
 ) -> None:
     # Both inputs are scanned once, so the byte sum is correct and says
-    # nothing about the quadratic row work it hides.
+    # nothing about the quadratic row work it hides. The plan does say it:
+    # each of these prices at 225 billion rows against a 50 million budget.
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
     for predicate in ("1 = 1", "a.orderkey <> b.custkey", "a.custkey = b.custkey OR 1 = 1"):
         est = await engine.estimate_cost(
             f"SELECT a.orderkey FROM tpch.sf1.orders a "
             f"JOIN tpch.sf1.customer b ON {predicate}"
         )
-        assert est.confidence == "low", predicate
+        assert est.max_intermediate_rows is not None, predicate
+        assert est.max_intermediate_rows > DEFAULT_MAX_INTERMEDIATE_ROWS, predicate
+        with pytest.raises(BudgetExceededError):
+            enforce_budget(est, budget)
 
 
 async def test_estimate_cost_of_join_sums_both_scans(engine: TrinoEngine) -> None:
