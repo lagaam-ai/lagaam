@@ -60,6 +60,10 @@ class CostEstimate(BaseModel):
 
     scanned_bytes: int | None = None
     row_estimate: int | None = None
+    # The widest row count any operator would produce — the number a cross
+    # join blows and a byte sum cannot see. None when the engine has no plan
+    # estimates to offer (a non-Trino adapter, or an unreadable plan).
+    max_intermediate_rows: int | None = None
     # None = "infer from the evidence"; an explicit value is checked for sanity.
     confidence: Literal["high", "low"] | None = None
 

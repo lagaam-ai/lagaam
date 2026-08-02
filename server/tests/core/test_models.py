@@ -7,6 +7,7 @@ from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     ColumnInfo,
+    CostEstimate,
     SchemaInfo,
     TableSchema,
 )
@@ -68,3 +69,20 @@ def test_models_reject_missing_required_fields() -> None:
         ColumnInfo(name="orderkey")  # type: ignore[call-arg]
     with pytest.raises(ValidationError):
         TableSchema(catalog="tpch", schema_name="tiny", table="orders")  # type: ignore[call-arg]
+
+
+def test_max_intermediate_rows_defaults_to_unknown() -> None:
+    assert CostEstimate(scanned_bytes=10).max_intermediate_rows is None
+
+
+def test_max_intermediate_rows_is_carried() -> None:
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=902_625_000)
+    assert estimate.max_intermediate_rows == 902_625_000
+
+
+def test_max_intermediate_rows_does_not_decide_confidence() -> None:
+    # Confidence tracks the byte number; a plan estimate is a separate axis.
+    assert CostEstimate(max_intermediate_rows=5).confidence == "low"
+    assert (
+        CostEstimate(scanned_bytes=10, max_intermediate_rows=5).confidence == "high"
+    )
