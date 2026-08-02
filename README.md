@@ -27,6 +27,7 @@ and cannot reach the engine any other way.
 | `LAGAAM_AGENT_NAME` | Identity stamped on the audit trail | `anonymous` |
 | `LAGAAM_MAX_SCAN_BYTES` | Scan-bytes budget per query, pre-execution | 50 GiB |
 | `LAGAAM_MAX_ROWS` | Scanned-row estimate budget per query | ungated |
+| `LAGAAM_MAX_INTERMEDIATE_ROWS` | Rows the engine would *build* at its widest step — not rows returned, so a `LIMIT` doesn't lower it | 50,000,000 |
 | `LAGAAM_MAX_RETURNED_ROWS` | Rows returned to the agent per query | `1000` (max `100000`) |
 | `LAGAAM_QUERY_TIMEOUT` | Wall-clock seconds per query | `300` |
 | `LAGAAM_METADATA_TTL` | Metadata cache TTL, seconds | `300` |
@@ -37,15 +38,23 @@ and cannot reach the engine any other way.
 can reach every table in every catalog is the thing this exists to prevent, so
 that has to be asked for — set `LAGAAM_ALLOW_ALL_TABLES=true` if you mean it.
 
-Cost estimates come from engine statistics — run `ANALYZE` on your tables and
-the quotes get sharp. Without stats the gate fails safe and asks the agent for
-a query it can price.
+Cost quotes come from the engine's own plan estimates, and those need table
+statistics: a table without stats cannot be priced, so its queries are refused
+rather than guessed at. Run `ANALYZE` on your tables before pointing an agent
+at them — a connector that has no statistics at all is effectively unusable
+through the gate. That is deliberate: a query nobody can size is exactly the
+kind that runs for $500.
 
 ## How it works
 
 A `QueryEngine` port with a Trino adapter. Every `query_data` call walks one
 pipeline: **validate (sqlglot AST) → table allowlist → cost quotation → budget
 gate → execute (row cap + timeout) → verify → audit**.
+
+The quote is the engine's own plan, not a guess from the SQL text:
+`EXPLAIN (TYPE IO)` prices the bytes a query would scan, and
+`EXPLAIN (TYPE LOGICAL)` prices the widest row count any operator would
+build — the number a cross join blows and a `LIMIT` cannot hide.
 
 Details in [docs/architecture.md](docs/architecture.md); the longer story in
 [docs/vision.md](docs/vision.md).
