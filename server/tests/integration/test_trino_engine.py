@@ -306,6 +306,24 @@ _LEGITIMATE_AT_SCALE = [
     ("sf1 healthy join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey = o.orderkey"),
     ("sf1 group by", "SELECT l.orderkey, count(*) AS c FROM tpch.sf1.lineitem l GROUP BY l.orderkey"),
     ("sf1 filtered scan", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.orderdate > DATE '1995-01-01'"),
+    ("sf1 count star", "SELECT count(*) AS c FROM tpch.sf1.lineitem"),
+    # Trino stops estimating multi-way joins past a depth, so these report a
+    # NaN join over fully sized children. Charging the product would price a
+    # 4-table star join at 2.2 trillion rows against a real 1,828,911.
+    ("tpch q3", "SELECT l.orderkey, sum(l.extendedprice*(1-l.discount)) AS revenue, o.orderdate, o.shippriority FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey WHERE c.mktsegment='BUILDING' AND o.orderdate < DATE '1995-03-15' AND l.shipdate > DATE '1995-03-15' GROUP BY l.orderkey, o.orderdate, o.shippriority"),
+    ("tpch q5", "SELECT n.name, sum(l.extendedprice*(1-l.discount)) AS revenue FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey JOIN tpch.sf1.supplier s ON l.suppkey=s.suppkey AND c.nationkey=s.nationkey JOIN tpch.sf1.nation n ON s.nationkey=n.nationkey JOIN tpch.sf1.region r ON n.regionkey=r.regionkey WHERE r.name='ASIA' AND o.orderdate >= DATE '1994-01-01' GROUP BY n.name"),
+    ("tpch q10", "SELECT c.custkey, c.name, sum(l.extendedprice*(1-l.discount)) AS revenue FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey JOIN tpch.sf1.nation n ON c.nationkey=n.nationkey WHERE o.orderdate >= DATE '1993-10-01' AND l.returnflag='R' GROUP BY c.custkey, c.name"),
+    ("tpch q18", "SELECT c.name, o.orderkey, o.totalprice, sum(l.quantity) AS q FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON o.orderkey=l.orderkey WHERE o.orderkey IN (SELECT l2.orderkey FROM tpch.sf1.lineitem l2 GROUP BY l2.orderkey HAVING sum(l2.quantity) > 300) GROUP BY c.name, o.orderkey, o.totalprice"),
+    ("tpch q21", "SELECT s.name, count(*) AS numwait FROM tpch.sf1.supplier s JOIN tpch.sf1.lineitem l1 ON s.suppkey=l1.suppkey JOIN tpch.sf1.orders o ON o.orderkey=l1.orderkey JOIN tpch.sf1.nation n ON s.nationkey=n.nationkey WHERE o.orderstatus='F' AND l1.receiptdate > l1.commitdate AND EXISTS (SELECT 1 FROM tpch.sf1.lineitem l2 WHERE l2.orderkey=l1.orderkey AND l2.suppkey <> l1.suppkey) AND NOT EXISTS (SELECT 1 FROM tpch.sf1.lineitem l3 WHERE l3.orderkey=l1.orderkey AND l3.suppkey <> l1.suppkey AND l3.receiptdate > l3.commitdate) AND n.name='SAUDI ARABIA' GROUP BY s.name"),
+    ("sf1 three table star join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey=o.orderkey JOIN tpch.sf1.customer c ON o.custkey=c.custkey"),
+    ("sf1 four table star join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey=o.orderkey JOIN tpch.sf1.customer c ON o.custkey=c.custkey JOIN tpch.sf1.nation n ON c.nationkey=n.nationkey"),
+    ("sf1 self join on a key", "SELECT a.orderkey FROM tpch.sf1.orders a JOIN tpch.sf1.orders b ON a.orderkey=b.orderkey"),
+    ("sf1 anti join via NOT IN", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.custkey NOT IN (SELECT c.custkey FROM tpch.sf1.customer c WHERE c.nationkey=1)"),
+    ("sf1 anti join via NOT EXISTS", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE NOT EXISTS (SELECT 1 FROM tpch.sf1.lineitem l WHERE l.orderkey=o.orderkey)"),
+    ("sf1 cohort window", "SELECT custkey, orderdate, row_number() OVER (PARTITION BY custkey ORDER BY orderdate) AS step, count(*) OVER (PARTITION BY custkey) AS total FROM tpch.sf1.orders WHERE orderdate >= DATE '1995-01-01'"),
+    # A Window emits one row per input row, so it bounds its side of a NaN
+    # join even though Trino reports no estimate above it.
+    ("sf1 funnel window joined to a dimension", "SELECT c.custkey, w.step FROM tpch.sf1.customer c JOIN (SELECT custkey, row_number() OVER (PARTITION BY custkey ORDER BY orderdate) AS step FROM tpch.sf1.orders) w ON c.custkey=w.custkey"),
 ]
 
 _EXPLOSIONS_AT_SCALE = [
@@ -332,6 +350,21 @@ _EXPLOSIONS = [
     ("cartesian laundered by a zero-length substr", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON substr(l.comment,1,0)=substr(o.comment,1,0)"),
     ("cross join laundered by lower on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON lower(a.linestatus)=lower(b.linestatus)"),
     ("cross join laundered by upper on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON upper(a.linestatus)=upper(b.linestatus)"),
+    ("cross join laundered by trim on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON trim(a.linestatus)=trim(b.linestatus)"),
+    ("cross join laundered by concat on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON concat(a.linestatus,'')=concat(b.linestatus,'')"),
+    ("cross join laundered by || on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON a.linestatus||''=b.linestatus||''"),
+    # Filter laundering: the join key stays a plain column, and a filter Trino
+    # cannot size nulls one side's estimate instead. Measured live before the
+    # fix: quoted 60,175 against a true 1,810,518,277 rows — 30,088x under.
+    ("filter laundered by regexp_like on both sides", "SELECT a.orderkey FROM (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) a JOIN (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) b ON a.linestatus = b.linestatus"),
+    ("filter laundered through a shared cte", "WITH f AS (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) SELECT a.orderkey FROM f a JOIN f b ON a.linestatus=b.linestatus"),
+    ("filter laundered by lower(comment) LIKE on both sides", "SELECT a.orderkey FROM (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') a JOIN (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') b ON a.linestatus=b.linestatus"),
+    ("filter laundered on shipmode, seven distinct values", "SELECT a.orderkey FROM (SELECT orderkey,shipmode FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') a JOIN (SELECT orderkey,shipmode FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') b ON a.shipmode=b.shipmode"),
+    ("filter laundered on one side only", "SELECT a.orderkey FROM (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) a JOIN tpch.tiny.lineitem b ON a.linestatus=b.linestatus"),
+    # The derived key aliased back to a plain column name: the name lies, the
+    # plan's own "sym := source" assignment does not.
+    ("derived key aliased back to a plain column name", "SELECT a.orderkey FROM (SELECT orderkey, substr(linestatus,1,1) AS linestatus FROM tpch.tiny.lineitem) a JOIN (SELECT orderkey, substr(linestatus,1,1) AS linestatus FROM tpch.tiny.lineitem) b ON a.linestatus=b.linestatus"),
+    ("constant key aliased as a column", "SELECT a.orderkey FROM (SELECT orderkey, 1 AS k FROM tpch.tiny.lineitem) a JOIN (SELECT orderkey, 1 AS k FROM tpch.tiny.orders) b ON a.k=b.k"),
 ]
 
 _GENERATORS = [

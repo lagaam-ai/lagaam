@@ -16,11 +16,25 @@ upward: a filter Trino cannot size makes every operator above it unknown.
 A join in that state is charged the product of what it joins, because the
 alternative is pricing the laundered cross join at its children's size.
 
-Exception: a NaN join carrying real equality criteria (descriptor.criteria)
-cannot exceed the product of its inputs, and its inputs already bound the
-work — charging the product there invents cost Trino simply failed to
-propagate through (e.g. a decorrelated correlated subquery). That join
-falls back to the max-of-children rule instead, same as a non-join node.
+Exception: charging the product is right when the join itself is what Trino
+could not size, and wrong when Trino merely stopped propagating stats. Two
+structural signals, both read from the plan, tell those apart.
+
+A side is *aggregation-bounded* when an Aggregate/Distinct/TopN/Limit — or a
+row-preserving Window over a sized input — sits between it and the join,
+seen through Exchange/Project wrappers. Such a side emits at most one row
+per group, so the join cannot multiply and the product is invented cost.
+This is the decorrelated-correlated-subquery shape.
+
+Otherwise the join is trusted only when every equality key resolves, through
+the plan's own "sym := source" assignments, to a base table column AND no
+side is a scan whose estimate went NaN. The first conjunct kills the derived
+key (substr/lower/cast renders "expr := substring(...)", and an alias back
+to a plain name cannot hide it). The second kills filter laundering, where
+the key stays a plain column but a regexp_like filter nulls a scan estimate
+so a low-cardinality key multiplies unpriced. Both must hold, because each
+alone has a measured counterexample. Trino stops estimating multi-way joins
+past a depth, so this is what keeps an ordinary 4-table star join quotable.
 """
 
 import json
@@ -50,9 +64,37 @@ _JOIN_NODES = frozenset(
     }
 )
 
+# Collapse rows to at most one per group, or to a fixed cap.
+_BOUNDING_NODES = frozenset(
+    {"Aggregate", "DistinctLimit", "TopN", "Limit", "Distinct"}
+)
+
+# Emit exactly one row per input row, so a sized input bounds them.
+_ROW_PRESERVING_NODES = frozenset({"Window", "RowNumber", "TopNRanking", "Sort"})
+
+# Cannot emit more rows than their widest input, so the walk sees through them.
+_PASSTHROUGH_NODES = frozenset(
+    {
+        "LocalExchange",
+        "RemoteExchange",
+        "Exchange",
+        "Project",
+        "FilterProject",
+        "Filter",
+        "AssignUniqueId",
+        "MarkDistinct",
+        "EnforceSingleRow",
+        "GroupId",
+        "Output",
+    }
+)
+
 # A plan this deep is a machine's, not an analyst's, and recursing it would
 # raise where the caller expects a number.
 _MAX_PLAN_DEPTH = 400
+
+# How far the bounded/base-column walks descend before giving up (denying).
+_MAX_WALK_DEPTH = 60
 
 
 def max_intermediate_rows(plan_json: str) -> float | None:
@@ -68,16 +110,21 @@ def max_intermediate_rows(plan_json: str) -> float | None:
     if not isinstance(root, dict):
         return None
     widest: list[float] = []
-    _visit(root, widest, 0)
+    _visit(root, widest, 0, _assignments(root, {}, 0))
     return max(widest) if widest else None
 
 
-def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | None:
+def _visit(
+    node: dict[str, Any],
+    widest: list[float],
+    depth: int,
+    assigned: dict[str, str],
+) -> float | None:
     """This node's rows, recording every knowable count into ``widest``."""
     if depth > _MAX_PLAN_DEPTH:
         return None
     children = [
-        _visit(child, widest, depth + 1)
+        _visit(child, widest, depth + 1, assigned)
         for child in _children(node)
     ]
     known = [rows for rows in children if rows is not None]
@@ -85,7 +132,11 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
     if rows is None and known:
         # Only treat as join product if name is actually a string and known.
         node_name = node.get("name")
-        if isinstance(node_name, str) and node_name in _JOIN_NODES and not _has_join_criteria(node):
+        if (
+            isinstance(node_name, str)
+            and node_name in _JOIN_NODES
+            and not _join_cannot_multiply(node, assigned)
+        ):
             # A join whose size Trino could not estimate still pairs its
             # inputs; charging less than the product is how a laundered
             # cross join reads as the size of one of its tables.
@@ -106,30 +157,95 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
 # One conjunct: "(name = name)" with optional whitespace around the operator.
 _CONJUNCT = re.compile(r"\(\s*([^()=\s]+)\s*=\s*([^()=\s]+)\s*\)")
 
-# A plain column: identifier chars, optionally suffixed with Trino's own
-# disambiguator ("orderkey_4"). Never matches "expr" or "expr_17", which is
-# how Trino names a key derived from an expression rather than a column.
-_PLAIN_COLUMN = re.compile(r"^(?!expr(?:_\d+)?$)[A-Za-z_][A-Za-z0-9_]*$")
+# One assignment line from a node's details: "expr := substring(col, 1, 1)".
+_ASSIGNMENT = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*:=\s*(.+?)\s*$")
+
+# A base-column source: "tpch:orderkey" or "orderkey" — a bare name, never a
+# call, literal or operator. Anything else is a computed key.
+_BASE_COLUMN_SOURCE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*(?::[A-Za-z_][A-Za-z0-9_]*)?$"
+)
 
 
-def _has_join_criteria(node: dict[str, Any]) -> bool:
-    """True if this join's criteria is a real equality key on plain columns.
+def _join_cannot_multiply(node: dict[str, Any], assigned: dict[str, str]) -> bool:
+    """True if this NaN join provably cannot blow up, so max-of-children holds."""
+    children = _children(node)
+    if not children:
+        return False
+    if any(_aggregation_bounded(child, 0) for child in children):
+        return True
+    return _keys_are_base_columns(node, assigned) and not any(
+        _has_nan_scan(child, 0) for child in children
+    )
 
-    An equi-join cannot exceed the product of its inputs, and its criteria
-    means Trino sized its inputs deliberately, not because it gave up.
 
-    But Trino renders ANY equi-join key this way, including one derived from
-    an expression (substr, lower, cast, ...) — "(expr = expr_17)" instead of
-    a column name. That still cannot exceed the product of its own inputs,
-    but the exemption exists because the inputs already bound the work, and
-    a derived key can be engineered to make Trino's per-side estimates read
-    far below the true join output (see module docstring's cross-join
-    laundering). So only a criteria naming plain columns on every conjunct
-    is trusted; anything else — including a criteria we fail to parse at
-    all — falls through to the product. Matching the literal "expr" token is
-    a heuristic on Trino's naming, acceptable only because failing to
-    recognise a criteria denies (charges the product) rather than exempts.
-    """
+def _aggregation_bounded(node: dict[str, Any], depth: int) -> bool:
+    """True if an aggregation caps this side's rows, through wrapper nodes."""
+    if depth > _MAX_WALK_DEPTH or not isinstance(node, dict):
+        return False
+    name = node.get("name")
+    if not isinstance(name, str):
+        return False
+    if name in _BOUNDING_NODES:
+        return True
+    if name in _ROW_PRESERVING_NODES:
+        return any(_is_sized(child, 0) for child in _children(node))
+    if name in _JOIN_NODES:
+        return False
+    if name in _PASSTHROUGH_NODES:
+        return any(_aggregation_bounded(child, depth + 1) for child in _children(node))
+    return False
+
+
+def _is_sized(node: dict[str, Any], depth: int) -> bool:
+    """True if Trino put a finite row count on this subtree."""
+    if depth > _MAX_WALK_DEPTH or not isinstance(node, dict):
+        return False
+    if _own_estimate(node) is not None:
+        return True
+    name = node.get("name")
+    if not isinstance(name, str) or name in _JOIN_NODES:
+        return False
+    if name in _PASSTHROUGH_NODES or name in _ROW_PRESERVING_NODES or name in _BOUNDING_NODES:
+        return any(_is_sized(child, depth + 1) for child in _children(node))
+    return False
+
+
+def _has_nan_scan(node: dict[str, Any], depth: int) -> bool:
+    """True if a leaf scan under this side had its estimate nulled by a filter."""
+    if depth > _MAX_WALK_DEPTH or not isinstance(node, dict):
+        return False
+    name = node.get("name")
+    if not isinstance(name, str):
+        return False
+    children = _children(node)
+    if not children:
+        return _reports_nan(node)
+    if name in _JOIN_NODES:
+        return False
+    if name in _PASSTHROUGH_NODES or name in _ROW_PRESERVING_NODES or name in _BOUNDING_NODES:
+        return any(_has_nan_scan(child, depth + 1) for child in children)
+    return False
+
+
+def _reports_nan(node: dict[str, Any]) -> bool:
+    """True if any estimate alternative on this node is unknown."""
+    estimates = node.get("estimates")
+    if not isinstance(estimates, list):
+        return False
+    for estimate in estimates:
+        if not isinstance(estimate, dict):
+            continue
+        rows = estimate.get("outputRowCount")
+        if isinstance(rows, str) and rows == "NaN":
+            return True
+        if isinstance(rows, float) and math.isnan(rows):
+            return True
+    return False
+
+
+def _keys_are_base_columns(node: dict[str, Any], assigned: dict[str, str]) -> bool:
+    """True if every equality key resolves to a plain base table column."""
     descriptor = node.get("descriptor")
     if not isinstance(descriptor, dict):
         return False
@@ -139,11 +255,32 @@ def _has_join_criteria(node: dict[str, Any]) -> bool:
     conjuncts = _CONJUNCT.findall(criteria)
     if not conjuncts:
         return False
-    return all(
-        _PLAIN_COLUMN.match(side) is not None
-        for pair in conjuncts
-        for side in pair
-    )
+    for pair in conjuncts:
+        for symbol in pair:
+            source = assigned.get(symbol)
+            # A key whose origin the plan never states is not a proven column.
+            if source is None or not _BASE_COLUMN_SOURCE.match(source):
+                return False
+    return True
+
+
+def _assignments(
+    node: dict[str, Any], found: dict[str, str], depth: int
+) -> dict[str, str]:
+    """Every "symbol := source" the plan declares, gathered once up front."""
+    if depth > _MAX_PLAN_DEPTH or not isinstance(node, dict):
+        return found
+    details = node.get("details")
+    if isinstance(details, list):
+        for line in details:
+            if not isinstance(line, str):
+                continue
+            match = _ASSIGNMENT.match(line)
+            if match is not None:
+                found.setdefault(match.group(1), match.group(2))
+    for child in _children(node):
+        _assignments(child, found, depth + 1)
+    return found
 
 
 def _children(node: dict[str, Any]) -> list[dict[str, Any]]:

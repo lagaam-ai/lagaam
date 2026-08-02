@@ -10,13 +10,23 @@ def _node(
     rows: object,
     children: list[dict] | None = None,
     descriptor: object = None,
+    details: object = None,
+    estimates: object = None,
 ) -> dict:
     """One plan node. rows=None means the estimate list is empty."""
-    estimates = [] if rows is None else [{"outputRowCount": rows}]
+    if estimates is None:
+        estimates = [] if rows is None else [{"outputRowCount": rows}]
     node = {"name": name, "estimates": estimates, "children": children or []}
     if descriptor is not None:
         node["descriptor"] = descriptor
+    if details is not None:
+        node["details"] = details
     return node
+
+
+def _scan(name: str, rows: object, column: str = "linestatus") -> dict:
+    """A leaf scan that assigns a plain base column, as Trino renders it."""
+    return _node(name, rows, details=[f"{column} := tpch:{column}"])
 
 
 def test_a_healthy_join_reports_its_own_row_count() -> None:
@@ -53,10 +63,10 @@ def test_a_nan_join_is_charged_the_product_of_its_children() -> None:
     assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
 
 
-def test_a_nan_join_with_equality_criteria_takes_the_widest_child() -> None:
-    # Correlated semi-join shape: Trino fails to propagate stats through a
-    # decorrelated subquery, but the join has a real equality key, so the
-    # product would invent work the subtree below already bounds.
+def test_a_nan_join_over_an_aggregation_takes_the_widest_child() -> None:
+    # Correlated semi-join shape, measured live on Trino 476: the decorrelated
+    # subquery arrives under an Aggregate, which emits at most one row per
+    # group, so the join cannot blow up and the product would invent work.
     plan = _node(
         "Output",
         "NaN",
@@ -64,12 +74,132 @@ def test_a_nan_join_with_equality_criteria_takes_the_widest_child() -> None:
             _node(
                 "InnerJoin",
                 "NaN",
-                [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
+                [
+                    _node("Aggregate", "NaN", [_scan("TableScan", 1200000.0)]),
+                    _scan("TableScan", 10000.0),
+                ],
                 descriptor={"criteria": "(suppkey_1 = suppkey)"},
             )
         ],
     )
     assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+
+
+def test_a_nan_join_between_two_plain_scans_is_charged_the_product() -> None:
+    # The filter-laundering attack: the key stays a plain column but a
+    # regexp_like filter nulls one side's estimate. Neither side is bounded
+    # by an aggregation, so a low-cardinality key really does multiply.
+    # Measured live: quoted 60,175 against a true 1,810,518,277 rows.
+    plan = _node(
+        "Output",
+        "NaN",
+        [
+            _node(
+                "InnerJoin",
+                "NaN",
+                [
+                    _scan("ScanFilterProject", 60175.0),
+                    _node(
+                        "LocalExchange",
+                        "NaN",
+                        [
+                            _node(
+                                "RemoteExchange",
+                                "NaN",
+                                [
+                                    _node(
+                                        "ScanFilterProject",
+                                        None,
+                                        estimates=[
+                                            {"outputRowCount": 60175.0},
+                                            {"outputRowCount": "NaN"},
+                                        ],
+                                        details=["linestatus := tpch:linestatus"],
+                                    )
+                                ],
+                            )
+                        ],
+                    ),
+                ],
+                descriptor={"criteria": "(linestatus = linestatus_10)"},
+            )
+        ],
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 60175.0
+
+
+def test_a_nan_join_sees_an_aggregation_through_exchange_wrappers() -> None:
+    # The real plan nests Aggregate under LocalExchange -> RemoteExchange;
+    # the walk must see through those or the exemption never fires.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [
+            _node(
+                "LocalExchange",
+                "NaN",
+                [
+                    _node(
+                        "RemoteExchange",
+                        "NaN",
+                        [_node("Aggregate", "NaN", [_scan("TableScan", 1200000.0)])],
+                    )
+                ],
+            ),
+            _scan("TableScan", 10000.0),
+        ],
+        descriptor={"criteria": "(suppkey_1 = suppkey)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+
+
+def test_a_nan_join_whose_key_is_a_computed_expression_pays_the_product() -> None:
+    # substr/lower/cast wrappers: both sides are sized, no NaN anywhere, but
+    # the key is derived. The plan's own assignment gives it away.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [
+            _node(
+                "ScanProject",
+                60175.0,
+                details=["expr := substring(linestatus, bigint '1', bigint '1')"],
+            ),
+            _node(
+                "ScanProject",
+                60175.0,
+                details=["expr_17 := substring(linestatus, bigint '1', bigint '1')"],
+            ),
+        ],
+        descriptor={"criteria": "(expr = expr_17)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 60175.0
+
+
+def test_a_nan_join_on_base_columns_with_sized_sides_takes_the_widest() -> None:
+    # Trino stops estimating multi-way joins past a depth: a 4-table star
+    # join reports NaN above an already-sized join, with every side sized and
+    # no derived key. Charging the product there denies ordinary analytics.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [
+            _node(
+                "InnerJoin",
+                3040568.0,
+                [_scan("ScanFilter", 6001215.0, "orderkey"), _scan("ScanFilter", 10000.0, "suppkey")],
+                descriptor={"criteria": "(suppkey_1 = suppkey)"},
+            ),
+            _node(
+                "TableScan",
+                729413.0,
+                details=["orderkey_4 := tpch:orderkey"],
+            ),
+        ],
+        descriptor={"criteria": "(orderkey = orderkey_4)"},
+    )
+    # The join takes max-of-children; the widest operator is the 6M leaf scan.
+    assert max_intermediate_rows(json.dumps(plan)) == 6001215.0
 
 
 def test_a_nan_join_with_missing_descriptor_is_charged_the_product() -> None:
@@ -109,48 +239,88 @@ def test_a_nan_join_with_empty_criteria_is_charged_the_product() -> None:
     assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
 
 
-def test_a_nan_join_with_derived_key_criteria_is_charged_the_product() -> None:
-    # substr/lower/cast-wrapped join keys: Trino renders the synthetic
-    # column as "expr"/"expr_N", not the plain column name. Measured live:
-    # ON substr(a.linestatus,1,1)=substr(b.linestatus,1,1) under-reported
-    # 30,087x by taking this path before the fix.
-    plan = _node(
-        "CrossJoin",
-        "NaN",
-        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
-        descriptor={"criteria": "(expr = expr_17)"},
-    )
-    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
-
-
-def test_a_nan_join_with_plain_orderkey_criteria_takes_the_widest_child() -> None:
-    # TPC-H Q21-style shape: plain column names, disambiguating suffix only.
+def test_a_nan_join_with_a_shadowed_alias_key_is_charged_the_product() -> None:
+    # The attacker aliases a derived key back to a plain column name. The
+    # name is a lie; the assignment in the plan's details is not.
     plan = _node(
         "InnerJoin",
         "NaN",
-        [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
-        descriptor={"criteria": "(orderkey = orderkey_4)"},
+        [
+            _node("ScanProject", 60175.0, details=["linestatus := lower(linestatus_3)"]),
+            _node("ScanProject", 60175.0, details=["linestatus_10 := lower(linestatus_9)"]),
+        ],
+        descriptor={"criteria": "(linestatus = linestatus_10)"},
     )
-    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
-
-
-def test_a_nan_join_with_plain_suppkey_criteria_takes_the_widest_child() -> None:
-    plan = _node(
-        "InnerJoin",
-        "NaN",
-        [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
-        descriptor={"criteria": "(suppkey_1 = suppkey)"},
-    )
-    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 60175.0
 
 
 def test_a_nan_join_with_mixed_plain_and_derived_criteria_is_charged_the_product() -> None:
     # One conjunct plain, one derived: conservative choice denies the whole.
     plan = _node(
-        "CrossJoin",
+        "InnerJoin",
         "NaN",
-        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        [
+            _node("ScanProject", 60175.0, details=["orderkey := tpch:orderkey"]),
+            _node("ScanProject", 15000.0, details=["expr_9 := lower(linestatus)"]),
+        ],
         descriptor={"criteria": "(orderkey = orderkey_4) AND (expr = expr_9)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
+
+
+def test_a_nan_join_with_a_row_preserving_window_side_takes_the_widest() -> None:
+    # A Window emits exactly one row per input row, so a Window over a sized
+    # input bounds that side even though Trino reports NaN above it.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [
+            _scan("ScanFilter", 150000.0, "custkey"),
+            _node(
+                "LocalExchange",
+                "NaN",
+                [_node("Window", None, [_scan("TableScan", 1500000.0, "custkey")])],
+            ),
+        ],
+        descriptor={"criteria": "(custkey = custkey_1)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1500000.0
+
+
+def test_malformed_details_fall_through_to_the_product() -> None:
+    # Anything unparseable must deny, never exempt.
+    for details in ("not-a-list", [None, 42, {"a": 1}], [], ["no assignment here"]):
+        plan = _node(
+            "InnerJoin",
+            "NaN",
+            [_node("ScanProject", 60175.0), _node("ScanProject", 15000.0)],
+            descriptor={"criteria": "(expr = expr_17)"},
+            details=details,
+        )
+        assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0, details
+
+
+def test_a_nan_join_with_unparseable_criteria_is_charged_the_product() -> None:
+    for criteria in ("", "garbage", "(a <> b)", 42, None, ["(a = b)"]):
+        plan = _node(
+            "InnerJoin",
+            "NaN",
+            [_scan("TableScan", 60175.0), _scan("TableScan", 15000.0)],
+            descriptor={"criteria": criteria},
+        )
+        assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0, criteria
+
+
+def test_an_unknown_bounding_node_name_does_not_exempt() -> None:
+    # A node we do not recognise cannot vouch for a side.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [
+            _node("SomeFutureBoundingNode", "NaN", [_scan("TableScan", 60175.0)]),
+            _scan("TableScan", 15000.0),
+        ],
+        descriptor={"criteria": "(expr = expr_17)"},
     )
     assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
 
