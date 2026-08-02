@@ -20,8 +20,11 @@ Two halves:
 - Hexagonal core: `QueryEngine` interface (port) + adapters. Trino adapter
   first; native Pinot adapter second (v0.2). Core never imports engine SDKs.
 - Token cost = METER: cumulative counting, enforced at the LLM proxy.
-- Query cost = QUOTATION: predicted pre-execution via EXPLAIN + heuristics,
-  enforced inside the MCP server before running anything.
+- Query cost = QUOTATION: predicted pre-execution from the engine's own plan
+  (bytes from EXPLAIN TYPE IO, widest-operator rows from EXPLAIN TYPE
+  LOGICAL), enforced inside the MCP server before running anything. Cardinality
+  is read from the plan, never inferred from SQL shape — see docs/adr/0004.
+  Row generators are the one exception the planner cannot see (docs/adr/0006).
 - Enforcement lives at the gates (proxy, MCP server). NEVER inside the agent
   pod — the pod is semi-trusted (prompt injection risk).
 - Identity is the handshake: control plane issues agent identity; MCP server

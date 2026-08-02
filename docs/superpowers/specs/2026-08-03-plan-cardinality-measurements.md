@@ -77,3 +77,91 @@ Also unnecessary: table_scan_counts + _collapse_factor in engine.py
 Kept (planner cannot do it):
   _generates_rows, _expands_a_bounded_value, _is_bounded_input,
   _func_name, _func_arguments, _generator_rows, _ROW_PRESERVING_FUNCS
+
+---
+
+## Addendum — measured during implementation (3 Aug 2026)
+
+Facts discovered after the design was written, all on the same Trino 476.
+
+### 10. The default budget the design proposed was wrong
+
+The design set `DEFAULT_MAX_INTERMEDIATE_ROWS` to 1,000,000,000, above the
+entire measured explosion band (225,000,000–902,625,000). Every attack shape
+would have been admitted. Caught by the integration corpus.
+
+Re-measured at a realistic scale, because the design corpus used only the
+toy `tiny` schema:
+
+| shape | scale | max intermediate rows |
+|---|---|---|
+| `lineitem JOIN orders ON orderkey` (legitimate) | sf1 | 6,001,215 |
+| `GROUP BY orderkey` (legitimate) | sf1 | 6,001,215 |
+| `JOIN ON l.linestatus = o.orderstatus` | sf1 | 3,000,607,500,000 |
+| cross join | sf1 | 9,001,822,500,000 |
+| `GROUP BY 1` ordinal pin | tiny | 225,000,000 |
+
+Band: 6,001,215 legitimate → 225,000,000 cheapest explosion (37.5x).
+Default set to **50,000,000**: 8.3x headroom above real work, 4.5x margin
+below the cheapest attack, nearest the geometric midpoint (36,746,066).
+
+### 11. A NaN join with equality criteria must not be charged a product
+
+```sql
+SELECT s.suppkey FROM tpch.sf1.supplier s
+WHERE s.suppkey IN (
+  SELECT ps.suppkey FROM tpch.sf1.partsupp ps
+  WHERE ps.supplycost < (SELECT avg(ps2.supplycost)
+                         FROM tpch.sf1.partsupp ps2 WHERE ps2.partkey = ps.partkey))
+```
+
+Estimated **12,000,000,000** rows; real execution **10,000 rows in 0.16s**.
+Trino fails to propagate stats through the decorrelated plan, so the top
+`InnerJoin` reports NaN and the product fallback invented the number.
+
+The plan JSON distinguishes the two cases directly:
+
+- laundered cross join: `{"name": "CrossJoin", "descriptor": {}}` — no
+  criteria, so the product is the real cost.
+- correlated semi-join: `{"name": "InnerJoin", "descriptor":
+  {"criteria": "(suppkey_1 = suppkey)"}}` — a real equality key.
+
+Charging the product only when criteria are absent fixes the false block
+(12,000,000,000 → 1,200,000, admitted) with no attack regression: 14 attack
+shapes including all five laundering variants remain denied.
+
+This does not generalise — five other correlated shapes, including TPC-H
+Q17, already estimate correctly at 6,001,215.
+
+### 12. sf100 has no statistics at all
+
+`SHOW STATS FOR tpch.sf100.lineitem` returns NULL for every column, as does
+`tpch.sf100.nation` (25 rows). Any sf100 query is therefore denied as
+unmeasurable. Correct fail-safe behaviour, and the reason the docs tell
+operators to run `ANALYZE`: a stats-less connector is unusable through this
+gate by design.
+
+### 13. Nesting: sqlglot breaks well before the input-size ceiling
+
+`_MAX_SQL_CHARS` (200,000) does not bound the real hazard.
+
+| shape | breaks at | payload |
+|---|---|---|
+| `SELECT x FROM (...) t` | render fails ~AST depth 263; parser ~loop 118 | 1,813 chars at depth 100 |
+| `CASE WHEN ... THEN (...)` | ~bracket depth 27 | small |
+| `abs(abs(...))` | ~bracket depth 45 | 263 chars |
+| `ARRAY[ARRAY[...]]` | quadratic: 0.03s @10, 0.78s @15, 5.11s @18, >45s @22 | 141 chars at depth 18 |
+
+The array shape is the worst and was invisible to a paren-only counter.
+Caps chosen: `_MAX_BRACKET_DEPTH = 12` (all delimiters, string literals
+skipped), `_MAX_NESTING_DEPTH = 100` (post-parse AST).
+
+Verified after the fix: 48 attack combinations across 8 nesting shapes at
+depths to 5000 — zero escapes, worst case 0.008s. Legitimate SQL measured at
+bracket depth 1–4 against the cap of 12; 0 of 16 realistic queries blocked.
+
+### 14. False-block rate
+
+Measured on a fresh 55-query corpus written independently of the design:
+**2/55 = 3.6%** (previous design: 8.8%). One was the NaN-join defect above,
+now fixed; the other was sf100's missing statistics.
