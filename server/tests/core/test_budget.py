@@ -194,6 +194,14 @@ def test_a_query_within_the_intermediate_row_budget_passes() -> None:
     enforce_budget(estimate, budget)
 
 
+def test_an_intermediate_row_count_exactly_at_the_limit_passes() -> None:
+    # The boundary is exclusive: a query that builds exactly the cap is not
+    # over it, same convention as the scan-byte budget.
+    budget = QueryBudget(max_intermediate_rows=1_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=1_000_000)
+    enforce_budget(estimate, budget)
+
+
 def test_a_product_over_the_intermediate_row_budget_is_denied() -> None:
     budget = QueryBudget(max_intermediate_rows=1_000_000_000)
     estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=902_625_000_0)

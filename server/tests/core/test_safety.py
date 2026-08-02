@@ -260,6 +260,20 @@ def test_a_very_deeply_nested_query_never_raises_recursionerror() -> None:
             validate_query(_nested(depth), "trino")
 
 
+def _and_chain(terms: int) -> str:
+    return "SELECT 1 FROM t WHERE " + " AND ".join(f"x{i} = {i}" for i in range(terms))
+
+
+def test_a_bracket_free_and_chain_is_caught_by_nesting_not_brackets() -> None:
+    # An AND chain nests the AST one level per term but opens no bracket at
+    # all, so _bracket_depth reads 0 — only _too_deeply_nested can catch it.
+    # 300 terms is small in characters (well under _MAX_SQL_CHARS) and shallow
+    # in brackets (0), so this proves the nesting guard fires on its own.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(_and_chain(300), "trino")
+    assert "nested" in str(err.value).lower()
+
+
 def _nested_abs(depth: int) -> str:
     expr = "1"
     for _ in range(depth):
