@@ -168,6 +168,64 @@ def test_a_self_referencing_cte_terminates() -> None:
     ) == 1
 
 
+# --- pathological CTE chains (doubling references) -------------------------
+
+
+def _doubling_chain(n: int) -> str:
+    # Each CTE references the previous one twice: a naive re-walk of every
+    # reference's body doubles the work per level, growing as 2^n.
+    head = "WITH c0 AS (SELECT orderkey FROM tpch.sf1.orders),"
+    links = ",".join(
+        f"c{i} AS (SELECT a.orderkey FROM c{i - 1} a JOIN c{i - 1} b "
+        f"ON a.orderkey = b.orderkey)"
+        for i in range(1, n)
+    )
+    return f"{head}{links} SELECT orderkey FROM c{n - 1} LIMIT 5"
+
+
+def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n24() -> None:
+    import time
+
+    start = time.perf_counter()
+    result = counts(_doubling_chain(24))
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0
+    assert result["tpch.sf1.orders"] <= 100_000
+
+
+def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n40() -> None:
+    import time
+
+    start = time.perf_counter()
+    result = counts(_doubling_chain(40))
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0
+    assert result["tpch.sf1.orders"] <= 100_000
+
+
+def test_three_way_self_join_still_returns_three() -> None:
+    assert counts(
+        "SELECT a.orderkey FROM tpch.tiny.orders a "
+        "JOIN tpch.tiny.orders b ON a.orderkey = b.orderkey "
+        "JOIN tpch.tiny.orders c ON b.orderkey = c.orderkey"
+    ) == {"tpch.tiny.orders": 3}
+
+
+def test_a_cte_referenced_four_times_still_returns_four() -> None:
+    cte = "WITH c AS (SELECT orderkey FROM tpch.tiny.orders) "
+    assert counts(
+        cte + "SELECT count(*) FROM ("
+        "SELECT * FROM c UNION ALL SELECT * FROM c UNION ALL "
+        "SELECT * FROM c UNION ALL SELECT * FROM c) z"
+    ) == {"tpch.tiny.orders": 4}
+
+
+def test_a_single_scan_still_returns_one() -> None:
+    assert counts("SELECT orderkey FROM tpch.tiny.orders") == {
+        "tpch.tiny.orders": 1
+    }
+
+
 # --- generators the parser does not model natively ------------------------
 
 

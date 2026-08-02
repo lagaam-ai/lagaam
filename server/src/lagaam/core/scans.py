@@ -21,6 +21,12 @@ from sqlglot import exp
 
 _GENERATORS = (exp.Unnest, exp.Explode, exp.Posexplode)
 
+# A chain of CTEs each referenced twice doubles table_scan_counts' walk work
+# per level: 24 links is a ~1,700-char request and 8M walk steps. Real queries
+# measure in the dozens of references at most, so this leaves orders of
+# magnitude of headroom while still bounding the walk to milliseconds.
+_MAX_SCAN_COUNT = 10_000
+
 # A relation an agent spells out inline is a lookup table, not a multiplier.
 # Past this many rows it stops being one: crossing a 1.5M-row scan against
 # 20,000 inline values is 30 billion rows the plan prices as one scan.
@@ -212,9 +218,17 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
 
     bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
     counts: dict[str, int] = {}
+    # A chain of CTEs each referenced twice doubles walk work per level of
+    # depth; a running total caught before recursing bounds that growth
+    # instead of only bounding the counts it would have produced.
+    budget = [_MAX_SCAN_COUNT]
 
     def walk(node: exp.Expr, weight: int, pending: frozenset[str]) -> None:
+        if budget[0] <= 0:
+            return
         for table in node.find_all(exp.Table):
+            if budget[0] <= 0:
+                return
             parts = [part.name for part in table.parts]
             name = parts[0].lower()
             if len(parts) == 1 and name in bodies:
@@ -222,10 +236,12 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
                 # depth is the engine's business, not the quote's.
                 if name in pending:
                     continue
+                budget[0] -= 1
                 walk(bodies[name], weight, pending | {name})
                 continue
             key = ".".join(parts).lower()
             counts[key] = counts.get(key, 0) + weight
+            budget[0] -= weight
 
     # From the query with its WITH detached: a CTE body counts once per
     # reference to it, not once where it is defined.
