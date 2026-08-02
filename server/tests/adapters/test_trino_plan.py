@@ -124,6 +124,68 @@ def test_junk_inside_a_well_formed_plan_is_survived() -> None:
     assert max_intermediate_rows(json.dumps(plan)) == 42.0
 
 
+def test_a_non_string_node_name_does_not_raise() -> None:
+    # A node with name as list or dict should not raise TypeError on membership test.
+    plan = {
+        "name": ["CrossJoin"],
+        "estimates": [{"outputRowCount": 100.0}],
+        "children": [
+            {"name": "TableScan", "estimates": [{"outputRowCount": 50.0}], "children": []}
+        ],
+    }
+    assert max_intermediate_rows(json.dumps(plan)) == 100.0
+
+    plan = {
+        "name": {"type": "CrossJoin"},
+        "estimates": [],
+        "children": [
+            {"name": "TableScan", "estimates": [{"outputRowCount": 75.0}], "children": []}
+        ],
+    }
+    assert max_intermediate_rows(json.dumps(plan)) == 75.0
+
+
+def test_a_join_product_that_overflows_to_infinity_does_not_contribute() -> None:
+    # Two very large numbers multiply to infinity. The CrossJoin has no
+    # own estimate, so it would compute 1e200 * 1e200 = inf as a product.
+    # This infinity must be rejected (not recorded in widest).
+    # The children's individual estimates are still recorded.
+    plan = _node(
+        "CrossJoin",
+        "NaN",
+        [
+            _node("TableScan", 1e200),
+            _node("TableScan", 1e200),
+        ],
+    )
+    # The infinity product is rejected. The two TableScans with 1e200 are recorded.
+    # Max is 1e200, not inf.
+    assert max_intermediate_rows(json.dumps(plan)) == 1e200
+
+
+def test_json_with_very_large_integers_does_not_raise() -> None:
+    # A JSON integer too large to convert to float (e.g., 10**400) should
+    # raise OverflowError in finite_number, which must be caught.
+    plan = {
+        "name": "TableScan",
+        "estimates": [{"outputRowCount": 10**400}],
+        "children": [],
+    }
+    assert max_intermediate_rows(json.dumps(plan)) is None
+
+
+def test_json_nested_deeply_does_not_raise_recursion_error() -> None:
+    # json.loads itself can raise RecursionError on deeply nested JSON.
+    # We need to catch that at the json.loads call.
+    # Simulate with a moderately deep structure that stresses json.loads.
+    plan_json = '{"name": "TableScan", "estimates": [{"outputRowCount": 1.0}], "children": []}'
+    # Build to just under where json.loads starts failing (around 5000)
+    for _ in range(4800):
+        plan_json = f'{{"name": "Project", "estimates": [], "children": [{plan_json}]}}'
+    # This should return None, not raise RecursionError
+    assert max_intermediate_rows(plan_json) is None
+
+
 def test_a_pathologically_deep_plan_is_refused_rather_than_recursed() -> None:
     # Build a 4500-deep plan as a JSON string directly. The estimate sits at
     # the bottom, past our depth cap of 400, so nothing is recorded.

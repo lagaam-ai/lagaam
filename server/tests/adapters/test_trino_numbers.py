@@ -45,3 +45,10 @@ def test_finite_values_pass_through(value: object, expected: float) -> None:
 )
 def test_unusable_values_are_none(value: object) -> None:
     assert finite_number(value) is None
+
+
+def test_extremely_large_integers_that_overflow_float_are_none() -> None:
+    # A JSON integer like 10**400 can be parsed by json.loads but raises
+    # OverflowError when converted to float. This must be caught and return None.
+    assert finite_number(10**400) is None
+    assert finite_number("10" + "0" * 400) is None

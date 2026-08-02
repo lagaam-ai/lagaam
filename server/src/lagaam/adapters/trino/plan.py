@@ -18,6 +18,7 @@ alternative is pricing the laundered cross join at its children's size.
 """
 
 import json
+import math
 from typing import Any
 
 from lagaam.adapters.trino.numbers import finite_number
@@ -55,7 +56,7 @@ def max_intermediate_rows(plan_json: str) -> float | None:
     """
     try:
         root = json.loads(plan_json)
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
         return None
     if not isinstance(root, dict):
         return None
@@ -75,13 +76,19 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
     known = [rows for rows in children if rows is not None]
     rows = _own_estimate(node)
     if rows is None and known:
-        if node.get("name") in _JOIN_NODES:
+        # Only treat as join product if name is actually a string and known.
+        node_name = node.get("name")
+        if isinstance(node_name, str) and node_name in _JOIN_NODES:
             # A join whose size Trino could not estimate still pairs its
             # inputs; charging less than the product is how a laundered
             # cross join reads as the size of one of its tables.
             rows = 1.0
             for child_rows in known:
                 rows *= child_rows
+            # A product of very large numbers can overflow to infinity.
+            # finite_number rejects infinities, so use it as a guard.
+            if not math.isfinite(rows) or rows < 0:
+                rows = None
         else:
             rows = max(known)
     if rows is not None:
