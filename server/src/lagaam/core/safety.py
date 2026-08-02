@@ -39,12 +39,12 @@ _DENY_NODES = (
 _MAX_SQL_CHARS = 200_000
 
 # sqlglot's own recursive-descent parser blows the stack on deep bracket
-# nesting well before a query gets big enough to trip _MAX_SQL_CHARS —
-# measured under pytest: parsing itself raised RecursionError at 118 levels
-# of "SELECT x FROM (...) t" (1,993 characters). This ceiling is a cheap,
-# text-level proxy checked before parsing is attempted at all, generous
-# enough that no ordinary query's bracket nesting comes close.
-_MAX_BRACKET_DEPTH = 60
+# nesting well before a query gets big enough to trip _MAX_SQL_CHARS — and
+# the break point depends on grammar shape, not bracket count alone: nested
+# CASE WHEN ... THEN (...) broke the parser at 27 brackets, nested abs() at
+# 44, nested subqueries not until 118 (all measured under pytest). The cap
+# has to sit below the worst of those, not the most generous.
+_MAX_BRACKET_DEPTH = 20
 
 # sqlglot's generator recurses once per AST level, so a *small* query nested
 # deeply enough blows the stack inside tree.sql(): measured under pytest,

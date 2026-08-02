@@ -256,3 +256,34 @@ def test_a_very_deeply_nested_query_never_raises_recursionerror() -> None:
     for depth in (100, 500, 1000):
         with pytest.raises(SqlValidationError):
             validate_query(_nested(depth), "trino")
+
+
+def _nested_abs(depth: int) -> str:
+    expr = "1"
+    for _ in range(depth):
+        expr = f"abs({expr})"
+    return f"SELECT {expr} FROM t"
+
+
+def _nested_case(depth: int) -> str:
+    expr = "0"
+    for _ in range(depth):
+        expr = f"CASE WHEN 1=1 THEN ({expr}) ELSE 0 END"
+    return f"SELECT {expr} FROM t"
+
+
+def test_deeply_nested_function_calls_are_refused_not_crashed() -> None:
+    # Measured: nested abs() blows the parser's own stack at 44 levels of
+    # bracket nesting — well under the subquery shape's 118. The bracket
+    # guard has to catch grammar nesting generally, not one SQL shape.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(_nested_abs(44), "trino")
+    assert "nested" in str(err.value).lower()
+
+
+def test_deeply_nested_case_expressions_are_refused_not_crashed() -> None:
+    # Measured: nested CASE WHEN ... THEN (...) blows the parser's stack at
+    # 27 levels of bracket nesting — the worst-case shape measured.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(_nested_case(27), "trino")
+    assert "nested" in str(err.value).lower()
