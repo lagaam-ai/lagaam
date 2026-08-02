@@ -287,6 +287,16 @@ _LEGITIMATE = [
     ("constant cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (SELECT 0.2 AS rate) r"),
     ("two small values relations", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (VALUES (1),(2)) AS a(x) CROSS JOIN (VALUES (1),(2)) AS b(y)"),
     ("semi join", "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey IN (SELECT orderkey FROM tpch.tiny.lineitem)"),
+    # The shape the NaN-with-criteria exemption exists for: Trino decorrelates
+    # this into a plan whose top InnerJoin has equality keys but no estimate.
+    # Charging the product there priced 12 billion rows against a real 10,000.
+    (
+        "doubly nested correlated semi join",
+        "SELECT s.suppkey FROM tpch.sf1.supplier s WHERE s.suppkey IN ("
+        "SELECT ps.suppkey FROM tpch.sf1.partsupp ps WHERE ps.supplycost < ("
+        "SELECT avg(ps2.supplycost) FROM tpch.sf1.partsupp ps2 "
+        "WHERE ps2.partkey = ps.partkey))",
+    ),
 ]
 
 # tpch.tiny is a toy scale (15,000-row orders); these prove the gate at sf1
