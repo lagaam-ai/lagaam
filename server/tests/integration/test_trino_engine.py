@@ -281,6 +281,19 @@ _LEGITIMATE = [
     ("semi join", "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey IN (SELECT orderkey FROM tpch.tiny.lineitem)"),
 ]
 
+# tpch.tiny is a toy scale (15,000-row orders); these prove the gate at sf1
+# (1.5M-row orders, 6M-row lineitem), where legitimate analytics measures
+# up to 6,001,215 rows at its widest operator.
+_LEGITIMATE_AT_SCALE = [
+    ("sf1 healthy join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey = o.orderkey"),
+    ("sf1 group by", "SELECT l.orderkey, count(*) AS c FROM tpch.sf1.lineitem l GROUP BY l.orderkey"),
+    ("sf1 filtered scan", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.orderdate > DATE '1995-01-01'"),
+]
+
+_EXPLOSIONS_AT_SCALE = [
+    ("sf1 low-cardinality join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.linestatus = o.orderstatus"),
+]
+
 _EXPLOSIONS = [
     ("cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o"),
     ("cross join laundered by a like filter", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o WHERE o.comment LIKE '%special%'"),
@@ -331,3 +344,33 @@ async def test_row_generators_are_denied_by_the_shape_check(
     # The planner cannot see these, so scans.py must still refuse them.
     estimate = await engine.estimate_cost(sql)
     assert estimate.confidence == "low"
+
+
+@pytest.mark.parametrize(
+    "label,sql", _LEGITIMATE_AT_SCALE, ids=[t[0] for t in _LEGITIMATE_AT_SCALE]
+)
+async def test_legitimate_sf1_shapes_clear_the_default_budget(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    # tiny alone cannot prove the gate survives real scale; sf1 does.
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize(
+    "label,sql", _EXPLOSIONS_AT_SCALE, ids=[t[0] for t in _EXPLOSIONS_AT_SCALE]
+)
+async def test_row_explosions_at_sf1_are_denied(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)

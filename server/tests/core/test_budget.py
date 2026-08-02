@@ -237,7 +237,7 @@ def test_the_env_budget_gates_intermediate_rows_by_default(
         "LAGAAM_MAX_INTERMEDIATE_ROWS",
     ):
         monkeypatch.delenv(name, raising=False)
-    assert QueryBudget.from_env().max_intermediate_rows == 10_000_000
+    assert QueryBudget.from_env().max_intermediate_rows == 50_000_000
 
 
 def test_the_env_budget_reads_an_explicit_intermediate_row_cap(

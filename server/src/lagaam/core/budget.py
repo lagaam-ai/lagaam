@@ -27,10 +27,13 @@ DEFAULT_MAX_SCAN_BYTES = 50 * 1024**3  # 50 GiB
 DEFAULT_TIMEOUT_SECONDS = 300.0
 # Rows are materialized in this process, so the ceiling is memory, not policy.
 MAX_RETURNED_ROWS_CEILING = 100_000
-# Measured on Trino 476: legitimate analytics peaks around 240,700 rows at
-# its widest operator, while the cheapest product shape starts at
-# 225,000,000. This sits between them with room on both sides.
-DEFAULT_MAX_INTERMEDIATE_ROWS = 10_000_000
+# Measured on Trino 476: legitimate analytics peaks at 6,001,215 rows at sf1
+# scale (a healthy join or GROUP BY over lineitem), while the cheapest
+# measured product shape starts at 225,000,000 at any scale — a 37.5x gap.
+# 50,000,000 sits near the geometric midpoint, 8.3x above legitimate sf1
+# work and 4.5x below the cheapest attack. Operators running larger scans
+# should raise this via LAGAAM_MAX_INTERMEDIATE_ROWS.
+DEFAULT_MAX_INTERMEDIATE_ROWS = 50_000_000
 
 
 class QueryBudget(BaseModel):
