@@ -27,6 +27,10 @@ DEFAULT_MAX_SCAN_BYTES = 50 * 1024**3  # 50 GiB
 DEFAULT_TIMEOUT_SECONDS = 300.0
 # Rows are materialized in this process, so the ceiling is memory, not policy.
 MAX_RETURNED_ROWS_CEILING = 100_000
+# Measured on Trino 476: legitimate analytics peaks around 240,700 rows at
+# its widest operator, while the cheapest product shape starts at
+# 225,000,000. This sits between them with room on both sides.
+DEFAULT_MAX_INTERMEDIATE_ROWS = 1_000_000_000
 
 
 class QueryBudget(BaseModel):
@@ -38,6 +42,9 @@ class QueryBudget(BaseModel):
 
     max_scan_bytes: int | None = Field(default=None, gt=0)
     max_rows: int | None = Field(default=None, gt=0)
+    # Rows the engine would build at its widest operator, not rows returned:
+    # what a product join blows and a byte estimate cannot see.
+    max_intermediate_rows: int | None = Field(default=None, gt=0)
     # Unset falls back to the server's default row cap, never unlimited.
     max_returned_rows: int | None = Field(
         default=None, gt=0, le=MAX_RETURNED_ROWS_CEILING
@@ -57,11 +64,17 @@ class QueryBudget(BaseModel):
         scan_bytes = _int_env("LAGAAM_MAX_SCAN_BYTES")
         timeout = _float_env("LAGAAM_QUERY_TIMEOUT")
         returned_rows = _int_env("LAGAAM_MAX_RETURNED_ROWS")
+        intermediate_rows = _int_env("LAGAAM_MAX_INTERMEDIATE_ROWS")
         return cls(
             max_scan_bytes=(
                 DEFAULT_MAX_SCAN_BYTES if scan_bytes is None else scan_bytes
             ),
             max_rows=_int_env("LAGAAM_MAX_ROWS"),
+            max_intermediate_rows=(
+                DEFAULT_MAX_INTERMEDIATE_ROWS
+                if intermediate_rows is None
+                else intermediate_rows
+            ),
             max_returned_rows=(
                 None
                 if returned_rows is None
@@ -134,4 +147,20 @@ def enforce_budget(estimate: CostEstimate, budget: QueryBudget) -> None:
                 f"rows, over your budget of {budget.max_rows:,}. This counts "
                 "rows scanned, not returned, so a LIMIT alone won't help — add "
                 "a WHERE filter (a date or key range) to read fewer rows."
+            )
+
+    if budget.max_intermediate_rows is not None:
+        if estimate.confidence == "low" or estimate.max_intermediate_rows is None:
+            raise BudgetExceededError(
+                "The row work could not be estimated, so this query cannot be "
+                f"cleared against your row budget. {_UNESTIMABLE}"
+            )
+        if estimate.max_intermediate_rows > budget.max_intermediate_rows:
+            raise BudgetExceededError(
+                f"This query would build {estimate.max_intermediate_rows:,} "
+                "rows at its widest step, over your budget of "
+                f"{budget.max_intermediate_rows:,}. These are rows the engine "
+                "materializes internally, not rows returned, so a LIMIT will "
+                "not help — join on a column with more distinct values, or "
+                "filter each side before the join."
             )

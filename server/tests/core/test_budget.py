@@ -183,3 +183,65 @@ def test_from_env_honours_an_explicit_budget(
     budget = QueryBudget.from_env()
     assert budget.max_scan_bytes == 1024
     assert budget.timeout_seconds == 5.0
+
+
+# --- widest-operator row budget -------------------------------------------
+
+
+def test_a_query_within_the_intermediate_row_budget_passes() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=240_700)
+    enforce_budget(estimate, budget)
+
+
+def test_a_product_over_the_intermediate_row_budget_is_denied() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=902_625_000_0)
+    with pytest.raises(BudgetExceededError) as err:
+        enforce_budget(estimate, budget)
+    message = str(err.value)
+    assert "9,026,250,000" in message
+    assert "1,000,000,000" in message
+    # The agent must learn that a LIMIT cannot fix a product.
+    assert "LIMIT" in message
+
+
+def test_a_missing_intermediate_row_count_is_denied() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(CostEstimate(scanned_bytes=10), budget)
+
+
+def test_a_low_confidence_estimate_is_denied_on_intermediate_rows() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(confidence="low", max_intermediate_rows=5)
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)
+
+
+def test_an_ungated_intermediate_row_dimension_admits_anything() -> None:
+    budget = QueryBudget(max_scan_bytes=100)
+    enforce_budget(
+        CostEstimate(scanned_bytes=10, max_intermediate_rows=10**15), budget
+    )
+
+
+def test_the_env_budget_gates_intermediate_rows_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "LAGAAM_MAX_SCAN_BYTES",
+        "LAGAAM_QUERY_TIMEOUT",
+        "LAGAAM_MAX_ROWS",
+        "LAGAAM_MAX_RETURNED_ROWS",
+        "LAGAAM_MAX_INTERMEDIATE_ROWS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert QueryBudget.from_env().max_intermediate_rows == 1_000_000_000
+
+
+def test_the_env_budget_reads_an_explicit_intermediate_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAGAAM_MAX_INTERMEDIATE_ROWS", "5000")
+    assert QueryBudget.from_env().max_intermediate_rows == 5000
