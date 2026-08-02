@@ -15,6 +15,12 @@ Unknown estimates arrive as the JSON string "NaN", and they propagate
 upward: a filter Trino cannot size makes every operator above it unknown.
 A join in that state is charged the product of what it joins, because the
 alternative is pricing the laundered cross join at its children's size.
+
+Exception: a NaN join carrying real equality criteria (descriptor.criteria)
+cannot exceed the product of its inputs, and its inputs already bound the
+work — charging the product there invents cost Trino simply failed to
+propagate through (e.g. a decorrelated correlated subquery). That join
+falls back to the max-of-children rule instead, same as a non-join node.
 """
 
 import json
@@ -78,7 +84,7 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
     if rows is None and known:
         # Only treat as join product if name is actually a string and known.
         node_name = node.get("name")
-        if isinstance(node_name, str) and node_name in _JOIN_NODES:
+        if isinstance(node_name, str) and node_name in _JOIN_NODES and not _has_join_criteria(node):
             # A join whose size Trino could not estimate still pairs its
             # inputs; charging less than the product is how a laundered
             # cross join reads as the size of one of its tables.
@@ -94,6 +100,19 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
     if rows is not None:
         widest.append(rows)
     return rows
+
+
+def _has_join_criteria(node: dict[str, Any]) -> bool:
+    """True if this join carries a real equality key, bounding its own output.
+
+    An equi-join cannot exceed the product of its inputs, and its criteria
+    means Trino sized its inputs deliberately, not because it gave up.
+    """
+    descriptor = node.get("descriptor")
+    if not isinstance(descriptor, dict):
+        return False
+    criteria = descriptor.get("criteria")
+    return isinstance(criteria, str) and criteria != ""
 
 
 def _children(node: dict[str, Any]) -> list[dict[str, Any]]:

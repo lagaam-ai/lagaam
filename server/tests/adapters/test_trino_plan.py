@@ -5,10 +5,18 @@ import json
 from lagaam.adapters.trino.plan import max_intermediate_rows
 
 
-def _node(name: str, rows: object, children: list[dict] | None = None) -> dict:
+def _node(
+    name: str,
+    rows: object,
+    children: list[dict] | None = None,
+    descriptor: object = None,
+) -> dict:
     """One plan node. rows=None means the estimate list is empty."""
     estimates = [] if rows is None else [{"outputRowCount": rows}]
-    return {"name": name, "estimates": estimates, "children": children or []}
+    node = {"name": name, "estimates": estimates, "children": children or []}
+    if descriptor is not None:
+        node["descriptor"] = descriptor
+    return node
 
 
 def test_a_healthy_join_reports_its_own_row_count() -> None:
@@ -38,8 +46,65 @@ def test_a_nan_join_is_charged_the_product_of_its_children() -> None:
                 "CrossJoin",
                 "NaN",
                 [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+                descriptor={},
             )
         ],
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
+
+
+def test_a_nan_join_with_equality_criteria_takes_the_widest_child() -> None:
+    # Correlated semi-join shape: Trino fails to propagate stats through a
+    # decorrelated subquery, but the join has a real equality key, so the
+    # product would invent work the subtree below already bounds.
+    plan = _node(
+        "Output",
+        "NaN",
+        [
+            _node(
+                "InnerJoin",
+                "NaN",
+                [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
+                descriptor={"criteria": "(suppkey_1 = suppkey)"},
+            )
+        ],
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+
+
+def test_a_nan_join_with_missing_descriptor_is_charged_the_product() -> None:
+    plan = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
+
+
+def test_a_nan_join_with_non_dict_descriptor_is_charged_the_product() -> None:
+    plan_string_descriptor = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        descriptor="not-a-dict",
+    )
+    assert max_intermediate_rows(json.dumps(plan_string_descriptor)) == 60175.0 * 15000.0
+
+    plan_list_descriptor = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        descriptor=["criteria"],
+    )
+    assert max_intermediate_rows(json.dumps(plan_list_descriptor)) == 60175.0 * 15000.0
+
+
+def test_a_nan_join_with_empty_criteria_is_charged_the_product() -> None:
+    plan = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        descriptor={"criteria": ""},
     )
     assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
 
