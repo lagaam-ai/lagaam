@@ -109,6 +109,52 @@ def test_a_nan_join_with_empty_criteria_is_charged_the_product() -> None:
     assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
 
 
+def test_a_nan_join_with_derived_key_criteria_is_charged_the_product() -> None:
+    # substr/lower/cast-wrapped join keys: Trino renders the synthetic
+    # column as "expr"/"expr_N", not the plain column name. Measured live:
+    # ON substr(a.linestatus,1,1)=substr(b.linestatus,1,1) under-reported
+    # 30,087x by taking this path before the fix.
+    plan = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        descriptor={"criteria": "(expr = expr_17)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
+
+
+def test_a_nan_join_with_plain_orderkey_criteria_takes_the_widest_child() -> None:
+    # TPC-H Q21-style shape: plain column names, disambiguating suffix only.
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
+        descriptor={"criteria": "(orderkey = orderkey_4)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+
+
+def test_a_nan_join_with_plain_suppkey_criteria_takes_the_widest_child() -> None:
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_node("TableScan", 1200000.0), _node("TableScan", 10000.0)],
+        descriptor={"criteria": "(suppkey_1 = suppkey)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1200000.0
+
+
+def test_a_nan_join_with_mixed_plain_and_derived_criteria_is_charged_the_product() -> None:
+    # One conjunct plain, one derived: conservative choice denies the whole.
+    plan = _node(
+        "CrossJoin",
+        "NaN",
+        [_node("TableScan", 60175.0), _node("TableScan", 15000.0)],
+        descriptor={"criteria": "(orderkey = orderkey_4) AND (expr = expr_9)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 15000.0
+
+
 def test_a_nan_non_join_takes_the_widest_child() -> None:
     # A filter cannot manufacture rows, so an unknown one is not a product.
     plan = _node(

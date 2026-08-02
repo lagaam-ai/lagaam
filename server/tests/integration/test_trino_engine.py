@@ -324,6 +324,14 @@ _EXPLOSIONS = [
     ("inequality join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey < o.orderkey"),
     ("group by ordinal constant pin", "SELECT a.orderkey FROM tpch.tiny.orders a JOIN (SELECT 1 AS m, count(*) AS c FROM tpch.tiny.lineitem l GROUP BY l.orderkey) t ON t.m = 1"),
     ("correlated inequality subquery", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.totalprice > (SELECT avg(l.extendedprice) FROM tpch.tiny.lineitem l WHERE l.orderkey < o.orderkey)"),
+    # Derived-key attacks: same join, wrapped in a scalar function. Trino
+    # renders the criteria as "(expr = expr_N)" and reports a NaN estimate
+    # bounded by tiny per-side scans (60,175) while doing the true product
+    # of work. Measured live: 30,087x under-report for the substr wrapper.
+    ("cross join laundered by substr on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON substr(a.linestatus,1,1)=substr(b.linestatus,1,1)"),
+    ("cartesian laundered by a zero-length substr", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON substr(l.comment,1,0)=substr(o.comment,1,0)"),
+    ("cross join laundered by lower on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON lower(a.linestatus)=lower(b.linestatus)"),
+    ("cross join laundered by upper on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON upper(a.linestatus)=upper(b.linestatus)"),
 ]
 
 _GENERATORS = [

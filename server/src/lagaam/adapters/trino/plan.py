@@ -25,6 +25,7 @@ falls back to the max-of-children rule instead, same as a non-join node.
 
 import json
 import math
+import re
 from typing import Any
 
 from lagaam.adapters.trino.numbers import finite_number
@@ -102,17 +103,47 @@ def _visit(node: dict[str, Any], widest: list[float], depth: int) -> float | Non
     return rows
 
 
+# One conjunct: "(name = name)" with optional whitespace around the operator.
+_CONJUNCT = re.compile(r"\(\s*([^()=\s]+)\s*=\s*([^()=\s]+)\s*\)")
+
+# A plain column: identifier chars, optionally suffixed with Trino's own
+# disambiguator ("orderkey_4"). Never matches "expr" or "expr_17", which is
+# how Trino names a key derived from an expression rather than a column.
+_PLAIN_COLUMN = re.compile(r"^(?!expr(?:_\d+)?$)[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def _has_join_criteria(node: dict[str, Any]) -> bool:
-    """True if this join carries a real equality key, bounding its own output.
+    """True if this join's criteria is a real equality key on plain columns.
 
     An equi-join cannot exceed the product of its inputs, and its criteria
     means Trino sized its inputs deliberately, not because it gave up.
+
+    But Trino renders ANY equi-join key this way, including one derived from
+    an expression (substr, lower, cast, ...) — "(expr = expr_17)" instead of
+    a column name. That still cannot exceed the product of its own inputs,
+    but the exemption exists because the inputs already bound the work, and
+    a derived key can be engineered to make Trino's per-side estimates read
+    far below the true join output (see module docstring's cross-join
+    laundering). So only a criteria naming plain columns on every conjunct
+    is trusted; anything else — including a criteria we fail to parse at
+    all — falls through to the product. Matching the literal "expr" token is
+    a heuristic on Trino's naming, acceptable only because failing to
+    recognise a criteria denies (charges the product) rather than exempts.
     """
     descriptor = node.get("descriptor")
     if not isinstance(descriptor, dict):
         return False
     criteria = descriptor.get("criteria")
-    return isinstance(criteria, str) and criteria != ""
+    if not isinstance(criteria, str) or criteria == "":
+        return False
+    conjuncts = _CONJUNCT.findall(criteria)
+    if not conjuncts:
+        return False
+    return all(
+        _PLAIN_COLUMN.match(side) is not None
+        for pair in conjuncts
+        for side in pair
+    )
 
 
 def _children(node: dict[str, Any]) -> list[dict[str, Any]]:
