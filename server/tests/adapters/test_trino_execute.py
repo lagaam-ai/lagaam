@@ -4,6 +4,7 @@ A sub-second timeout must never render as "0s" — Trino reads that as an
 instant kill, silently breaking every real query.
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -304,3 +305,106 @@ def test_estimate_of_a_query_touching_no_table_is_free() -> None:
     est = _estimate("SELECT 1", _json.dumps({"inputTableColumnInfos": []}))
     assert est.confidence == "high"
     assert est.scanned_bytes == 0
+
+
+# --- widest row count from the logical plan --------------------------------
+
+
+class _AnsweringCursor:
+    """A cursor that replays a canned answer keyed by a substring of the SQL."""
+
+    def __init__(self, answers: dict[str, "str | Exception"]) -> None:
+        self._answers = answers
+
+    def execute(self, sql: str) -> None:
+        for key, value in self._answers.items():
+            if key in sql:
+                if isinstance(value, Exception):
+                    raise value
+                self._result = value
+                return
+        raise AssertionError(f"no fake answer configured for SQL: {sql}")
+
+    def fetchone(self) -> list[str]:
+        return [self._result]
+
+
+def _engine_answering(answers: dict[str, "str | Exception"]) -> TrinoEngine:
+    """A TrinoEngine whose EXPLAIN calls are matched by substring against answers."""
+    engine = TrinoEngine()
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def cursor(self) -> _AnsweringCursor:
+            return _AnsweringCursor(answers)
+
+    engine._connect = lambda props=None: _Conn()  # type: ignore[method-assign]
+    return engine
+
+
+def test_estimate_cost_carries_the_widest_row_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quote reports what the plan says the widest operator builds."""
+    io_json = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {
+                        "outputRowCount": 15000.0,
+                        "outputSizeInBytes": 135000.0,
+                    },
+                }
+            ]
+        }
+    )
+    plan_json = json.dumps(
+        {
+            "name": "Output",
+            "estimates": [{"outputRowCount": "NaN"}],
+            "children": [
+                {
+                    "name": "CrossJoin",
+                    "estimates": [{"outputRowCount": "NaN"}],
+                    "children": [
+                        {"name": "TableScan", "estimates": [{"outputRowCount": 60175.0}]},
+                        {"name": "TableScan", "estimates": [{"outputRowCount": 15000.0}]},
+                    ],
+                }
+            ],
+        }
+    )
+    engine = _engine_answering({"TYPE IO": io_json, "TYPE LOGICAL": plan_json})
+    estimate = engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+    assert estimate.max_intermediate_rows == 902_625_000
+
+
+def test_a_failed_plan_call_still_returns_the_byte_quote() -> None:
+    """A plan we cannot read is an unknown row count, not a lost quote."""
+    io_json = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {
+                        "outputRowCount": 15000.0,
+                        "outputSizeInBytes": 135000.0,
+                    },
+                }
+            ]
+        }
+    )
+    engine = _engine_answering({"TYPE IO": io_json, "TYPE LOGICAL": RuntimeError("boom")})
+    estimate = engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+    assert estimate.scanned_bytes == 135000
+    assert estimate.max_intermediate_rows is None

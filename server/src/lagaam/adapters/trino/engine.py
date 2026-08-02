@@ -15,6 +15,7 @@ import trino.exceptions
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
 from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 from lagaam.adapters.trino.numbers import finite_number
+from lagaam.adapters.trino.plan import max_intermediate_rows
 from lagaam.core.errors import (
     EngineError,
     LagaamError,
@@ -290,7 +291,28 @@ class TrinoEngine:
         factor = _collapse_factor(
             table_scan_counts(sql, dialect), plan_entry_counts(io_json)
         )
-        return _scaled(parse_io_estimate(io_json), factor)
+        estimate = _scaled(parse_io_estimate(io_json), factor)
+        widest = self._widest_rows(sql)
+        if widest is None:
+            return estimate
+        return estimate.model_copy(update={"max_intermediate_rows": round(widest)})
+
+    def _widest_rows(self, sql: str) -> float | None:
+        """Rows the plan's widest operator would build, or None if unreadable.
+
+        A plan we cannot get is an unknown row count the budget denies on —
+        never a reason to lose a byte quote we already have.
+        """
+        try:
+            with self._connect() as conn:
+                cur = conn.cursor()
+                cur.execute(f"EXPLAIN (TYPE LOGICAL, FORMAT JSON) {sql}")
+                row = cur.fetchone()
+        # Best-effort enrichment of a quote that already exists: any failure
+        # here must degrade to None, never replace a working quote with a crash.
+        except Exception:
+            return None
+        return max_intermediate_rows(row[0]) if row else None
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:
