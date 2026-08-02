@@ -7,7 +7,13 @@ Then: uv run pytest -m integration
 import pytest
 
 from lagaam.adapters.trino.engine import TrinoEngine
-from lagaam.core.errors import TableNotFoundError
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    QueryBudget,
+    enforce_budget,
+)
+from lagaam.core.errors import BudgetExceededError, TableNotFoundError
 from lagaam.core.ports import QueryEngine
 
 pytestmark = pytest.mark.integration
@@ -250,3 +256,78 @@ async def test_timeout_is_self_correctable_and_leak_free(
         )
     assert "query_id" not in str(exc.value)
     assert "filter" in str(exc.value).lower()
+
+
+# Corpus measured live against Trino 476 (tpch.tiny). See
+# docs/superpowers/specs/2026-08-03-plan-cardinality-measurements.md.
+_LEGITIMATE = [
+    ("healthy equi-join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey = o.orderkey"),
+    ("3-way star join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey = o.orderkey JOIN tpch.tiny.customer c ON o.custkey = c.custkey"),
+    ("self join", "SELECT a.orderkey FROM tpch.tiny.orders a JOIN tpch.tiny.orders b ON a.orderkey = b.orderkey"),
+    ("cte referenced four times", "WITH t AS (SELECT orderkey FROM tpch.tiny.orders) SELECT a.orderkey FROM t a JOIN t b ON a.orderkey = b.orderkey JOIN t c ON a.orderkey = c.orderkey JOIN t d ON a.orderkey = d.orderkey"),
+    ("group by", "SELECT l.linestatus, count(*) AS c FROM tpch.tiny.lineitem l GROUP BY l.linestatus"),
+    ("count star", "SELECT count(*) AS c FROM tpch.tiny.lineitem"),
+    ("distinct", "SELECT DISTINCT l.linestatus FROM tpch.tiny.lineitem l"),
+    ("date filter", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.orderdate > DATE '1995-01-01'"),
+    ("like filter", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.comment LIKE '%special%'"),
+    ("window function", "SELECT l.orderkey, row_number() OVER (PARTITION BY l.orderkey ORDER BY l.linenumber) AS r FROM tpch.tiny.lineitem l"),
+    ("union all", "SELECT orderkey FROM tpch.tiny.orders UNION ALL SELECT orderkey FROM tpch.tiny.orders"),
+    ("lateral aggregate", "SELECT o.orderkey, t.c FROM tpch.tiny.orders o LEFT JOIN LATERAL (SELECT count(*) AS c FROM tpch.tiny.lineitem l WHERE l.orderkey = o.orderkey) t ON true"),
+    ("correlated equality subquery", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.totalprice > (SELECT avg(l.extendedprice) FROM tpch.tiny.lineitem l WHERE l.orderkey = o.orderkey)"),
+    ("scalar subquery", "SELECT orderkey FROM tpch.tiny.orders WHERE totalprice > (SELECT avg(totalprice) FROM tpch.tiny.orders)"),
+    ("unnest a literal array", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(ARRAY['a','b']) AS u(n)"),
+    ("constant cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (SELECT 0.2 AS rate) r"),
+    ("two small values relations", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (VALUES (1),(2)) AS a(x) CROSS JOIN (VALUES (1),(2)) AS b(y)"),
+    ("semi join", "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey IN (SELECT orderkey FROM tpch.tiny.lineitem)"),
+]
+
+_EXPLOSIONS = [
+    ("cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o"),
+    ("cross join laundered by a like filter", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o WHERE o.comment LIKE '%special%'"),
+    ("cross join laundered by a limit", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o LIMIT 10"),
+    ("cross join laundered by an aggregate", "WITH t AS (SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o) SELECT count(*) AS c FROM t"),
+    ("cross join laundered by distinct", "SELECT DISTINCT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o"),
+    ("cross join laundered by a group by", "SELECT l.orderkey, count(*) AS c FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o GROUP BY l.orderkey"),
+    ("join on a constant", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON 1 = 1"),
+    ("join on a two-valued column", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.linestatus = o.orderstatus"),
+    ("inequality join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey < o.orderkey"),
+    ("group by ordinal constant pin", "SELECT a.orderkey FROM tpch.tiny.orders a JOIN (SELECT 1 AS m, count(*) AS c FROM tpch.tiny.lineitem l GROUP BY l.orderkey) t ON t.m = 1"),
+    ("correlated inequality subquery", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.totalprice > (SELECT avg(l.extendedprice) FROM tpch.tiny.lineitem l WHERE l.orderkey < o.orderkey)"),
+]
+
+_GENERATORS = [
+    ("unnest a sequence", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(sequence(1, 10000)) AS u(n)"),
+    ("unnest a repeat", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(repeat(l.linestatus, 10000)) AS u(n)"),
+]
+
+
+@pytest.mark.parametrize("label,sql", _LEGITIMATE, ids=[t[0] for t in _LEGITIMATE])
+async def test_legitimate_shapes_clear_the_default_budget(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize("label,sql", _EXPLOSIONS, ids=[t[0] for t in _EXPLOSIONS])
+async def test_row_explosions_are_denied(label: str, sql: str, engine: TrinoEngine) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize("label,sql", _GENERATORS, ids=[t[0] for t in _GENERATORS])
+async def test_row_generators_are_denied_by_the_shape_check(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    # The planner cannot see these, so scans.py must still refuse them.
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "low"

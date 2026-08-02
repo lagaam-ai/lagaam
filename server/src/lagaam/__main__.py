@@ -13,7 +13,7 @@ Env:
   LAGAAM_AGENT_NAME      identity on the audit trail (anonymous)
   LAGAAM_MAX_SCAN_BYTES  pre-execution scan budget (50 GiB)
   LAGAAM_MAX_ROWS        pre-execution scanned-row budget (ungated)
-  LAGAAM_MAX_INTERMEDIATE_ROWS  widest-operator row budget (default 1000000000)
+  LAGAAM_MAX_INTERMEDIATE_ROWS  widest-operator row budget (default 10000000)
   LAGAAM_MAX_RETURNED_ROWS  rows handed back (1000, capped at 100000)
   LAGAAM_QUERY_TIMEOUT   wall-clock seconds per query (300)
   LAGAAM_METADATA_TTL    metadata cache TTL in seconds (300)

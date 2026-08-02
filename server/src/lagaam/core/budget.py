@@ -30,7 +30,7 @@ MAX_RETURNED_ROWS_CEILING = 100_000
 # Measured on Trino 476: legitimate analytics peaks around 240,700 rows at
 # its widest operator, while the cheapest product shape starts at
 # 225,000,000. This sits between them with room on both sides.
-DEFAULT_MAX_INTERMEDIATE_ROWS = 1_000_000_000
+DEFAULT_MAX_INTERMEDIATE_ROWS = 10_000_000
 
 
 class QueryBudget(BaseModel):
