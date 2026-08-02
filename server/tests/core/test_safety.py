@@ -230,3 +230,29 @@ def test_a_long_but_ordinary_query_is_not_refused() -> None:
         default_limit=1001,
     )
     assert "LIMIT 1001" in safe
+
+
+def _nested(depth: int) -> str:
+    sql = "SELECT 1 AS x"
+    for _ in range(depth):
+        sql = f"SELECT x FROM ({sql}) t"
+    return sql
+
+
+def test_an_ordinary_nesting_depth_is_accepted() -> None:
+    # Deeper than any human query, well inside what sqlglot can render.
+    validate_query(_nested(20), "trino")
+
+
+def test_a_deeply_nested_query_is_refused_not_crashed() -> None:
+    # Measured: ~100 levels (1,813 characters) blew the stack inside
+    # tree.sql(). A tiny payload must not take the server down.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(_nested(300), "trino")
+    assert "nested" in str(err.value).lower()
+
+
+def test_a_very_deeply_nested_query_never_raises_recursionerror() -> None:
+    for depth in (100, 500, 1000):
+        with pytest.raises(SqlValidationError):
+            validate_query(_nested(depth), "trino")

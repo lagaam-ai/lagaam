@@ -38,10 +38,63 @@ _DENY_NODES = (
 # padding the input, not an analyst asking a question.
 _MAX_SQL_CHARS = 200_000
 
+# sqlglot's own recursive-descent parser blows the stack on deep bracket
+# nesting well before a query gets big enough to trip _MAX_SQL_CHARS —
+# measured under pytest: parsing itself raised RecursionError at 118 levels
+# of "SELECT x FROM (...) t" (1,993 characters). This ceiling is a cheap,
+# text-level proxy checked before parsing is attempted at all, generous
+# enough that no ordinary query's bracket nesting comes close.
+_MAX_BRACKET_DEPTH = 60
+
+# sqlglot's generator recurses once per AST level, so a *small* query nested
+# deeply enough blows the stack inside tree.sql(): measured under pytest,
+# rendering raised RecursionError at an AST depth of 263 (87 levels of
+# "SELECT x FROM (...) t"). An ordinary analytical query — joins, a CASE
+# aggregate, a CTE pipeline, a window function — measured 6-9 deep; 20 levels
+# of synthetic subquery nesting measured 62. This cap sits well above real
+# SQL and well below where rendering breaks.
+_MAX_NESTING_DEPTH = 100
+
 _GROUPING_LIMIT = re.compile(
     r"(GROUP\s+BY\s+(?:ROLLUP|CUBE|GROUPING\s+SETS)\b.*?)\s+(LIMIT\s+\d+)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _bracket_depth(sql: str) -> int:
+    """Deepest ``(``/``)`` nesting in the raw text, scanned iteratively.
+
+    Runs before parsing, since sqlglot's recursive-descent parser can blow
+    the stack on bracket nesting alone — a RecursionError the parser raises
+    itself, which no post-parse check can catch.
+    """
+    depth = 0
+    peak = 0
+    for char in sql:
+        if char == "(":
+            depth += 1
+            peak = max(peak, depth)
+        elif char == ")":
+            depth -= 1
+    return peak
+
+
+def _too_deeply_nested(tree: exp.Expr) -> bool:
+    """True if the AST nests past what the SQL generator can render.
+
+    Iterative by construction: a recursive depth check would raise the very
+    RecursionError it exists to prevent.
+    """
+    stack = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_NESTING_DEPTH:
+            return True
+        for child in node.args.values():
+            for item in child if isinstance(child, list) else [child]:
+                if isinstance(item, exp.Expr):
+                    stack.append((item, depth + 1))
+    return False
 
 
 def _parse_statements(sql: str, dialect: str) -> list[exp.Expr | None]:
@@ -82,6 +135,12 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
             f"{_MAX_SQL_CHARS:,} this server parses. Select fewer columns, "
             "shorten any IN list, or split the query."
         )
+    if _bracket_depth(sql) > _MAX_BRACKET_DEPTH:
+        raise SqlValidationError(
+            "The SQL is nested too deeply for this server to process safely. "
+            "Flatten the subqueries — most nesting can be replaced by a CTE "
+            "or a join — and retry."
+        )
     try:
         statements = _parse_statements(sql, dialect)
     except sqlglot.errors.ParseError as errs:
@@ -109,6 +168,12 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
         raise SqlValidationError(
             "This tool is read-only: only SELECT queries are allowed. "
             "Use the metadata tools for catalogs and schemas."
+        )
+    if _too_deeply_nested(tree):
+        raise SqlValidationError(
+            "The SQL is nested too deeply for this server to process safely. "
+            "Flatten the subqueries — most nesting can be replaced by a CTE "
+            "or a join — and retry."
         )
     denied = tree.find(*_DENY_NODES)
     if denied is not None:
