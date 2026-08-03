@@ -237,7 +237,7 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
         pass
     else:
         _deny_writes(reread)
-        return rendered
+        return _within_char_cap(rendered)
 
     limit = tree.args.get("limit")
     if limit is None or not isinstance(tree, exp.Query):
@@ -259,6 +259,22 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
             "Rewrite it more simply and retry."
         ) from None
     _deny_writes(reread)
+    return _within_char_cap(rendered)
+
+
+def _within_char_cap(rendered: str) -> str:
+    """The rendered SQL, if it still fits what this server vouches for.
+
+    Rendering expands SQL — measured 1.33x on a wide coalesce — so checking
+    only the input let a 198,043-character query leave as 264,053, which is
+    the string the engine runs and the audit line records.
+    """
+    if len(rendered) > _MAX_SQL_CHARS:
+        raise SqlValidationError(
+            f"The SQL expands to {len(rendered):,} characters, over the "
+            f"{_MAX_SQL_CHARS:,} this server parses. Select fewer columns, "
+            "shorten any IN list, or split the query."
+        )
     return rendered
 
 

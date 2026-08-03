@@ -130,6 +130,18 @@ def test_select_into_rejected(sql: str) -> None:
         validate(sql)
 
 
+def test_the_char_cap_bounds_what_is_emitted_not_only_what_arrived() -> None:
+    # Rendering expands SQL — measured 1.33x on a wide coalesce — so an input
+    # just under the cap left as 264,053 characters, which is what reaches
+    # the engine and the audit line.
+    from lagaam.core.safety import _MAX_SQL_CHARS
+
+    sql = f"SELECT coalesce({','.join(['30'] * 66000)}) AS x FROM tpch.tiny.orders"
+    assert len(sql) <= _MAX_SQL_CHARS
+    with pytest.raises(SqlValidationError, match="characters"):
+        validate(sql)
+
+
 def test_rendered_sql_is_judged_not_only_the_parsed_tree() -> None:
     # The invariant this module documents: what executes is what was judged.
     # A construct that only becomes DDL at render time must not survive.
