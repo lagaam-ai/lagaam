@@ -212,20 +212,32 @@ def _is_sized(node: dict[str, Any], depth: int) -> bool:
 
 
 def _has_nan_scan(node: dict[str, Any], depth: int) -> bool:
-    """True if a leaf scan under this side had its estimate nulled by a filter."""
+    """True if a leaf scan under this side had its estimate nulled by a filter.
+
+    Read negated by the caller, so every give-up returns True: an unread
+    subtree must cost the exemption, not grant it.
+    """
     if depth > _MAX_WALK_DEPTH or not isinstance(node, dict):
-        return False
+        return True
     name = node.get("name")
     if not isinstance(name, str):
-        return False
+        return True
     children = _children(node)
     if not children:
         return _reports_nan(node)
-    if name in _JOIN_NODES:
+    # An aggregation caps this side, so dirt below it cannot reach the join.
+    if name in _BOUNDING_NODES:
         return False
-    if name in _PASSTHROUGH_NODES or name in _ROW_PRESERVING_NODES or name in _BOUNDING_NODES:
+    # Descend through joins too: a laundered scan under a nested join is the
+    # same dirt, and stopping here reads "did not look" as "clean".
+    if (
+        name in _JOIN_NODES
+        or name in _PASSTHROUGH_NODES
+        or name in _ROW_PRESERVING_NODES
+    ):
         return any(_has_nan_scan(child, depth + 1) for child in children)
-    return False
+    # An unrecognised node is only trusted where Trino sized it anyway.
+    return _own_estimate(node) is None
 
 
 def _reports_nan(node: dict[str, Any]) -> bool:

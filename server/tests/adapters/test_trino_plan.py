@@ -2,7 +2,7 @@
 
 import json
 
-from lagaam.adapters.trino.plan import max_intermediate_rows
+from lagaam.adapters.trino.plan import _has_nan_scan, max_intermediate_rows
 
 
 def _node(
@@ -465,6 +465,83 @@ def test_json_nested_deeply_does_not_raise_recursion_error() -> None:
         plan_json = f'{{"name": "Project", "estimates": [], "children": [{plan_json}]}}'
     # This should return None, not raise RecursionError
     assert max_intermediate_rows(plan_json) is None
+
+
+def test_a_laundered_scan_under_a_nested_join_still_pays_the_product() -> None:
+    # The dirty leaf hides one join deeper than the guard used to look, so the
+    # outer join read as clean and priced itself at max-of-children.
+    laundered = _node(
+        "Filter",
+        "NaN",
+        [_scan("TableScan", "NaN", "custkey")],
+        details=["regexp_like(comment, 'x')"],
+    )
+    inner = _node(
+        "InnerJoin",
+        "NaN",
+        [_scan("TableScan", 500000.0, "suppkey"), laundered],
+        descriptor={"criteria": "(suppkey = custkey)"},
+    )
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_scan("TableScan", 1000000.0, "orderkey"), inner],
+        descriptor={"criteria": "(orderkey = suppkey)"},
+    )
+    # 1e6 * 5e5: the outer join pays the product rather than reading 1e6.
+    assert max_intermediate_rows(json.dumps(plan)) == 500000000000.0
+
+
+def test_an_aggregation_under_a_nested_join_still_takes_the_widest() -> None:
+    # The mirror of the case above: an aggregation caps that side, so a NaN
+    # scan beneath it cannot reach the join and must not deny the query.
+    bounded = _node(
+        "Aggregate",
+        15000.0,
+        [_node("Filter", "NaN", [_scan("TableScan", "NaN", "custkey")])],
+    )
+    inner = _node(
+        "InnerJoin",
+        "NaN",
+        [_scan("TableScan", 5000.0, "suppkey"), bounded],
+        descriptor={"criteria": "(suppkey = custkey)"},
+    )
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_scan("TableScan", 1000000.0, "orderkey"), inner],
+        descriptor={"criteria": "(orderkey = suppkey)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1000000.0
+
+
+def test_a_join_beside_a_sized_unknown_node_takes_the_widest() -> None:
+    # An unrecognised node Trino sized is trusted; only unsized ones deny.
+    sized_unknown = _node("SomeFutureTrinoNode", 4000.0, [_scan("TableScan", 4000.0, "custkey")])
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_scan("TableScan", 1000000.0, "orderkey"), sized_unknown],
+        descriptor={"criteria": "(orderkey = custkey)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 1000000.0
+
+
+def test_the_dirt_walk_gives_up_dirty_so_an_unread_subtree_denies() -> None:
+    # _has_nan_scan is read negated, so every give-up must return True or the
+    # walk grants the exemption it meant to withhold.
+    buried = _scan("TableScan", 1.0, "custkey")
+    for _ in range(70):
+        buried = _node("Project", "NaN", [buried])
+    assert _has_nan_scan(buried, 0) is True
+    assert _has_nan_scan({"name": 42, "children": [], "estimates": []}, 0) is True
+    # An unrecognised node Trino left unsized is dirt; a sized one is not.
+    assert _has_nan_scan(_node("SomeFutureTrinoNode", "NaN", [_scan("TableScan", 5.0, "c")]), 0) is True
+    assert _has_nan_scan(_node("SomeFutureTrinoNode", 4000.0, [_scan("TableScan", 5.0, "c")]), 0) is False
+    # An aggregation caps its side, so dirt below it never reaches the join --
+    # true even when Trino could not size the aggregation itself.
+    assert _has_nan_scan(_node("Aggregate", 15000.0, [_scan("TableScan", "NaN", "custkey")]), 0) is False
+    assert _has_nan_scan(_node("Aggregate", "NaN", [_scan("TableScan", "NaN", "custkey")]), 0) is False
 
 
 def test_a_pathologically_deep_plan_is_refused_rather_than_recursed() -> None:
