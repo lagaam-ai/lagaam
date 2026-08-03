@@ -172,11 +172,17 @@ def _join_cannot_multiply(node: dict[str, Any], assigned: dict[str, str]) -> boo
     children = _children(node)
     if not children:
         return False
+    # Bounding a side's own output is not bounding the fan-out: a LIMIT above
+    # the input size caps nothing, and a DISTINCT on a superset of the join
+    # key still multiplies. Only dirt the bound sits above is contained.
+    if any(
+        _has_nan_scan(child, 0) and not _aggregation_bounded(child, 0)
+        for child in children
+    ):
+        return False
     if any(_aggregation_bounded(child, 0) for child in children):
         return True
-    return _keys_are_base_columns(node, assigned) and not any(
-        _has_nan_scan(child, 0) for child in children
-    )
+    return _keys_are_base_columns(node, assigned)
 
 
 def _aggregation_bounded(node: dict[str, Any], depth: int) -> bool:

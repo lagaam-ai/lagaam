@@ -515,6 +515,46 @@ def test_an_aggregation_under_a_nested_join_still_takes_the_widest() -> None:
     assert max_intermediate_rows(json.dumps(plan)) == 1000000.0
 
 
+def test_a_no_op_limit_does_not_exempt_a_laundered_join() -> None:
+    # Measured on Trino 476 (tpch.tiny): LIMIT 1000000 over a 60,175-row table
+    # caps nothing, but membership in the bounding set granted the exemption
+    # before the dirt walk ran — quoting 60,175 for 1,810,518,277 real rows.
+    # A laundered scan keeps a finite alternative beside the NaN one, which is
+    # how the join still prices while reporting no usable estimate.
+    laundered = _node(
+        "ScanFilterProject",
+        None,
+        details=["linestatus := tpch:linestatus", "regexp_like(comment, 'x')"],
+        estimates=[{"outputRowCount": 60175.0}, {"outputRowCount": "NaN"}],
+    )
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_node("Limit", 60175.0, [_scan("TableScan", 60175.0)]), laundered],
+        descriptor={"criteria": "(linestatus = linestatus_1)"},
+    )
+    # The product, not the widest child: an unbounded dirty side reaches it.
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 60175.0
+
+
+def test_a_distinct_over_the_join_key_does_not_exempt_a_laundered_join() -> None:
+    # DISTINCT bounds its own output, but on a superset of the join key it
+    # still fans out — measured 7,681x under-report before this check.
+    laundered = _node(
+        "ScanFilterProject",
+        None,
+        details=["linestatus := tpch:linestatus", "regexp_like(comment, 'x')"],
+        estimates=[{"outputRowCount": 60175.0}, {"outputRowCount": "NaN"}],
+    )
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [_node("Distinct", 30000.0, [_scan("TableScan", 60175.0)]), laundered],
+        descriptor={"criteria": "(linestatus = linestatus_1)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 30000.0 * 60175.0
+
+
 def test_a_join_beside_a_sized_unknown_node_takes_the_widest() -> None:
     # An unrecognised node Trino sized is trusted; only unsized ones deny.
     sized_unknown = _node("SomeFutureTrinoNode", 4000.0, [_scan("TableScan", 4000.0, "custkey")])
