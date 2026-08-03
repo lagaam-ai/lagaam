@@ -31,12 +31,15 @@ def check_tables_allowed(
             "denied. Send a single valid SELECT with fully-qualified names."
         )
 
+    # Declared names per WITH clause, built once: a query can carry thousands
+    # of CTEs, and rescanning them for every table reference is quadratic.
+    scopes: dict[int, dict[str, exp.CTE]] = {}
     for table in tree.find_all(exp.Table):
         # A bare reference to a CTE is a local alias, not a base table — but
         # only where that CTE is in scope. A tree-wide name set lets a CTE
         # buried in a subquery vouch for the same bare name in an outer scope,
         # where the engine resolves it to a real table.
-        if not table.catalog and not table.db and _cte_in_scope(table):
+        if not table.catalog and not table.db and _cte_in_scope(table, scopes):
             continue
         rendered = table.sql(dialect=dialect)
         try:
@@ -54,7 +57,9 @@ def check_tables_allowed(
             )
 
 
-def _cte_in_scope(table: exp.Table) -> bool:
+def _cte_in_scope(
+    table: exp.Table, scopes: dict[int, dict[str, exp.CTE]]
+) -> bool:
     """Is this bare name declared by a WITH clause enclosing it?
 
     Walks outward from the reference, so a CTE only vouches for names inside
@@ -69,14 +74,18 @@ def _cte_in_scope(table: exp.Table) -> bool:
         # rename cannot silently turn this check off.
         with_clause = node.args.get("with_") or node.args.get("with")
         if isinstance(with_clause, exp.With):
-            recursive = bool(with_clause.args.get("recursive"))
-            for cte in with_clause.expressions:
-                if cte.alias_or_name.lower() != name:
-                    continue
+            declared = scopes.get(id(with_clause))
+            if declared is None:
+                declared = {
+                    cte.alias_or_name.lower(): cte
+                    for cte in reversed(with_clause.expressions)
+                }
+                scopes[id(with_clause)] = declared
+            cte = declared.get(name)
+            if cte is not None:
                 # Only a RECURSIVE CTE binds its own name inside its body.
-                if not recursive and _within(table, cte):
-                    continue
-                return True
+                if with_clause.args.get("recursive") or not _within(table, cte):
+                    return True
         node = node.parent
     return False
 
