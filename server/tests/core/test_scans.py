@@ -74,6 +74,38 @@ def test_repeat_manufactures_rows_despite_a_column_feed() -> None:
     )
 
 
+def test_a_small_literal_sequence_is_priceable() -> None:
+    # A date spine is how an agent gap-fills a time series, and its length is
+    # spelled out in the SQL: refusing it sight-unseen blocks ordinary work.
+    assert not unpriceable("SELECT n FROM UNNEST(sequence(1, 12)) AS t(n)")
+    assert not unpriceable(
+        "SELECT d FROM UNNEST(sequence(DATE '1996-01-01', DATE '1996-01-31', "
+        "INTERVAL '1' DAY)) AS t(d)"
+    )
+    assert not unpriceable(
+        "SELECT s.d FROM hive.s.orders o CROSS JOIN UNNEST(sequence("
+        "DATE '1996-01-01', DATE '1996-12-31', INTERVAL '1' DAY)) AS s(d)"
+    )
+
+
+def test_a_sequence_the_gate_cannot_size_stays_unpriceable() -> None:
+    # The cap still binds, a column bound is not a length, and a month step is
+    # not a fixed stride — each must fall back to refusing the query.
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 100000)) AS t(n)")
+    assert unpriceable(
+        "SELECT n FROM hive.s.orders o CROSS JOIN "
+        "UNNEST(sequence(1, o.custkey)) AS t(n)"
+    )
+    assert unpriceable(
+        "SELECT d FROM UNNEST(sequence(DATE '1900-01-01', DATE '2100-12-31', "
+        "INTERVAL '1' DAY)) AS t(d)"
+    )
+    assert unpriceable(
+        "SELECT d FROM UNNEST(sequence(DATE '1996-01-01', DATE '1996-06-01', "
+        "INTERVAL '1' MONTH)) AS t(d)"
+    )
+
+
 def test_unnest_of_a_literal_array_is_priceable() -> None:
     # A two-element lookup table written inline invents nothing.
     assert not unpriceable(

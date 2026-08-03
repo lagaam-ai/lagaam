@@ -16,10 +16,16 @@ per table however often the query reads it, so a self-join's *bytes* are
 undercounted even though its rows are not.
 """
 
+from datetime import date
+
 import sqlglot
 from sqlglot import exp
 
 _GENERATORS = (exp.Unnest, exp.Explode, exp.Posexplode)
+
+# Interval units with a fixed number of days, so a sequence() over them has a
+# length arithmetic can find. MONTH and YEAR vary in length and are excluded.
+_FIXED_INTERVAL_DAYS = {"DAY": 1, "WEEK": 7}
 
 # A chain of CTEs each referenced twice doubles table_scan_counts' walk work
 # per level: 24 links is a ~1,700-char request and 8M walk steps. Real queries
@@ -149,6 +155,13 @@ def _is_bounded_input(value: exp.Expr) -> bool:
         )
     if isinstance(value, exp.Column):
         return True
+    if isinstance(value, exp.GenerateSeries):
+        # sequence() spells its own length out when both ends are literal, so
+        # a date spine can be priced instead of refused. Anything the length
+        # cannot be computed from — a column bound, a calendar step, a span
+        # over the cap — stays unpriceable.
+        length = _sequence_length(value)
+        return length is not None and length <= _MAX_INLINE_ROWS
     if isinstance(value, exp.Func):
         if _func_name(value) not in _ROW_PRESERVING_FUNCS:
             return False
@@ -163,6 +176,68 @@ def _is_bounded_input(value: exp.Expr) -> bool:
     return False
 
 
+def _sequence_length(value: exp.GenerateSeries) -> int | None:
+    """How many rows this sequence() yields, or None if that is not knowable.
+
+    Only fixed strides count. A month or year step covers a variable number
+    of days, so its length is not arithmetic on the endpoints and the gate
+    keeps refusing it.
+    """
+    start = _literal_point(value.args.get("start"))
+    end = _literal_point(value.args.get("end"))
+    if start is None or end is None:
+        return None
+    step = value.args.get("step")
+    stride = 1
+    if isinstance(step, exp.Interval):
+        unit = (step.text("unit") or "").upper()
+        if unit not in _FIXED_INTERVAL_DAYS:
+            return None
+        # Trino writes an interval magnitude as a quoted literal: INTERVAL '1'.
+        magnitude = _literal_int(step.this, allow_string=True)
+        if magnitude is None or magnitude <= 0:
+            return None
+        stride = magnitude * _FIXED_INTERVAL_DAYS[unit]
+    elif step is not None:
+        magnitude = _literal_int(step)
+        if magnitude is None or magnitude == 0:
+            return None
+        stride = abs(magnitude)
+    span = abs(end - start)
+    return span // stride + 1
+
+
+def _literal_point(value: exp.Expr | None) -> int | None:
+    """An endpoint as an integer: a plain number, or a date as its ordinal."""
+    if value is None:
+        return None
+    if isinstance(value, exp.Cast):
+        inner = value.this
+        text = inner.name if isinstance(inner, exp.Literal) else None
+        if text is None:
+            return None
+        try:
+            return date.fromisoformat(text).toordinal()
+        except ValueError:
+            return None
+    return _literal_int(value)
+
+
+def _literal_int(value: exp.Expr | None, allow_string: bool = False) -> int | None:
+    """A literal integer, or None for anything the agent could vary."""
+    if isinstance(value, exp.Neg):
+        magnitude = _literal_int(value.this, allow_string)
+        return None if magnitude is None else -magnitude
+    if not isinstance(value, exp.Literal):
+        return None
+    if value.is_string and not allow_string:
+        return None
+    try:
+        return int(value.name)
+    except ValueError:
+        return None
+
+
 def _generator_rows(generator: exp.Expr) -> int:
     """Rows a bounded generator yields: a literal array's length, or 1 for a
     column, whose rows belong to a table the plan already priced.
@@ -174,6 +249,10 @@ def _generator_rows(generator: exp.Expr) -> int:
     widest = 1
     for value in generator.find_all(exp.Array, exp.Struct):
         widest = max(widest, len(value.expressions or []))
+    for series in generator.find_all(exp.GenerateSeries):
+        length = _sequence_length(series)
+        if length is not None:
+            widest = max(widest, length)
     return widest
 
 
