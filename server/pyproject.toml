@@ -18,6 +18,7 @@ dev = [
     "httpx>=0.27",
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
+    "pytest-timeout>=2.3",
     "mypy>=1.13",
 ]
 
@@ -34,6 +35,10 @@ testpaths = ["tests"]
 markers = [
     "integration: needs a running engine (docker compose --profile trino up)",
 ]
+# The suite runs in under a second; a test past this is hung, not slow. The
+# guards here bound work sqlglot does not, so a regression means an infinite
+# spin, and without a timeout it takes the machine rather than the build.
+timeout = 60
 addopts = "-m 'not integration'"
 
 [tool.mypy]
