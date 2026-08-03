@@ -555,6 +555,59 @@ def test_a_distinct_over_the_join_key_does_not_exempt_a_laundered_join() -> None
     assert max_intermediate_rows(json.dumps(plan)) == 30000.0 * 60175.0
 
 
+def test_a_row_cap_above_the_dirt_does_not_hide_it() -> None:
+    # Measured on Trino 476: moving the no-op LIMIT onto the dirty side made
+    # that side read clean, and the exemption was granted — 6,001,215 quoted
+    # for 626,089,517 real rows. A cap bounds a side's own rows; it does not
+    # bound how far the other side fans out per key.
+    laundered = _node(
+        "ScanFilterProject",
+        None,
+        details=["linestatus := tpch:linestatus", "regexp_like(comment, 'x')"],
+        estimates=[{"outputRowCount": 60175.0}, {"outputRowCount": "NaN"}],
+    )
+    capped = _node("Limit", 60175.0, [_node("LimitPartial", 60175.0, [laundered])])
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [capped, _scan("TableScan", 60175.0)],
+        descriptor={"criteria": "(linestatus = linestatus_1)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0 * 60175.0
+
+
+def test_a_partial_stage_is_walked_through_to_the_scan_beneath() -> None:
+    # Trino splits Limit into partial/final stages, and LimitPartial carries
+    # the cap as its own estimate even though its input went NaN. Matching no
+    # node set, it read as sized and the dirt beneath was never visited.
+    laundered = _node(
+        "ScanFilterProject",
+        None,
+        details=["linestatus := tpch:linestatus", "regexp_like(comment, 'x')"],
+        estimates=[{"outputRowCount": 60175.0}, {"outputRowCount": "NaN"}],
+    )
+    assert _has_nan_scan(_node("LimitPartial", 60175.0, [laundered]), 0) is True
+
+
+def test_a_grouping_collapse_still_contains_the_dirt_beneath_it() -> None:
+    # The exemption exists for this: an Aggregate emits at most one row per
+    # group, so a laundered scan under it cannot reach the join.
+    laundered = _node(
+        "ScanFilterProject",
+        None,
+        details=["custkey := tpch:custkey", "regexp_like(comment, 'x')"],
+        estimates=[{"outputRowCount": 15000.0}, {"outputRowCount": "NaN"}],
+    )
+    bounded = _node("Aggregate", 15000.0, [laundered])
+    plan = _node(
+        "InnerJoin",
+        "NaN",
+        [bounded, _scan("TableScan", 60175.0, "custkey")],
+        descriptor={"criteria": "(custkey = custkey_1)"},
+    )
+    assert max_intermediate_rows(json.dumps(plan)) == 60175.0
+
+
 def test_a_join_beside_a_sized_unknown_node_takes_the_widest() -> None:
     # An unrecognised node Trino sized is trusted; only unsized ones deny.
     sized_unknown = _node("SomeFutureTrinoNode", 4000.0, [_scan("TableScan", 4000.0, "custkey")])

@@ -69,6 +69,24 @@ _BOUNDING_NODES = frozenset(
     {"Aggregate", "DistinctLimit", "TopN", "Limit", "Distinct"}
 )
 
+# Of those, the ones that collapse rows per key rather than merely capping a
+# count. Only a collapse contains dirt: a row cap leaves the other side's
+# fan-out per join key completely free.
+_COLLAPSING_NODES = frozenset({"Aggregate", "Distinct"})
+
+# Trino splits these into partial and final stages, and the partial carries
+# the cap as its own estimate even when its input went NaN — matching no set,
+# it read as sized and the walk stopped above the dirt.
+_PARTIAL_NODES = frozenset(
+    {
+        "LimitPartial",
+        "TopNPartial",
+        "AggregatePartial",
+        "DistinctPartial",
+        "DistinctLimitPartial",
+    }
+)
+
 # Emit exactly one row per input row, so a sized input bounds them.
 _ROW_PRESERVING_NODES = frozenset({"Window", "RowNumber", "TopNRanking", "Sort"})
 
@@ -172,13 +190,10 @@ def _join_cannot_multiply(node: dict[str, Any], assigned: dict[str, str]) -> boo
     children = _children(node)
     if not children:
         return False
-    # Bounding a side's own output is not bounding the fan-out: a LIMIT above
-    # the input size caps nothing, and a DISTINCT on a superset of the join
-    # key still multiplies. Only dirt the bound sits above is contained.
-    if any(
-        _has_nan_scan(child, 0) and not _aggregation_bounded(child, 0)
-        for child in children
-    ):
+    # Dirt anywhere under either side means the product is unpriced, whatever
+    # else the plan says. The walk already stops clean at a grouping collapse,
+    # which is the only shape that genuinely contains it.
+    if any(_has_nan_scan(child, 0) for child in children):
         return False
     if any(_aggregation_bounded(child, 0) for child in children):
         return True
@@ -231,8 +246,10 @@ def _has_nan_scan(node: dict[str, Any], depth: int) -> bool:
     children = _children(node)
     if not children:
         return _reports_nan(node)
-    # An aggregation caps this side, so dirt below it cannot reach the join.
-    if name in _BOUNDING_NODES:
+    # A grouping collapse caps this side per key, so dirt below it cannot
+    # reach the join. A row cap does not: it bounds this side's own rows and
+    # leaves the other side's fan-out per key untouched.
+    if name in _COLLAPSING_NODES:
         return False
     # Descend through joins too: a laundered scan under a nested join is the
     # same dirt, and stopping here reads "did not look" as "clean".
@@ -240,6 +257,8 @@ def _has_nan_scan(node: dict[str, Any], depth: int) -> bool:
         name in _JOIN_NODES
         or name in _PASSTHROUGH_NODES
         or name in _ROW_PRESERVING_NODES
+        or name in _BOUNDING_NODES
+        or name in _PARTIAL_NODES
     ):
         return any(_has_nan_scan(child, depth + 1) for child in children)
     # An unrecognised node is only trusted where Trino sized it anyway.
