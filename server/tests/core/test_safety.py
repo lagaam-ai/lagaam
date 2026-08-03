@@ -335,3 +335,14 @@ def test_a_moderately_nested_array_is_refused_quickly_not_left_to_hang() -> None
     with pytest.raises(SqlValidationError):
         validate_query(_nested_array(16), "trino")
     assert time.monotonic() - started < 1.0
+
+
+def test_the_depth_caps_are_the_committed_values() -> None:
+    # A mutation run that dies between mutating and restoring leaves a
+    # disabled guard in the working tree, and every behavioural test above
+    # still passes with a huge cap because their payloads only grow. Pin the
+    # numbers themselves so a stale mutation cannot ship green.
+    from lagaam.core.safety import _MAX_BRACKET_DEPTH, _MAX_NESTING_DEPTH
+
+    assert _MAX_BRACKET_DEPTH == 12
+    assert _MAX_NESTING_DEPTH == 100

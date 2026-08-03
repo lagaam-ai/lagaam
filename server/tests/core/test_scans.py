@@ -326,3 +326,11 @@ def test_a_generator_hidden_inside_a_literal_array_is_unpriceable() -> None:
         "SELECT t.n FROM hive.s.orders a "
         "CROSS JOIN UNNEST(ARRAY[sequence(1, 1000000)]) AS t(n)"
     )
+
+
+def test_the_scan_count_cap_is_the_committed_value() -> None:
+    # Same reason as the depth caps in test_safety: a mutation left on disk
+    # by an interrupted run must fail loudly, not pass green.
+    from lagaam.core.scans import _MAX_SCAN_COUNT
+
+    assert _MAX_SCAN_COUNT == 10_000

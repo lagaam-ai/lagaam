@@ -56,6 +56,13 @@ docs/      vision.md, architecture.md, roadmap.md
 ```
 
 ## Conventions
+- **Mutation testing must never edit the shared working tree.** Run it in a
+  throwaway `git worktree`, or guard mutate/restore with a shell `trap` so an
+  interrupted run cannot leave a disabled guard on disk. An in-place `cp`
+  restore has already failed once: the run died mid-mutation, left
+  `_MAX_BRACKET_DEPTH` disabled, raced a concurrent session, and orphaned two
+  pytest processes that pinned a CPU core each for five hours. The safety
+  caps are pinned by value in the tests so a stale mutation fails loudly.
 - Tests required for core/ logic (pytest). Adapters get integration tests
   against dockerized engines.
 - Conventional commits (feat:, fix:, docs:, chore:), atomic: one logical
