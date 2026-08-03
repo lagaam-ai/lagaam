@@ -115,6 +115,35 @@ def test_write_smuggled_into_cte_rejected() -> None:
 @pytest.mark.parametrize(
     "sql",
     [
+        "SELECT c.x INTO memory.default.owned FROM memory.default.src c",
+        "SELECT c.x INTO TEMP TABLE t FROM memory.default.src c",
+        "SELECT c.x INTO UNLOGGED t FROM memory.default.src c",
+        'SELECT c.x INTO "cat"."sch"."tbl" FROM memory.default.src c',
+        "SELECT 1 INTO t",
+    ],
+)
+def test_select_into_rejected(sql: str) -> None:
+    # sqlglot parses SELECT..INTO as a Select, so it passes the Query gate,
+    # but the Trino generator renders it as CREATE TABLE .. AS SELECT. Trino
+    # runs that write during EXPLAIN, before the budget gate is reached.
+    with pytest.raises(SqlValidationError, match="read-only"):
+        validate(sql)
+
+
+def test_rendered_sql_is_judged_not_only_the_parsed_tree() -> None:
+    # The invariant this module documents: what executes is what was judged.
+    # A construct that only becomes DDL at render time must not survive.
+    rendered = []
+    for sql in ("SELECT a FROM tpch.tiny.orders", "SELECT count(*) FROM tpch.tiny.orders"):
+        rendered.append(validate(sql).lower())
+    assert not any("create" in sql for sql in rendered)
+    with pytest.raises(SqlValidationError, match="read-only"):
+        validate("SELECT o.custkey INTO tpch.tiny.orders FROM tpch.tiny.orders o")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
         "SELECT x FROM TABLE(system.query(query => 'DROP TABLE t'))",
         "SELECT x FROM mysql.system.query(query => 'DELETE FROM t')",
         "SELECT x FROM TABLE(exclude_columns(input => TABLE(tpch.tiny.orders), "

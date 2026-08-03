@@ -27,6 +27,8 @@ _DENY_NODES = (
     exp.TruncateTable,
     exp.Grant,
     exp.Command,
+    # Parses under a Select, but the Trino generator emits CREATE TABLE AS.
+    exp.Into,
 )
 
 
@@ -230,10 +232,11 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
     an attack — so the LIMIT moves outside a wrapper the parser accepts.
     """
     try:
-        sqlglot.parse_one(rendered, dialect=dialect)
+        reread = sqlglot.parse_one(rendered, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         pass
     else:
+        _deny_writes(reread)
         return rendered
 
     limit = tree.args.get("limit")
@@ -249,10 +252,33 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
     )
     rendered = wrapped.sql(dialect=dialect, comments=False)
     try:
-        sqlglot.parse_one(rendered, dialect=dialect)
+        reread = sqlglot.parse_one(rendered, dialect=dialect)
     except sqlglot.errors.SqlglotError:
         raise SqlValidationError(
             "The SQL uses a construct this server cannot re-read safely. "
             "Rewrite it more simply and retry."
         ) from None
+    _deny_writes(reread)
     return rendered
+
+
+def _deny_writes(tree: exp.Expr) -> None:
+    """Judge the rendered SQL, since that is what the engine will run.
+
+    SELECT .. INTO parses as a Select and passes every check on the input
+    tree, then renders as CREATE TABLE .. AS SELECT — which Trino executes
+    during EXPLAIN, upstream of the budget gate. Judging only the tree we
+    parsed leaves the guarantee to the generator; judging what we emit keeps
+    "the SQL that executes is the SQL that was judged" true by construction.
+    """
+    if not isinstance(tree, exp.Query):
+        raise SqlValidationError(
+            "This tool is read-only: only SELECT queries are allowed. "
+            "Use the metadata tools for catalogs and schemas."
+        )
+    denied = tree.find(*_DENY_NODES)
+    if denied is not None:
+        raise SqlValidationError(
+            "This tool is read-only: write/DDL constructs are not allowed "
+            f"(found {denied.key.upper()}). Send a plain SELECT query."
+        )
