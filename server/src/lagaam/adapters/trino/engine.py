@@ -50,6 +50,18 @@ _ENGINE_FAILURES = (trino.exceptions.Error, trino.exceptions.HttpError, OSError)
 
 _UNREACHABLE = "the query engine is not reachable right now"
 
+# Planning is attacker-reachable work: a 722-char self-referencing CTE chain
+# measured 32s of coordinator time on Trino 476, quadrupling per two links,
+# while passing every parse-time guard in milliseconds. The gate waits for
+# EXPLAIN, so an uncapped plan is how the enforcement point itself goes down.
+# The cap has to be iterative_optimizer_timeout: measured on Trino 476, the
+# 32s plan finished untouched under both query_max_run_time and
+# query_max_planning_time, because the work is the optimizer's own iteration.
+# 10s is ~110x the worst legitimate plan measured (TPC-H Q21 at sf1, 0.09s)
+# and well under the 32s the chain needs, so it kills the attack without
+# coming near real work.
+_PLAN_TIMEOUT = {"iterative_optimizer_timeout": "10s"}
+
 
 def _detail(exc: Exception) -> str:
     """Agent-safe failure text: exc.message, never str(exc), which leaks
@@ -284,7 +296,7 @@ class TrinoEngine:
         if has_unpriceable_shape(sql, dialect):
             return CostEstimate(confidence="low")
         # TYPE IO plans the query without running it; NEVER use ANALYZE here.
-        with self._connect() as conn:
+        with self._connect(_PLAN_TIMEOUT) as conn:
             cur = conn.cursor()
             cur.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {sql}")
             row = cur.fetchone()
@@ -309,7 +321,7 @@ class TrinoEngine:
         never a reason to lose a byte quote we already have.
         """
         try:
-            with self._connect() as conn:
+            with self._connect(_PLAN_TIMEOUT) as conn:
                 cur = conn.cursor()
                 cur.execute(f"EXPLAIN (TYPE LOGICAL, FORMAT JSON) {sql}")
                 row = cur.fetchone()

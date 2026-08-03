@@ -279,6 +279,38 @@ def _estimate(sql: str, io_json: str) -> Any:
     return engine._estimate_cost(sql)
 
 
+def test_planning_carries_a_wall_clock_cap() -> None:
+    # Planning is not free: a 722-char self-referencing CTE chain took 32s of
+    # coordinator time on Trino 476, and the gate waits for it. Without a cap
+    # the enforcement point is what a hostile query takes down.
+    engine = TrinoEngine()
+    seen: list[dict[str, str] | None] = []
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def cursor(self) -> _ExplainCursor:
+            return _ExplainCursor('{"inputTableColumnInfos": []}')
+
+    def _record(props: dict[str, str] | None = None) -> _Conn:
+        seen.append(props)
+        return _Conn()
+
+    engine._connect = _record  # type: ignore[method-assign]
+    engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+
+    assert seen, "estimate_cost never opened a connection"
+    for props in seen:
+        assert props is not None, "planning ran with no session properties"
+        # Measured: query_max_run_time and query_max_planning_time both let a
+        # 32s plan finish, so the cap must be the optimizer's own timeout.
+        assert "iterative_optimizer_timeout" in props
+
+
 def _io_entry(catalog: str, schema: str, table: str, size: float, rows: float) -> dict[str, Any]:
     return {
         "table": {"catalog": catalog, "schemaTable": {"schema": schema, "table": table}},

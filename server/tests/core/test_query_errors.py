@@ -58,6 +58,17 @@ def test_a_missing_function_is_the_agent_s_to_fix() -> None:
     assert "function" in hint.lower()
 
 
+def test_a_plan_the_optimizer_gave_up_on_is_the_agent_s_to_simplify() -> None:
+    # The gate caps optimizer time, so a query too complex to plan surfaces as
+    # OPTIMIZER_TIMEOUT. Reported as an engine fault the agent retries it, and
+    # each retry spends the whole cap again.
+    from lagaam.core.query_errors import is_self_correctable
+
+    assert is_self_correctable("OPTIMIZER_TIMEOUT")
+    hint = hint_for_engine_error("OPTIMIZER_TIMEOUT")
+    assert "complex" in hint.lower() or "split" in hint.lower()
+
+
 def test_unknown_error_gets_a_generic_retry_hint() -> None:
     # An unmapped code still returns something actionable, never None.
     hint = hint_for_engine_error("SOME_NEW_TRINO_CODE")
