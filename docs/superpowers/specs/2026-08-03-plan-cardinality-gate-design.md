@@ -1,7 +1,9 @@
 # Plan-based cardinality gate
 
 **Date:** 3 Aug 2026
-**Status:** approved, not implemented
+**Status:** implemented and superseded in places — this is the design as
+written before the work, kept for the reasoning. The ADRs under `docs/adr/`
+describe what actually shipped and win wherever the two disagree.
 **Replaces:** the join/product/correlation half of `core/scans.py`
 
 ## Why
@@ -190,7 +192,7 @@ per nesting level. It escapes as a raw Python error rather than a
 `SqlValidationError`.
 
 Fix: measure AST depth after parsing and before rendering; past a fixed cap
-(200, well above any human query and below sqlglot's practical limit),
+(shipped as 100 — see ADR 0007 for the measured bounds),
 raise `SqlValidationError` with what-to-change text. Depth is measured
 iteratively so the check cannot itself recurse.
 
@@ -227,7 +229,7 @@ No leniency. Each of these is a gate on completion, not a suggestion.
   direction (NaN never reads as cheap), and the integration test runs against
   live Trino, so a change in Trino's estimator surfaces as a test failure
   rather than a silent hole.
-- **The 1e9 default may not fit every deployment.** It is configurable, and
+- **The default may not fit every deployment.** (Shipped as 50,000,000; 1e9 was measured above the whole explosion band and never shipped.) It is configurable, and
   the measured bands are documented here so an operator can reason about it.
 - **One extra EXPLAIN per query** (~30 ms, planning only). Acceptable against
   a gate whose purpose is to prevent minutes of execution.

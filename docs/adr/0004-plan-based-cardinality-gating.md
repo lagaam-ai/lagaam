@@ -18,8 +18,9 @@ computes it.
 
 The Trino adapter runs `EXPLAIN (TYPE LOGICAL, FORMAT JSON)` and gates on
 the plan's per-operator row estimates (ADR 0005) instead of on SQL shape.
-The shape heuristics were deleted: `core/scans.py` went from 695 lines to
-242.
+The shape heuristics were deleted: `core/scans.py` dropped from 695 lines to
+258, keeping only the row-generator check the planner cannot see. It has
+since grown back to size a literal `sequence()` rather than refuse it.
 
 ## Consequences
 

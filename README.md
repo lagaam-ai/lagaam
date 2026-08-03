@@ -28,7 +28,7 @@ and cannot reach the engine any other way.
 | `LAGAAM_MAX_SCAN_BYTES` | Scan-bytes budget per query, pre-execution | 50 GiB |
 | `LAGAAM_MAX_ROWS` | Scanned-row estimate budget per query | ungated |
 | `LAGAAM_MAX_INTERMEDIATE_ROWS` | Rows the engine would *build* at its widest step — not rows returned, so a `LIMIT` doesn't lower it | 50,000,000 |
-| `LAGAAM_MAX_RETURNED_ROWS` | Rows returned to the agent per query | `1000` (max `100000`) |
+| `LAGAAM_MAX_RETURNED_ROWS` | Rows returned to the agent per query — unset, the server applies its own 1000-row cap | `1000` (max `100000`) |
 | `LAGAAM_QUERY_TIMEOUT` | Wall-clock seconds per query | `300` |
 | `LAGAAM_METADATA_TTL` | Metadata cache TTL, seconds | `300` |
 | `LAGAAM_AUDIT_LOG` | Audit JSONL file path | stderr |
@@ -37,6 +37,12 @@ and cannot reach the engine any other way.
 **The server will not start without `LAGAAM_ALLOWED_TABLES`.** An agent that
 can reach every table in every catalog is the thing this exists to prevent, so
 that has to be asked for — set `LAGAAM_ALLOW_ALL_TABLES=true` if you mean it.
+
+**The budget dimensions above apply whether or not you set them.** Leaving
+`LAGAAM_MAX_SCAN_BYTES` and `LAGAAM_MAX_INTERMEDIATE_ROWS` unset gives you
+their defaults, not an open gate — an unconfigured server refuses what it
+cannot afford rather than waving it through. If queries are being denied and
+you expected no limits, that is why; raise the dimension you mean to raise.
 
 Cost quotes come from the engine's own plan estimates, and those need table
 statistics: a table without stats cannot be priced, so its queries are refused

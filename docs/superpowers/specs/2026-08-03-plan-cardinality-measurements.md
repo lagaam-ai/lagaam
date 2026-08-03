@@ -56,6 +56,9 @@ table rows (15,000) from split metadata, and still catches cross join (225M).
 However the equi-join on memory goes NaN at the join node.
 => Rule: a join node whose estimate is NaN is charged the PRODUCT of its
    children's known rows. Verified this is what makes laundering visible.
+   (Still true as the default. The narrow exemptions that came later are in
+   ADR 0005; the "criteria absent" version in §11 was defeated — see the note
+   there.)
 
 ## 8. TYPE LOGICAL JSON also carries outputSizeInBytes
 Root estimate identical to TYPE IO's ({'outputRowCount': 60175.0,
@@ -129,6 +132,15 @@ The plan JSON distinguishes the two cases directly:
 Charging the product only when criteria are absent fixes the false block
 (12,000,000,000 → 1,200,000, admitted) with no attack regression: 14 attack
 shapes including all five laundering variants remain denied.
+
+> **Superseded — do not implement this rule.** Criteria text is a property of
+> the join *key*, while the exploitable property is the NaN *estimate*, which
+> a filter controls independently: wrapping the key in `substr`, or moving the
+> wrapper into a `WHERE` on both sides, kept the criteria plain and
+> under-quoted by 30,088x. The shipped rule is in ADR 0005 — a NaN join takes
+> max-of-children only when a side is aggregation-bounded above the dirt, or
+> every key resolves through the plan's own assignments to a base table column
+> with no NaN-estimate leaf beneath. See `adapters/trino/plan.py`.
 
 This does not generalise — five other correlated shapes, including TPC-H
 Q17, already estimate correctly at 6,001,215.
