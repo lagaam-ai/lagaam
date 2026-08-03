@@ -290,10 +290,15 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
 
     Returns {} for unparseable SQL — the shape check has already refused it.
     """
+    return _walk_scans(sql, dialect)[0]
+
+
+def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
+    """The read counts, and whether the walk budget ran out reaching them."""
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
     except sqlglot.errors.SqlglotError:
-        return {}
+        return {}, False
 
     bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
     counts: dict[str, int] = {}
@@ -325,7 +330,19 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
     # From the query with its WITH detached: a CTE body counts once per
     # reference to it, not once where it is defined.
     walk(_without_cte_bodies(tree), 1, frozenset())
-    return counts
+    return counts, budget[0] <= 0
+
+
+def scan_counts_saturated(sql: str, dialect: str) -> bool:
+    """True if counting this query's reads hit the walk budget.
+
+    A saturated count is not a small count: the byte quote is scaled UP by
+    how many reads the plan folded together, so counting fewer reads than
+    the query really does makes it cheaper. Measured, a 1,471-character CTE
+    chain reads a table 524,288 times and counts 3,328 — a 61 GiB query
+    priced at 3 GiB. The caller denies on this rather than take the discount.
+    """
+    return _walk_scans(sql, dialect)[1]
 
 
 def _without_cte_bodies(tree: exp.Expr) -> exp.Expr:

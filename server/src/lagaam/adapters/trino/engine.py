@@ -24,7 +24,11 @@ from lagaam.core.errors import (
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
-from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
+from lagaam.core.scans import (
+    has_unpriceable_shape,
+    scan_counts_saturated,
+    table_scan_counts,
+)
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
@@ -294,6 +298,11 @@ class TrinoEngine:
         # Product joins and row generators break the byte sum in ways no
         # scaling can repair — don't vouch for a quote at all.
         if has_unpriceable_shape(sql, dialect):
+            return CostEstimate(confidence="low")
+        # A count that hit its walk budget under-reports the reads the plan
+        # folded together, and the byte quote is scaled by that count — so a
+        # saturated walk quotes the query cheaper the more it actually reads.
+        if scan_counts_saturated(sql, dialect):
             return CostEstimate(confidence="low")
         # TYPE IO plans the query without running it; NEVER use ANALYZE here.
         with self._connect(_PLAN_TIMEOUT) as conn:

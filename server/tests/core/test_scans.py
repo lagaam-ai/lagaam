@@ -360,6 +360,28 @@ def test_a_generator_hidden_inside_a_literal_array_is_unpriceable() -> None:
     )
 
 
+def test_a_saturated_scan_count_is_reported_as_unpriceable() -> None:
+    # The walk budget bounds CPU, but a partial count scales the byte quote
+    # DOWN — measured, a 1,471-char CTE chain counts 3,328 reads where the
+    # true number is 524,288, so a 61 GiB query quotes at 3 GiB and is
+    # admitted. Saturation has to deny, not discount.
+    from lagaam.core.scans import scan_counts_saturated
+
+    parts = ["c0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
+    for i in range(1, 20):
+        parts.append(
+            f"c{i} AS (SELECT a.orderkey FROM c{i - 1} a "
+            f"JOIN c{i - 1} b ON a.orderkey = b.orderkey)"
+        )
+    exploding = "WITH " + ", ".join(parts) + " SELECT orderkey FROM c19"
+
+    assert scan_counts_saturated(exploding, "trino")
+    assert not scan_counts_saturated(
+        "SELECT a.x FROM tpch.tiny.orders a JOIN tpch.tiny.orders b ON a.k = b.k",
+        "trino",
+    )
+
+
 def test_the_scan_count_cap_is_the_committed_value() -> None:
     # Same reason as the depth caps in test_safety: a mutation left on disk
     # by an interrupted run must fail loudly, not pass green.
