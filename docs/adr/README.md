@@ -11,3 +11,4 @@ Title / Status / Context / Decision / Consequences.
 | [0004](0004-plan-based-cardinality-gating.md) | Plan-based cardinality gating over SQL-shape heuristics |
 | [0005](0005-gate-on-max-intermediate-rows.md) | Gate on maximum intermediate rows, not output rows |
 | [0006](0006-row-generators-stay-sql-level.md) | Row generators remain a SQL-level check |
+| [0007](0007-parser-safety-bounds.md) | Parser safety bounds sit ahead of the parse |

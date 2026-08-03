@@ -30,32 +30,13 @@ _DENY_NODES = (
 )
 
 
-# Parsing is superlinear in nesting depth: measured on sqlglot 30.12, 3 MB of
-# nested subqueries cost 5s and 12 MB cost 25s, before any check of ours runs.
-# The bound belongs here, ahead of the parse — a gate an agent can make burn
-# CPU is the unbounded work it exists to refuse. Trino itself accepts more
-# than this, so the ceiling is generous: a 200k-character query is a machine
-# padding the input, not an analyst asking a question.
+# Bounds measured against sqlglot 30.12 and reasoned about in docs/adr/0007.
 _MAX_SQL_CHARS = 200_000
 
-# sqlglot's own recursive-descent parser blows the stack, or goes
-# quadratic-or-worse, on deep bracket nesting well before a query gets big
-# enough to trip _MAX_SQL_CHARS — and the break point depends on grammar
-# shape, not bracket count alone. RecursionError shapes are the shallower
-# worry: nested CASE WHEN ... THEN (...) broke the parser at 27 brackets,
-# nested abs() at 44. The binding constraint turned out to be slowness, not
-# a crash: nested ARRAY[...] parses in 0.03s at depth 10 but 0.76s at depth
-# 15 and hangs past 5s by depth 18 (all measured under pytest, fresh
-# process per depth). The cap sits below where that curve turns expensive.
+# Tightest of the three: nested ARRAY[...] already costs 0.76s at depth 15.
 _MAX_BRACKET_DEPTH = 12
 
-# sqlglot's generator recurses once per AST level, so a *small* query nested
-# deeply enough blows the stack inside tree.sql(): measured under pytest,
-# rendering raised RecursionError at an AST depth of 263 (87 levels of
-# "SELECT x FROM (...) t"). An ordinary analytical query — joins, a CASE
-# aggregate, a CTE pipeline, a window function — measured 6-9 deep; 20 levels
-# of synthetic subquery nesting measured 62. This cap sits well above real
-# SQL and well below where rendering breaks.
+# sqlglot's generator recurses per AST level; rendering raises around 263.
 _MAX_NESTING_DEPTH = 100
 
 _GROUPING_LIMIT = re.compile(
