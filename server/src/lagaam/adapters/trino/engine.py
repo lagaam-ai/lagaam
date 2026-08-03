@@ -53,12 +53,17 @@ _UNREACHABLE = "the query engine is not reachable right now"
 
 def _detail(exc: Exception) -> str:
     """Agent-safe failure text: exc.message, never str(exc), which leaks
-    the query id."""
-    if isinstance(exc, trino.exceptions.HttpError | OSError):
-        # An HttpError body can hold token material and an OSError names the
-        # host and port; neither is the agent's to see or act on.
-        return _UNREACHABLE
-    return getattr(exc, "message", None) or str(exc)
+    the query id.
+
+    Vouching for a message the engine composed is safe; vouching for every
+    class not on a denylist is not. Transport and auth failures are Error
+    subclasses carrying no message, so str(exc) named the coordinator's host
+    and any token in the auth text — the leak the denylist meant to prevent.
+    """
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    return _UNREACHABLE
 
 
 def _collapse_factor(sql_counts: dict[str, int], plan_counts: dict[str, int]) -> int:

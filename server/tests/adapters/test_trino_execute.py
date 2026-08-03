@@ -118,6 +118,25 @@ def test_unreachable_engine_does_not_name_the_host() -> None:
     assert _detail(http) == _UNREACHABLE
 
 
+def test_transport_and_auth_failures_do_not_name_the_host_or_token() -> None:
+    # These are Error subclasses but neither HttpError nor OSError, and they
+    # carry no .message — so a denylist let str(exc) through verbatim.
+    import trino.exceptions
+
+    from lagaam.adapters.trino.engine import _UNREACHABLE, _detail
+
+    conn = trino.exceptions.TrinoConnectionError(
+        "HTTPConnectionPool(host='internal-trino.corp', port=8443): Max retries"
+    )
+    assert _detail(conn) == _UNREACHABLE
+    auth = trino.exceptions.TrinoAuthError(
+        "failed to authenticate with https://internal-trino.corp:8443 "
+        "using token eyJhbGciOi_SECRET"
+    )
+    assert _detail(auth) == _UNREACHABLE
+    assert _detail(trino.exceptions.OperationalError("host=db-internal")) == _UNREACHABLE
+
+
 # --- SHOW STATS row counts ------------------------------------------------
 
 
