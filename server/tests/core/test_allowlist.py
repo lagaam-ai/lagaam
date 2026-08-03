@@ -50,7 +50,53 @@ def test_cte_name_is_not_treated_as_a_table() -> None:
     )
 
 
+def test_cte_shapes_that_stay_in_scope_pass() -> None:
+    # Narrowing CTE resolution to enclosing scopes must not cost the ordinary
+    # spellings: chained, nested in a derived table, recursive, and a CTE
+    # deliberately named after a real table it reads.
+    allowed = {"tpch.tiny.orders"}
+    guard(
+        "WITH a AS (SELECT k FROM tpch.tiny.orders), b AS (SELECT k FROM a) "
+        "SELECT k FROM b",
+        allowed=allowed,
+    )
+    guard(
+        "SELECT x FROM (WITH inner_c AS (SELECT k AS x FROM tpch.tiny.orders) "
+        "SELECT x FROM inner_c) t",
+        allowed=allowed,
+    )
+    guard(
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r "
+        "WHERE n < 5) SELECT n FROM r",
+        allowed=allowed,
+    )
+    guard(
+        "WITH orders AS (SELECT k FROM tpch.tiny.orders) SELECT k FROM orders",
+        allowed=allowed,
+    )
+
+
 # --- what is denied ------------------------------------------------------
+
+
+def test_a_cte_does_not_vouch_for_the_same_name_in_an_outer_scope() -> None:
+    # The CTE is declared inside the IN-subquery, so the outer bare customer
+    # is a base table the engine resolves — a grant bypass if it were skipped.
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "SELECT c.name FROM customer c WHERE c.custkey IN "
+            "(WITH customer AS (SELECT 1 AS custkey) SELECT custkey FROM customer)",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
+def test_a_cte_in_a_sibling_scope_does_not_vouch_for_a_bare_name() -> None:
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "WITH a AS (WITH customer AS (SELECT 1 AS c) SELECT c FROM customer) "
+            "SELECT x FROM customer",
+            allowed={"tpch.tiny.orders"},
+        )
 
 
 def test_table_outside_allowlist_is_denied() -> None:

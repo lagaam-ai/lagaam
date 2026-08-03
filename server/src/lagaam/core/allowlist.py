@@ -31,10 +31,12 @@ def check_tables_allowed(
             "denied. Send a single valid SELECT with fully-qualified names."
         )
 
-    ctes = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
     for table in tree.find_all(exp.Table):
-        # A bare reference to a CTE is a local alias, not a base table.
-        if table.name.lower() in ctes and not table.catalog and not table.db:
+        # A bare reference to a CTE is a local alias, not a base table — but
+        # only where that CTE is in scope. A tree-wide name set lets a CTE
+        # buried in a subquery vouch for the same bare name in an outer scope,
+        # where the engine resolves it to a real table.
+        if not table.catalog and not table.db and _cte_in_scope(table):
             continue
         rendered = table.sql(dialect=dialect)
         try:
@@ -50,6 +52,43 @@ def check_tables_allowed(
                 "Query only the tables in your grant; call list_catalogs "
                 "to see them."
             )
+
+
+def _cte_in_scope(table: exp.Table) -> bool:
+    """Is this bare name declared by a WITH clause enclosing it?
+
+    Walks outward from the reference, so a CTE only vouches for names inside
+    the query that declares it. A CTE also cannot vouch for a reference in
+    its own definition, which is where a self-referencing name resolves to
+    the base table instead.
+    """
+    name = table.name.lower()
+    node: exp.Expr | None = table
+    while node is not None:
+        # sqlglot spells the arg "with_" on Query nodes; accept both so a
+        # rename cannot silently turn this check off.
+        with_clause = node.args.get("with_") or node.args.get("with")
+        if isinstance(with_clause, exp.With):
+            recursive = bool(with_clause.args.get("recursive"))
+            for cte in with_clause.expressions:
+                if cte.alias_or_name.lower() != name:
+                    continue
+                # Only a RECURSIVE CTE binds its own name inside its body.
+                if not recursive and _within(table, cte):
+                    continue
+                return True
+        node = node.parent
+    return False
+
+
+def _within(node: exp.Expr, ancestor: exp.Expr) -> bool:
+    """Does ``node`` sit inside ``ancestor``'s subtree?"""
+    walk: exp.Expr | None = node
+    while walk is not None:
+        if walk is ancestor:
+            return True
+        walk = walk.parent
+    return False
 
 
 def table_parts_allowed(
