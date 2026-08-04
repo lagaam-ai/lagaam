@@ -7,7 +7,13 @@ Then: uv run pytest -m integration
 import pytest
 
 from lagaam.adapters.trino.engine import TrinoEngine
-from lagaam.core.errors import TableNotFoundError
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    QueryBudget,
+    enforce_budget,
+)
+from lagaam.core.errors import BudgetExceededError, TableNotFoundError
 from lagaam.core.ports import QueryEngine
 
 pytestmark = pytest.mark.integration
@@ -58,22 +64,47 @@ async def test_estimate_cost_quotes_a_real_scan(engine: TrinoEngine) -> None:
 
 
 async def test_count_star_is_not_quoted_as_free(engine: TrinoEngine) -> None:
-    # Regression: count(*) scans the whole table but Trino reports 0 bytes.
-    # Must NOT come back as high-confidence 0 — that would slip past a budget.
+    # count(*) scans the whole table but reads no columns, so Trino reports 0
+    # bytes. Quoting that as free slips past any budget; blocking it outright
+    # denies a query no rewrite can fix. It gets priced from its rows.
     est = await engine.estimate_cost("SELECT count(*) FROM tpch.sf1.orders")
-    assert est.confidence == "low"
+    assert est.scanned_bytes is not None and est.scanned_bytes > 0
+    assert est.row_estimate == 1_500_000
 
 
-async def test_self_join_is_not_quoted_as_a_single_scan(
+async def test_a_self_join_is_billed_for_both_scans(engine: TrinoEngine) -> None:
+    # Trino emits one IO entry per distinct (table, column-set), so two scans
+    # reading the SAME columns collapse into one and the plan bills half the
+    # work. The quote is scaled by the repeat count to make up the difference.
+    single = await engine.estimate_cost("SELECT orderkey FROM tpch.tiny.lineitem")
+    self_join = await engine.estimate_cost(
+        "SELECT a.orderkey FROM tpch.tiny.lineitem a "
+        "JOIN tpch.tiny.lineitem b ON a.orderkey = b.orderkey"
+    )
+    assert self_join.confidence == "high"
+    assert single.scanned_bytes is not None
+    assert self_join.scanned_bytes == single.scanned_bytes * 2
+
+
+async def test_a_product_join_is_refused_however_it_is_spelled(
     engine: TrinoEngine,
 ) -> None:
-    # Two physical scans of lineitem; the IO plan bills one. Quoting it high
-    # would undercount by 2x — must degrade to low.
-    est = await engine.estimate_cost(
-        "SELECT a.orderkey FROM tpch.sf1.lineitem a "
-        "JOIN tpch.sf1.lineitem b ON a.orderkey = b.orderkey"
+    # Both inputs are scanned once, so the byte sum is correct and says
+    # nothing about the quadratic row work it hides. The plan does say it:
+    # each of these prices at 225 billion rows against a 50 million budget.
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
     )
-    assert est.confidence == "low"
+    for predicate in ("1 = 1", "a.orderkey <> b.custkey", "a.custkey = b.custkey OR 1 = 1"):
+        est = await engine.estimate_cost(
+            f"SELECT a.orderkey FROM tpch.sf1.orders a "
+            f"JOIN tpch.sf1.customer b ON {predicate}"
+        )
+        assert est.max_intermediate_rows is not None, predicate
+        assert est.max_intermediate_rows > DEFAULT_MAX_INTERMEDIATE_ROWS, predicate
+        with pytest.raises(BudgetExceededError):
+            enforce_budget(est, budget)
 
 
 async def test_estimate_cost_of_join_sums_both_scans(engine: TrinoEngine) -> None:
@@ -233,3 +264,172 @@ async def test_timeout_is_self_correctable_and_leak_free(
         )
     assert "query_id" not in str(exc.value)
     assert "filter" in str(exc.value).lower()
+
+
+# Corpus measured live against Trino 476 (tpch.tiny). See
+# docs/superpowers/specs/2026-08-03-plan-cardinality-measurements.md.
+_LEGITIMATE = [
+    ("healthy equi-join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey = o.orderkey"),
+    ("3-way star join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey = o.orderkey JOIN tpch.tiny.customer c ON o.custkey = c.custkey"),
+    ("self join", "SELECT a.orderkey FROM tpch.tiny.orders a JOIN tpch.tiny.orders b ON a.orderkey = b.orderkey"),
+    ("cte referenced four times", "WITH t AS (SELECT orderkey FROM tpch.tiny.orders) SELECT a.orderkey FROM t a JOIN t b ON a.orderkey = b.orderkey JOIN t c ON a.orderkey = c.orderkey JOIN t d ON a.orderkey = d.orderkey"),
+    ("group by", "SELECT l.linestatus, count(*) AS c FROM tpch.tiny.lineitem l GROUP BY l.linestatus"),
+    ("count star", "SELECT count(*) AS c FROM tpch.tiny.lineitem"),
+    ("distinct", "SELECT DISTINCT l.linestatus FROM tpch.tiny.lineitem l"),
+    ("date filter", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.orderdate > DATE '1995-01-01'"),
+    ("like filter", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.comment LIKE '%special%'"),
+    ("window function", "SELECT l.orderkey, row_number() OVER (PARTITION BY l.orderkey ORDER BY l.linenumber) AS r FROM tpch.tiny.lineitem l"),
+    ("union all", "SELECT orderkey FROM tpch.tiny.orders UNION ALL SELECT orderkey FROM tpch.tiny.orders"),
+    ("lateral aggregate", "SELECT o.orderkey, t.c FROM tpch.tiny.orders o LEFT JOIN LATERAL (SELECT count(*) AS c FROM tpch.tiny.lineitem l WHERE l.orderkey = o.orderkey) t ON true"),
+    ("correlated equality subquery", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.totalprice > (SELECT avg(l.extendedprice) FROM tpch.tiny.lineitem l WHERE l.orderkey = o.orderkey)"),
+    ("scalar subquery", "SELECT orderkey FROM tpch.tiny.orders WHERE totalprice > (SELECT avg(totalprice) FROM tpch.tiny.orders)"),
+    ("unnest a literal array", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(ARRAY['a','b']) AS u(n)"),
+    ("constant cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (SELECT 0.2 AS rate) r"),
+    ("two small values relations", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN (VALUES (1),(2)) AS a(x) CROSS JOIN (VALUES (1),(2)) AS b(y)"),
+    ("semi join", "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey IN (SELECT orderkey FROM tpch.tiny.lineitem)"),
+    # The shape the NaN-with-criteria exemption exists for: Trino decorrelates
+    # this into a plan whose top InnerJoin has equality keys but no estimate.
+    # Charging the product there priced 12 billion rows against a real 10,000.
+    (
+        "doubly nested correlated semi join",
+        "SELECT s.suppkey FROM tpch.sf1.supplier s WHERE s.suppkey IN ("
+        "SELECT ps.suppkey FROM tpch.sf1.partsupp ps WHERE ps.supplycost < ("
+        "SELECT avg(ps2.supplycost) FROM tpch.sf1.partsupp ps2 "
+        "WHERE ps2.partkey = ps.partkey))",
+    ),
+]
+
+# tpch.tiny is a toy scale (15,000-row orders); these prove the gate at sf1
+# (1.5M-row orders, 6M-row lineitem), where legitimate analytics measures
+# up to 6,001,215 rows at its widest operator.
+_LEGITIMATE_AT_SCALE = [
+    ("sf1 healthy join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey = o.orderkey"),
+    ("sf1 group by", "SELECT l.orderkey, count(*) AS c FROM tpch.sf1.lineitem l GROUP BY l.orderkey"),
+    ("sf1 filtered scan", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.orderdate > DATE '1995-01-01'"),
+    ("sf1 count star", "SELECT count(*) AS c FROM tpch.sf1.lineitem"),
+    # Trino stops estimating multi-way joins past a depth, so these report a
+    # NaN join over fully sized children. Charging the product would price a
+    # 4-table star join at 2.2 trillion rows against a real 1,828,911.
+    ("tpch q3", "SELECT l.orderkey, sum(l.extendedprice*(1-l.discount)) AS revenue, o.orderdate, o.shippriority FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey WHERE c.mktsegment='BUILDING' AND o.orderdate < DATE '1995-03-15' AND l.shipdate > DATE '1995-03-15' GROUP BY l.orderkey, o.orderdate, o.shippriority"),
+    ("tpch q5", "SELECT n.name, sum(l.extendedprice*(1-l.discount)) AS revenue FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey JOIN tpch.sf1.supplier s ON l.suppkey=s.suppkey AND c.nationkey=s.nationkey JOIN tpch.sf1.nation n ON s.nationkey=n.nationkey JOIN tpch.sf1.region r ON n.regionkey=r.regionkey WHERE r.name='ASIA' AND o.orderdate >= DATE '1994-01-01' GROUP BY n.name"),
+    ("tpch q10", "SELECT c.custkey, c.name, sum(l.extendedprice*(1-l.discount)) AS revenue FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON l.orderkey=o.orderkey JOIN tpch.sf1.nation n ON c.nationkey=n.nationkey WHERE o.orderdate >= DATE '1993-10-01' AND l.returnflag='R' GROUP BY c.custkey, c.name"),
+    ("tpch q18", "SELECT c.name, o.orderkey, o.totalprice, sum(l.quantity) AS q FROM tpch.sf1.customer c JOIN tpch.sf1.orders o ON c.custkey=o.custkey JOIN tpch.sf1.lineitem l ON o.orderkey=l.orderkey WHERE o.orderkey IN (SELECT l2.orderkey FROM tpch.sf1.lineitem l2 GROUP BY l2.orderkey HAVING sum(l2.quantity) > 300) GROUP BY c.name, o.orderkey, o.totalprice"),
+    ("tpch q21", "SELECT s.name, count(*) AS numwait FROM tpch.sf1.supplier s JOIN tpch.sf1.lineitem l1 ON s.suppkey=l1.suppkey JOIN tpch.sf1.orders o ON o.orderkey=l1.orderkey JOIN tpch.sf1.nation n ON s.nationkey=n.nationkey WHERE o.orderstatus='F' AND l1.receiptdate > l1.commitdate AND EXISTS (SELECT 1 FROM tpch.sf1.lineitem l2 WHERE l2.orderkey=l1.orderkey AND l2.suppkey <> l1.suppkey) AND NOT EXISTS (SELECT 1 FROM tpch.sf1.lineitem l3 WHERE l3.orderkey=l1.orderkey AND l3.suppkey <> l1.suppkey AND l3.receiptdate > l3.commitdate) AND n.name='SAUDI ARABIA' GROUP BY s.name"),
+    ("sf1 three table star join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey=o.orderkey JOIN tpch.sf1.customer c ON o.custkey=c.custkey"),
+    ("sf1 four table star join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.orderkey=o.orderkey JOIN tpch.sf1.customer c ON o.custkey=c.custkey JOIN tpch.sf1.nation n ON c.nationkey=n.nationkey"),
+    ("sf1 self join on a key", "SELECT a.orderkey FROM tpch.sf1.orders a JOIN tpch.sf1.orders b ON a.orderkey=b.orderkey"),
+    ("sf1 anti join via NOT IN", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.custkey NOT IN (SELECT c.custkey FROM tpch.sf1.customer c WHERE c.nationkey=1)"),
+    ("sf1 anti join via NOT EXISTS", "SELECT o.orderkey FROM tpch.sf1.orders o WHERE NOT EXISTS (SELECT 1 FROM tpch.sf1.lineitem l WHERE l.orderkey=o.orderkey)"),
+    ("sf1 cohort window", "SELECT custkey, orderdate, row_number() OVER (PARTITION BY custkey ORDER BY orderdate) AS step, count(*) OVER (PARTITION BY custkey) AS total FROM tpch.sf1.orders WHERE orderdate >= DATE '1995-01-01'"),
+    # A Window emits one row per input row, so it bounds its side of a NaN
+    # join even though Trino reports no estimate above it.
+    ("sf1 funnel window joined to a dimension", "SELECT c.custkey, w.step FROM tpch.sf1.customer c JOIN (SELECT custkey, row_number() OVER (PARTITION BY custkey ORDER BY orderdate) AS step FROM tpch.sf1.orders) w ON c.custkey=w.custkey"),
+]
+
+_EXPLOSIONS_AT_SCALE = [
+    ("sf1 low-cardinality join", "SELECT l.orderkey FROM tpch.sf1.lineitem l JOIN tpch.sf1.orders o ON l.linestatus = o.orderstatus"),
+]
+
+_EXPLOSIONS = [
+    ("cross join", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o"),
+    ("cross join laundered by a like filter", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o WHERE o.comment LIKE '%special%'"),
+    ("cross join laundered by a limit", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o LIMIT 10"),
+    ("cross join laundered by an aggregate", "WITH t AS (SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o) SELECT count(*) AS c FROM t"),
+    ("cross join laundered by distinct", "SELECT DISTINCT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o"),
+    ("cross join laundered by a group by", "SELECT l.orderkey, count(*) AS c FROM tpch.tiny.lineitem l CROSS JOIN tpch.tiny.orders o GROUP BY l.orderkey"),
+    ("join on a constant", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON 1 = 1"),
+    ("join on a two-valued column", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.linestatus = o.orderstatus"),
+    ("inequality join", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON l.orderkey < o.orderkey"),
+    ("group by ordinal constant pin", "SELECT a.orderkey FROM tpch.tiny.orders a JOIN (SELECT 1 AS m, count(*) AS c FROM tpch.tiny.lineitem l GROUP BY l.orderkey) t ON t.m = 1"),
+    ("correlated inequality subquery", "SELECT o.orderkey FROM tpch.tiny.orders o WHERE o.totalprice > (SELECT avg(l.extendedprice) FROM tpch.tiny.lineitem l WHERE l.orderkey < o.orderkey)"),
+    # Derived-key attacks: same join, wrapped in a scalar function. Trino
+    # renders the criteria as "(expr = expr_N)" and reports a NaN estimate
+    # bounded by tiny per-side scans (60,175) while doing the true product
+    # of work. Measured live: 30,087x under-report for the substr wrapper.
+    ("cross join laundered by substr on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON substr(a.linestatus,1,1)=substr(b.linestatus,1,1)"),
+    ("cartesian laundered by a zero-length substr", "SELECT l.orderkey FROM tpch.tiny.lineitem l JOIN tpch.tiny.orders o ON substr(l.comment,1,0)=substr(o.comment,1,0)"),
+    ("cross join laundered by lower on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON lower(a.linestatus)=lower(b.linestatus)"),
+    ("cross join laundered by upper on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON upper(a.linestatus)=upper(b.linestatus)"),
+    ("cross join laundered by trim on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON trim(a.linestatus)=trim(b.linestatus)"),
+    ("cross join laundered by concat on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON concat(a.linestatus,'')=concat(b.linestatus,'')"),
+    ("cross join laundered by || on the join key", "SELECT a.orderkey FROM tpch.tiny.lineitem a JOIN tpch.tiny.lineitem b ON a.linestatus||''=b.linestatus||''"),
+    # Filter laundering: the join key stays a plain column, and a filter Trino
+    # cannot size nulls one side's estimate instead. Measured live before the
+    # fix: quoted 60,175 against a true 1,810,518,277 rows — 30,088x under.
+    ("filter laundered by regexp_like on both sides", "SELECT a.orderkey FROM (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) a JOIN (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) b ON a.linestatus = b.linestatus"),
+    ("filter laundered through a shared cte", "WITH f AS (SELECT orderkey, linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) SELECT a.orderkey FROM f a JOIN f b ON a.linestatus=b.linestatus"),
+    ("filter laundered by lower(comment) LIKE on both sides", "SELECT a.orderkey FROM (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') a JOIN (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') b ON a.linestatus=b.linestatus"),
+    ("filter laundered on shipmode, seven distinct values", "SELECT a.orderkey FROM (SELECT orderkey,shipmode FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') a JOIN (SELECT orderkey,shipmode FROM tpch.tiny.lineitem WHERE lower(comment) LIKE '%a%') b ON a.shipmode=b.shipmode"),
+    ("filter laundered on one side only", "SELECT a.orderkey FROM (SELECT orderkey,linestatus FROM tpch.tiny.lineitem WHERE regexp_like(comment,'.*')) a JOIN tpch.tiny.lineitem b ON a.linestatus=b.linestatus"),
+    # The derived key aliased back to a plain column name: the name lies, the
+    # plan's own "sym := source" assignment does not.
+    ("derived key aliased back to a plain column name", "SELECT a.orderkey FROM (SELECT orderkey, substr(linestatus,1,1) AS linestatus FROM tpch.tiny.lineitem) a JOIN (SELECT orderkey, substr(linestatus,1,1) AS linestatus FROM tpch.tiny.lineitem) b ON a.linestatus=b.linestatus"),
+    ("constant key aliased as a column", "SELECT a.orderkey FROM (SELECT orderkey, 1 AS k FROM tpch.tiny.lineitem) a JOIN (SELECT orderkey, 1 AS k FROM tpch.tiny.orders) b ON a.k=b.k"),
+]
+
+_GENERATORS = [
+    ("unnest a sequence", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(sequence(1, 10000)) AS u(n)"),
+    ("unnest a repeat", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(repeat(l.linestatus, 10000)) AS u(n)"),
+]
+
+
+@pytest.mark.parametrize("label,sql", _LEGITIMATE, ids=[t[0] for t in _LEGITIMATE])
+async def test_legitimate_shapes_clear_the_default_budget(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize("label,sql", _EXPLOSIONS, ids=[t[0] for t in _EXPLOSIONS])
+async def test_row_explosions_are_denied(label: str, sql: str, engine: TrinoEngine) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize("label,sql", _GENERATORS, ids=[t[0] for t in _GENERATORS])
+async def test_row_generators_are_denied_by_the_shape_check(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    # The planner cannot see these, so scans.py must still refuse them.
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "low"
+
+
+@pytest.mark.parametrize(
+    "label,sql", _LEGITIMATE_AT_SCALE, ids=[t[0] for t in _LEGITIMATE_AT_SCALE]
+)
+async def test_legitimate_sf1_shapes_clear_the_default_budget(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    # tiny alone cannot prove the gate survives real scale; sf1 does.
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    enforce_budget(estimate, budget)
+
+
+@pytest.mark.parametrize(
+    "label,sql", _EXPLOSIONS_AT_SCALE, ids=[t[0] for t in _EXPLOSIONS_AT_SCALE]
+)
+async def test_row_explosions_at_sf1_are_denied(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    estimate = await engine.estimate_cost(sql)
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)

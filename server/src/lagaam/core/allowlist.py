@@ -10,6 +10,7 @@ import sqlglot
 from sqlglot import exp
 
 from lagaam.core.errors import TableAccessDeniedError
+from lagaam.core.identifiers import IdentifierError, normalize_grant, table_fqn
 from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
@@ -30,23 +31,90 @@ def check_tables_allowed(
             "denied. Send a single valid SELECT with fully-qualified names."
         )
 
-    ctes = {c.alias_or_name.lower() for c in tree.find_all(exp.CTE)}
+    # Declared names per WITH clause, built once: a query can carry thousands
+    # of CTEs, and rescanning them for every table reference is quadratic.
+    scopes: dict[int, dict[str, exp.CTE]] = {}
     for table in tree.find_all(exp.Table):
-        # A bare reference to a CTE is a local alias, not a base table.
-        if table.name.lower() in ctes and not table.catalog and not table.db:
+        # A bare reference to a CTE is a local alias, not a base table — but
+        # only where that CTE is in scope. A tree-wide name set lets a CTE
+        # buried in a subquery vouch for the same bare name in an outer scope,
+        # where the engine resolves it to a real table.
+        if not table.catalog and not table.db and _cte_in_scope(table, scopes):
             continue
-        if not table.catalog or not table.db:
+        rendered = table.sql(dialect=dialect)
+        try:
+            fqn = table_fqn(table)
+        except IdentifierError as exc:
             raise TableAccessDeniedError(
-                f"Table '{table.name}' is not fully qualified, so access "
-                "cannot be checked. Use catalog.schema.table names."
-            )
-        fqn = f"{table.catalog}.{table.db}.{table.name}".lower()
+                f"Table '{rendered}' cannot be checked against your grant "
+                f"({exc}). Use plain catalog.schema.table names."
+            ) from exc
         if fqn not in allowed:
             raise TableAccessDeniedError(
-                f"Access to {table.catalog}.{table.db}.{table.name} is not "
-                "permitted for this agent. Query only the tables in your "
-                "grant; call list_catalogs to see them."
+                f"Access to {rendered} is not permitted for this agent. "
+                "Query only the tables in your grant; call list_catalogs "
+                "to see them."
             )
+
+
+def _cte_in_scope(
+    table: exp.Table, scopes: dict[int, dict[str, exp.CTE]]
+) -> bool:
+    """Is this bare name declared by a WITH clause enclosing it?
+
+    Walks outward from the reference, so a CTE only vouches for names inside
+    the query that declares it. A CTE also cannot vouch for a reference in
+    its own definition, which is where a self-referencing name resolves to
+    the base table instead.
+    """
+    name = table.name.lower()
+    node: exp.Expr | None = table
+    while node is not None:
+        # sqlglot spells the arg "with_" on Query nodes; accept both so a
+        # rename cannot silently turn this check off.
+        with_clause = node.args.get("with_") or node.args.get("with")
+        if isinstance(with_clause, exp.With):
+            declared = scopes.get(id(with_clause))
+            if declared is None:
+                declared = {
+                    cte.alias_or_name.lower(): cte
+                    for cte in reversed(with_clause.expressions)
+                }
+                scopes[id(with_clause)] = declared
+            cte = declared.get(name)
+            if cte is not None:
+                # Only a RECURSIVE CTE binds its own name inside its body.
+                if with_clause.args.get("recursive") or not _within(table, cte):
+                    return True
+        node = node.parent
+    return False
+
+
+def _within(node: exp.Expr, ancestor: exp.Expr) -> bool:
+    """Does ``node`` sit inside ``ancestor``'s subtree?"""
+    walk: exp.Expr | None = node
+    while walk is not None:
+        if walk is ancestor:
+            return True
+        walk = walk.parent
+    return False
+
+
+def table_parts_allowed(
+    catalog: str, schema: str, table: str, allowed: frozenset[str] | set[str]
+) -> bool:
+    """Is this already-resolved three-part name in the grant?
+
+    For names that arrive as parts rather than SQL — engine-reported metadata,
+    and describe_table's arguments. Folded the same way ``table_fqn`` folds
+    parsed SQL, so a connector reporting uppercase names (Oracle, Snowflake)
+    still grounds an agent whose grant is written lowercase. A name no grant
+    could express — non-ASCII, or one carrying a dot — matches nothing.
+    """
+    try:
+        return normalize_grant(f"{catalog}.{schema}.{table}") in allowed
+    except IdentifierError:
+        return False
 
 
 def filter_catalog_metadata(
@@ -69,7 +137,7 @@ def filter_catalog_metadata(
             tables = [
                 t
                 for t in schema.tables
-                if f"{catalog.name}.{schema.name}.{t}".lower() in allowed
+                if table_parts_allowed(catalog.name, schema.name, t, allowed)
             ]
             if tables:
                 schemas.append(SchemaInfo(name=schema.name, tables=tables))

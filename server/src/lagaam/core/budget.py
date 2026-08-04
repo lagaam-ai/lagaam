@@ -20,6 +20,16 @@ from lagaam.core.errors import BudgetExceededError
 from lagaam.core.models import CostEstimate
 
 
+# A gate that opens when unconfigured is not a gate: env-built budgets get
+# these ceilings rather than None.
+DEFAULT_MAX_SCAN_BYTES = 50 * 1024**3  # 50 GiB
+DEFAULT_TIMEOUT_SECONDS = 300.0
+# Rows are materialized in this process, so the ceiling is memory, not policy.
+MAX_RETURNED_ROWS_CEILING = 100_000
+# Tuned between measured legitimate work and the cheapest attack; docs/adr/0005.
+DEFAULT_MAX_INTERMEDIATE_ROWS = 50_000_000
+
+
 class QueryBudget(BaseModel):
     """Per-query ceilings. Unset (None) means that dimension is not gated.
 
@@ -29,19 +39,47 @@ class QueryBudget(BaseModel):
 
     max_scan_bytes: int | None = Field(default=None, gt=0)
     max_rows: int | None = Field(default=None, gt=0)
+    # Rows the engine would build at its widest operator, not rows returned:
+    # what a product join blows and a byte estimate cannot see.
+    max_intermediate_rows: int | None = Field(default=None, gt=0)
     # Unset falls back to the server's default row cap, never unlimited.
-    max_returned_rows: int | None = Field(default=None, gt=0)
+    max_returned_rows: int | None = Field(
+        default=None, gt=0, le=MAX_RETURNED_ROWS_CEILING
+    )
     # Enforced at execution time (U6); validated here so it is coherent.
     timeout_seconds: float | None = Field(default=None, gt=0)
 
     @classmethod
     def from_env(cls) -> "QueryBudget":
-        """Server-wide default budget from env; per-agent budgets arrive in U7."""
+        """Server-wide default budget from env; per-agent budgets arrive in U7.
+
+        Scan bytes and timeout fall back to defaults rather than to unlimited,
+        so a server started with no LAGAAM_* vars still has a gate. An
+        out-of-range returned-row cap is clamped, not rejected: a running
+        deployment must not fail to boot over a number we can safely lower.
+        """
+        scan_bytes = _int_env("LAGAAM_MAX_SCAN_BYTES")
+        timeout = _float_env("LAGAAM_QUERY_TIMEOUT")
+        returned_rows = _int_env("LAGAAM_MAX_RETURNED_ROWS")
+        intermediate_rows = _int_env("LAGAAM_MAX_INTERMEDIATE_ROWS")
         return cls(
-            max_scan_bytes=_int_env("LAGAAM_MAX_SCAN_BYTES"),
+            max_scan_bytes=(
+                DEFAULT_MAX_SCAN_BYTES if scan_bytes is None else scan_bytes
+            ),
             max_rows=_int_env("LAGAAM_MAX_ROWS"),
-            max_returned_rows=_int_env("LAGAAM_MAX_RETURNED_ROWS"),
-            timeout_seconds=_float_env("LAGAAM_QUERY_TIMEOUT"),
+            max_intermediate_rows=(
+                DEFAULT_MAX_INTERMEDIATE_ROWS
+                if intermediate_rows is None
+                else intermediate_rows
+            ),
+            max_returned_rows=(
+                None
+                if returned_rows is None
+                else min(returned_rows, MAX_RETURNED_ROWS_CEILING)
+            ),
+            timeout_seconds=(
+                DEFAULT_TIMEOUT_SECONDS if timeout is None else timeout
+            ),
         )
 
 
@@ -66,8 +104,10 @@ def _float_env(name: str) -> float | None:
 
 
 _UNESTIMABLE = (
-    "add a filter on a partition or key column, avoid self-joins, and query a "
-    "table with statistics so the cost can be predicted."
+    "Add a filter on a partition or key column, join on a key instead of "
+    "crossing tables, avoid reading the same table twice, avoid expanding a "
+    "value into rows (UNNEST over split(), sequence() or repeat()), and query "
+    "a table with statistics so the cost can be predicted."
 )
 
 
@@ -104,4 +144,20 @@ def enforce_budget(estimate: CostEstimate, budget: QueryBudget) -> None:
                 f"rows, over your budget of {budget.max_rows:,}. This counts "
                 "rows scanned, not returned, so a LIMIT alone won't help — add "
                 "a WHERE filter (a date or key range) to read fewer rows."
+            )
+
+    if budget.max_intermediate_rows is not None:
+        if estimate.confidence == "low" or estimate.max_intermediate_rows is None:
+            raise BudgetExceededError(
+                "The row work could not be estimated, so this query cannot be "
+                f"cleared against your row budget. {_UNESTIMABLE}"
+            )
+        if estimate.max_intermediate_rows > budget.max_intermediate_rows:
+            raise BudgetExceededError(
+                f"This query would build {estimate.max_intermediate_rows:,} "
+                "rows at its widest step, over your budget of "
+                f"{budget.max_intermediate_rows:,}. These are rows the engine "
+                "materializes internally, not rows returned, so a LIMIT will "
+                "not help — join on a column with more distinct values, or "
+                "filter each side before the join."
             )

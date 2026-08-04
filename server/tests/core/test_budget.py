@@ -5,8 +5,15 @@ shrink the query (add a filter, a LIMIT), the same way the domain errors do.
 """
 
 import pytest
+from pydantic import ValidationError
 
-from lagaam.core.budget import QueryBudget, enforce_budget
+from lagaam.core.budget import (
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    MAX_RETURNED_ROWS_CEILING,
+    QueryBudget,
+    enforce_budget,
+)
 from lagaam.core.errors import BudgetExceededError
 from lagaam.core.models import CostEstimate
 
@@ -108,7 +115,11 @@ def test_scan_row_budget_does_not_gate_returned_rows() -> None:
     assert budget.max_returned_rows is None
 
 
-def test_from_env_defaults_to_no_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_from_env_falls_back_to_a_real_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unconfigured server still has a gate: scan bytes and timeout default
+    # to finite ceilings rather than to unlimited.
     for var in (
         "LAGAAM_MAX_SCAN_BYTES",
         "LAGAAM_MAX_ROWS",
@@ -117,7 +128,17 @@ def test_from_env_defaults_to_no_limits(monkeypatch: pytest.MonkeyPatch) -> None
     ):
         monkeypatch.delenv(var, raising=False)
     budget = QueryBudget.from_env()
-    assert budget == QueryBudget()
+    assert budget.max_scan_bytes == DEFAULT_MAX_SCAN_BYTES
+    assert budget.timeout_seconds == DEFAULT_TIMEOUT_SECONDS
+    assert budget.max_rows is None  # row scan stays ungated by default
+    assert budget.max_returned_rows is None  # server applies its own row cap
+
+
+def test_returned_row_cap_is_bounded_above() -> None:
+    # Returned rows are materialized in this process, so an unbounded cap is
+    # an OOM of the gate itself.
+    with pytest.raises(ValidationError):
+        QueryBudget(max_returned_rows=MAX_RETURNED_ROWS_CEILING + 1)
 
 
 def test_from_env_rejects_garbage_with_a_clear_message(
@@ -133,3 +154,102 @@ def test_from_env_rejects_nonpositive(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LAGAAM_MAX_ROWS", "0")
     with pytest.raises(ValueError):
         QueryBudget.from_env()
+
+
+def test_from_env_clamps_an_oversized_returned_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A deployment that worked yesterday must not fail to boot over a number
+    # we can safely lower.
+    monkeypatch.setenv("LAGAAM_MAX_RETURNED_ROWS", "500000")
+    assert QueryBudget.from_env().max_returned_rows == MAX_RETURNED_ROWS_CEILING
+
+
+def test_from_env_rejects_a_zero_scan_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An explicit 0 once fell through `or` to the permissive default, giving
+    # an operator who asked to deny everything the opposite.
+    monkeypatch.setenv("LAGAAM_MAX_SCAN_BYTES", "0")
+    with pytest.raises(ValidationError):
+        QueryBudget.from_env()
+
+
+def test_from_env_honours_an_explicit_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAGAAM_MAX_SCAN_BYTES", "1024")
+    monkeypatch.setenv("LAGAAM_QUERY_TIMEOUT", "5")
+    budget = QueryBudget.from_env()
+    assert budget.max_scan_bytes == 1024
+    assert budget.timeout_seconds == 5.0
+
+
+# --- widest-operator row budget -------------------------------------------
+
+
+def test_a_query_within_the_intermediate_row_budget_passes() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=240_700)
+    enforce_budget(estimate, budget)
+
+
+def test_an_intermediate_row_count_exactly_at_the_limit_passes() -> None:
+    # The boundary is exclusive: a query that builds exactly the cap is not
+    # over it, same convention as the scan-byte budget.
+    budget = QueryBudget(max_intermediate_rows=1_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=1_000_000)
+    enforce_budget(estimate, budget)
+
+
+def test_a_product_over_the_intermediate_row_budget_is_denied() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(scanned_bytes=10, max_intermediate_rows=902_625_000_0)
+    with pytest.raises(BudgetExceededError) as err:
+        enforce_budget(estimate, budget)
+    message = str(err.value)
+    assert "9,026,250,000" in message
+    assert "1,000,000,000" in message
+    # The agent must learn that a LIMIT cannot fix a product.
+    assert "LIMIT" in message
+
+
+def test_a_missing_intermediate_row_count_is_denied() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(CostEstimate(scanned_bytes=10), budget)
+
+
+def test_a_low_confidence_estimate_is_denied_on_intermediate_rows() -> None:
+    budget = QueryBudget(max_intermediate_rows=1_000_000_000)
+    estimate = CostEstimate(confidence="low", max_intermediate_rows=5)
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)
+
+
+def test_an_ungated_intermediate_row_dimension_admits_anything() -> None:
+    budget = QueryBudget(max_scan_bytes=100)
+    enforce_budget(
+        CostEstimate(scanned_bytes=10, max_intermediate_rows=10**15), budget
+    )
+
+
+def test_the_env_budget_gates_intermediate_rows_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "LAGAAM_MAX_SCAN_BYTES",
+        "LAGAAM_QUERY_TIMEOUT",
+        "LAGAAM_MAX_ROWS",
+        "LAGAAM_MAX_RETURNED_ROWS",
+        "LAGAAM_MAX_INTERMEDIATE_ROWS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert QueryBudget.from_env().max_intermediate_rows == 50_000_000
+
+
+def test_the_env_budget_reads_an_explicit_intermediate_row_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LAGAAM_MAX_INTERMEDIATE_ROWS", "5000")
+    assert QueryBudget.from_env().max_intermediate_rows == 5000

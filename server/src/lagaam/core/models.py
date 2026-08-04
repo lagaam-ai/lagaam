@@ -53,6 +53,12 @@ class CatalogMetadata(BaseModel):
 class CostEstimate(BaseModel):
     """Pre-execution QUOTATION for a query: what it would scan, how sure we are.
 
+    Two different row numbers, because they answer different questions.
+    ``row_estimate`` is rows *scanned*, summed from the IO plan.
+    ``max_intermediate_rows`` is the widest row count any single operator
+    would build — a cross join scans 75,175 rows and builds 902,625,000, and
+    only the second number says so.
+
     ``confidence`` is "low" whenever the byte number is missing — the engine
     had no statistics, so the budget gate must fail safe rather than admit a
     query on an absent estimate.
@@ -60,6 +66,8 @@ class CostEstimate(BaseModel):
 
     scanned_bytes: int | None = None
     row_estimate: int | None = None
+    # Rows the widest operator would build; None when the plan cannot say.
+    max_intermediate_rows: int | None = None
     # None = "infer from the evidence"; an explicit value is checked for sanity.
     confidence: Literal["high", "low"] | None = None
 

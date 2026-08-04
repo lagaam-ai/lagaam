@@ -39,6 +39,36 @@ def test_permission_denied_is_explained() -> None:
     assert "permission" in hint.lower() or "access" in hint.lower()
 
 
+def test_an_unsupported_construct_is_the_agent_s_to_rewrite() -> None:
+    # Trino raises NOT_SUPPORTED for SQL it parses but cannot plan, e.g. some
+    # correlated subqueries. Reported as an engine fault the agent retries the
+    # identical query forever, because retrying is what it was told to do.
+    from lagaam.core.query_errors import is_self_correctable
+
+    assert is_self_correctable("NOT_SUPPORTED")
+    hint = hint_for_engine_error("NOT_SUPPORTED")
+    assert "rewrite" in hint.lower() or "restructure" in hint.lower()
+
+
+def test_a_missing_function_is_the_agent_s_to_fix() -> None:
+    from lagaam.core.query_errors import is_self_correctable
+
+    assert is_self_correctable("FUNCTION_NOT_FOUND")
+    hint = hint_for_engine_error("FUNCTION_NOT_FOUND")
+    assert "function" in hint.lower()
+
+
+def test_a_plan_the_optimizer_gave_up_on_is_the_agent_s_to_simplify() -> None:
+    # The gate caps optimizer time, so a query too complex to plan surfaces as
+    # OPTIMIZER_TIMEOUT. Reported as an engine fault the agent retries it, and
+    # each retry spends the whole cap again.
+    from lagaam.core.query_errors import is_self_correctable
+
+    assert is_self_correctable("OPTIMIZER_TIMEOUT")
+    hint = hint_for_engine_error("OPTIMIZER_TIMEOUT")
+    assert "complex" in hint.lower() or "split" in hint.lower()
+
+
 def test_unknown_error_gets_a_generic_retry_hint() -> None:
     # An unmapped code still returns something actionable, never None.
     hint = hint_for_engine_error("SOME_NEW_TRINO_CODE")

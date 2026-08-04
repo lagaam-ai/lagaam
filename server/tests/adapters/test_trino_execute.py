@@ -4,6 +4,7 @@ A sub-second timeout must never render as "0s" — Trino reads that as an
 instant kill, silently breaking every real query.
 """
 
+import json
 from typing import Any
 
 import pytest
@@ -102,4 +103,359 @@ def test_metadata_failures_use_message_not_repr() -> None:
             return "TrinoQueryError(message=..., query_id=20260716_abc)"
 
     assert _detail(FakeQueryError()) == "line 1:1: mismatched input"
-    assert _detail(OSError("connection refused")) == "connection refused"
+
+
+def test_unreachable_engine_does_not_name_the_host() -> None:
+    # OSError is what a refused connection raises, and its text carries the
+    # coordinator's address — internal topology the agent has no use for.
+    import trino.exceptions
+
+    from lagaam.adapters.trino.engine import _UNREACHABLE, _detail
+
+    leaky = OSError("connection refused to trino-coordinator.internal:8080")
+    assert _detail(leaky) == _UNREACHABLE
+    http = trino.exceptions.Http503Error("error 503: token=secret-value")
+    assert _detail(http) == _UNREACHABLE
+
+
+def test_transport_and_auth_failures_do_not_name_the_host_or_token() -> None:
+    # These are Error subclasses but neither HttpError nor OSError, and they
+    # carry no .message — so a denylist let str(exc) through verbatim.
+    import trino.exceptions
+
+    from lagaam.adapters.trino.engine import _UNREACHABLE, _detail
+
+    conn = trino.exceptions.TrinoConnectionError(
+        "HTTPConnectionPool(host='internal-trino.corp', port=8443): Max retries"
+    )
+    assert _detail(conn) == _UNREACHABLE
+    auth = trino.exceptions.TrinoAuthError(
+        "failed to authenticate with https://internal-trino.corp:8443 "
+        "using token eyJhbGciOi_SECRET"
+    )
+    assert _detail(auth) == _UNREACHABLE
+    assert _detail(trino.exceptions.OperationalError("host=db-internal")) == _UNREACHABLE
+
+
+# --- SHOW STATS row counts ------------------------------------------------
+
+
+class _StatsCursor:
+    """A cursor that replays one SHOW STATS result."""
+
+    def __init__(self, rows: list[list[Any]]) -> None:
+        self._rows = rows
+
+    def execute(self, sql: str) -> None:
+        pass
+
+    def fetchall(self) -> list[list[Any]]:
+        return self._rows
+
+
+def _row_estimate(rows: list[list[Any]]) -> int | None:
+    return TrinoEngine._row_estimate(_StatsCursor(rows), '"c"."s"."t"')
+
+
+def test_row_estimate_reads_the_summary_row() -> None:
+    # SHOW STATS: (column_name, data_size, distinct, nulls, row_count, ...)
+    assert _row_estimate([["a", 1.0, 1.0, 0.0, None], [None, None, None, None, 15000.0]]) == 15000
+
+
+def test_row_estimate_survives_a_nan_row_count() -> None:
+    # Stats-less tables report NaN, and round(nan) raises — a cosmetic missing
+    # estimate must not become a hard describe_table failure.
+    assert _row_estimate([[None, None, None, None, float("nan")]]) is None
+
+
+def test_row_estimate_survives_an_infinite_row_count() -> None:
+    assert _row_estimate([[None, None, None, None, float("inf")]]) is None
+
+
+def test_row_estimate_with_no_summary_row_is_none() -> None:
+    assert _row_estimate([["a", 1.0, 1.0, 0.0, None]]) is None
+
+
+def test_row_estimate_with_no_rows_is_none() -> None:
+    assert _row_estimate([]) is None
+
+
+# --- HTTP failures are engine failures ------------------------------------
+
+
+async def test_http_error_becomes_a_domain_error() -> None:
+    # trino.exceptions.HttpError derives from Exception, not Error, so it once
+    # escaped every except clause: unaudited, and raw text to the agent.
+    import trino.exceptions
+
+    from lagaam.core.errors import EngineError
+
+    engine = TrinoEngine()
+
+    def boom() -> None:
+        raise trino.exceptions.Http503Error("error 503: token=secret-value")
+
+    engine._list_catalogs = boom  # type: ignore[method-assign]
+    with pytest.raises(EngineError) as caught:
+        await engine.list_catalogs()
+    # The response body can carry credentials; the agent gets the class only.
+    from lagaam.adapters.trino.engine import _UNREACHABLE
+
+    assert "secret-value" not in str(caught.value)
+    assert _UNREACHABLE in str(caught.value)
+
+
+# --- scans the plan folded into one entry ---------------------------------
+
+
+def test_collapse_factor_makes_up_what_the_plan_folded() -> None:
+    # Trino reports one entry for two scans of a table when they read the
+    # same columns, so the byte sum bills half the work.
+    from lagaam.adapters.trino.engine import _collapse_factor
+
+    assert _collapse_factor({"c.s.t": 2}, {"c.s.t": 1}) == 2
+    assert _collapse_factor({"c.s.t": 2}, {"c.s.t": 2}) == 1  # already summed
+    assert _collapse_factor({"c.s.t": 5}, {"c.s.t": 1}) == 5
+    assert _collapse_factor({"c.s.a": 1, "c.s.b": 1}, {"c.s.a": 1, "c.s.b": 1}) == 1
+    assert _collapse_factor({"c.s.t": 3}, {}) == 1  # nothing to compare against
+
+
+def test_a_partial_collapse_rounds_up() -> None:
+    # 3 references over 2 entries is a real 1.5x shortfall; floor division
+    # would call it 1 and charge nothing for it.
+    from lagaam.adapters.trino.engine import _collapse_factor
+
+    assert _collapse_factor({"c.s.t": 3}, {"c.s.t": 2}) == 2
+    assert _collapse_factor({"c.s.t": 7}, {"c.s.t": 4}) == 2
+
+
+def test_scaled_multiplies_both_gated_dimensions() -> None:
+    from lagaam.adapters.trino.engine import _scaled
+    from lagaam.core.models import CostEstimate
+
+    scaled = _scaled(CostEstimate(scanned_bytes=100, row_estimate=10), 3)
+    assert scaled.scanned_bytes == 300
+    assert scaled.row_estimate == 30
+    assert scaled.confidence == "high"
+
+
+def test_scaled_leaves_a_low_confidence_quote_alone() -> None:
+    # There is no number to scale, and scaling would not make it trustworthy.
+    from lagaam.adapters.trino.engine import _scaled
+    from lagaam.core.models import CostEstimate
+
+    unscaled = _scaled(CostEstimate(confidence="low"), 4)
+    assert unscaled.scanned_bytes is None
+    assert unscaled.confidence == "low"
+
+
+class _ExplainCursor:
+    """A cursor that replays one EXPLAIN (TYPE IO) result."""
+
+    def __init__(self, io_json: str) -> None:
+        self._io_json = io_json
+
+    def execute(self, sql: str) -> None:
+        pass
+
+    def fetchone(self) -> list[str]:
+        return [self._io_json]
+
+
+def _estimate(sql: str, io_json: str) -> Any:
+    engine = TrinoEngine()
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def cursor(self) -> _ExplainCursor:
+            return _ExplainCursor(io_json)
+
+    engine._connect = lambda props=None: _Conn()  # type: ignore[method-assign]
+    return engine._estimate_cost(sql)
+
+
+def test_planning_carries_a_wall_clock_cap() -> None:
+    # Planning is not free: a 722-char self-referencing CTE chain took 32s of
+    # coordinator time on Trino 476, and the gate waits for it. Without a cap
+    # the enforcement point is what a hostile query takes down.
+    engine = TrinoEngine()
+    seen: list[dict[str, str] | None] = []
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def cursor(self) -> _ExplainCursor:
+            return _ExplainCursor('{"inputTableColumnInfos": []}')
+
+    def _record(props: dict[str, str] | None = None) -> _Conn:
+        seen.append(props)
+        return _Conn()
+
+    engine._connect = _record  # type: ignore[method-assign]
+    engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+
+    assert seen, "estimate_cost never opened a connection"
+    for props in seen:
+        assert props is not None, "planning ran with no session properties"
+        # Measured: query_max_run_time and query_max_planning_time both let a
+        # 32s plan finish, so the cap must be the optimizer's own timeout.
+        assert "iterative_optimizer_timeout" in props
+
+
+def _io_entry(catalog: str, schema: str, table: str, size: float, rows: float) -> dict[str, Any]:
+    return {
+        "table": {"catalog": catalog, "schemaTable": {"schema": schema, "table": table}},
+        "estimate": {"outputSizeInBytes": size, "outputRowCount": rows},
+    }
+
+
+def test_estimate_scales_a_quote_the_plan_folded_into_one_entry() -> None:
+    # The SQL reads orders twice; the plan reported one scan, so the byte sum
+    # bills half the work and has to be made up.
+    import json as _json
+
+    io_json = _json.dumps(
+        {"inputTableColumnInfos": [_io_entry("c", "s", "orders", 1000.0, 100.0)]}
+    )
+    est = _estimate(
+        "SELECT a.k FROM c.s.orders a JOIN c.s.orders b ON a.k = b.k", io_json
+    )
+    assert est.scanned_bytes == 2000
+    assert est.row_estimate == 200
+
+
+def test_estimate_does_not_scale_what_the_plan_already_summed() -> None:
+    import json as _json
+
+    io_json = _json.dumps(
+        {
+            "inputTableColumnInfos": [
+                _io_entry("c", "s", "orders", 1000.0, 100.0),
+                _io_entry("c", "s", "orders", 1000.0, 100.0),
+            ]
+        }
+    )
+    est = _estimate(
+        "SELECT a.k FROM c.s.orders a JOIN c.s.orders b ON a.k = b.k", io_json
+    )
+    assert est.scanned_bytes == 2000  # summed once, not doubled again
+
+
+def test_estimate_of_a_query_touching_no_table_is_free() -> None:
+    import json as _json
+
+    est = _estimate("SELECT 1", _json.dumps({"inputTableColumnInfos": []}))
+    assert est.confidence == "high"
+    assert est.scanned_bytes == 0
+
+
+# --- widest row count from the logical plan --------------------------------
+
+
+class _AnsweringCursor:
+    """A cursor that replays a canned answer keyed by a substring of the SQL."""
+
+    def __init__(self, answers: dict[str, "str | Exception"]) -> None:
+        self._answers = answers
+
+    def execute(self, sql: str) -> None:
+        for key, value in self._answers.items():
+            if key in sql:
+                if isinstance(value, Exception):
+                    raise value
+                self._result = value
+                return
+        raise AssertionError(f"no fake answer configured for SQL: {sql}")
+
+    def fetchone(self) -> list[str]:
+        return [self._result]
+
+
+def _engine_answering(answers: dict[str, "str | Exception"]) -> TrinoEngine:
+    """A TrinoEngine whose EXPLAIN calls are matched by substring against answers."""
+    engine = TrinoEngine()
+
+    class _Conn:
+        def __enter__(self) -> "_Conn":
+            return self
+
+        def __exit__(self, *a: Any) -> None:
+            pass
+
+        def cursor(self) -> _AnsweringCursor:
+            return _AnsweringCursor(answers)
+
+    engine._connect = lambda props=None: _Conn()  # type: ignore[method-assign]
+    return engine
+
+
+def test_estimate_cost_carries_the_widest_row_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The quote reports what the plan says the widest operator builds."""
+    io_json = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {
+                        "outputRowCount": 15000.0,
+                        "outputSizeInBytes": 135000.0,
+                    },
+                }
+            ]
+        }
+    )
+    plan_json = json.dumps(
+        {
+            "name": "Output",
+            "estimates": [{"outputRowCount": "NaN"}],
+            "children": [
+                {
+                    "name": "CrossJoin",
+                    "estimates": [{"outputRowCount": "NaN"}],
+                    "children": [
+                        {"name": "TableScan", "estimates": [{"outputRowCount": 60175.0}]},
+                        {"name": "TableScan", "estimates": [{"outputRowCount": 15000.0}]},
+                    ],
+                }
+            ],
+        }
+    )
+    engine = _engine_answering({"TYPE IO": io_json, "TYPE LOGICAL": plan_json})
+    estimate = engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+    assert estimate.max_intermediate_rows == 902_625_000
+
+
+def test_a_failed_plan_call_still_returns_the_byte_quote() -> None:
+    """A plan we cannot read is an unknown row count, not a lost quote."""
+    io_json = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {
+                        "outputRowCount": 15000.0,
+                        "outputSizeInBytes": 135000.0,
+                    },
+                }
+            ]
+        }
+    )
+    engine = _engine_answering({"TYPE IO": io_json, "TYPE LOGICAL": RuntimeError("boom")})
+    estimate = engine._estimate_cost("SELECT a FROM tpch.tiny.orders")
+    assert estimate.scanned_bytes == 135000
+    assert estimate.max_intermediate_rows is None

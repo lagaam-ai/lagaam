@@ -35,6 +35,23 @@ _HINTS: dict[str, str] = {
         "The engine refused access to a table or column. Query only what you "
         "are permitted to; call list_catalogs to see your access."
     ),
+    # Valid SQL the engine cannot plan — retrying it unchanged never works.
+    "NOT_SUPPORTED": (
+        "The engine parsed the query but cannot run this construct. Rewrite "
+        "it a simpler way — flatten a correlated subquery into a join, or "
+        "compute the inner result as a separate query — then retry."
+    ),
+    "FUNCTION_NOT_FOUND": (
+        "A function in the query does not exist in this engine. Check the "
+        "dialect card for the equivalent function name, then retry."
+    ),
+    # The planner gave up before the query ever ran, so retrying it unchanged
+    # only spends the same time again.
+    "OPTIMIZER_TIMEOUT": (
+        "The engine could not finish planning this query. It is too complex "
+        "to optimise — reduce the number of joins or CTEs, or split it into "
+        "separate queries — then retry."
+    ),
 }
 
 _GENERIC = (

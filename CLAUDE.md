@@ -20,8 +20,11 @@ Two halves:
 - Hexagonal core: `QueryEngine` interface (port) + adapters. Trino adapter
   first; native Pinot adapter second (v0.2). Core never imports engine SDKs.
 - Token cost = METER: cumulative counting, enforced at the LLM proxy.
-- Query cost = QUOTATION: predicted pre-execution via EXPLAIN + heuristics,
-  enforced inside the MCP server before running anything.
+- Query cost = QUOTATION: predicted pre-execution from the engine's own plan
+  (bytes from EXPLAIN TYPE IO, widest-operator rows from EXPLAIN TYPE
+  LOGICAL), enforced inside the MCP server before running anything. Cardinality
+  is read from the plan, never inferred from SQL shape — see docs/adr/0004.
+  Row generators are the one exception the planner cannot see (docs/adr/0006).
 - Enforcement lives at the gates (proxy, MCP server). NEVER inside the agent
   pod — the pod is semi-trusted (prompt injection risk).
 - Identity is the handshake: control plane issues agent identity; MCP server
@@ -53,6 +56,13 @@ docs/      vision.md, architecture.md, roadmap.md
 ```
 
 ## Conventions
+- **Mutation testing must never edit the shared working tree.** Run it in a
+  throwaway `git worktree`, or guard mutate/restore with a shell `trap` so an
+  interrupted run cannot leave a disabled guard on disk. An in-place `cp`
+  restore has already failed once: the run died mid-mutation, left
+  `_MAX_BRACKET_DEPTH` disabled, raced a concurrent session, and orphaned two
+  pytest processes that pinned a CPU core each for five hours. The safety
+  caps are pinned by value in the tests so a stale mutation fails loudly.
 - Tests required for core/ logic (pytest). Adapters get integration tests
   against dockerized engines.
 - Conventional commits (feat:, fix:, docs:, chore:), atomic: one logical

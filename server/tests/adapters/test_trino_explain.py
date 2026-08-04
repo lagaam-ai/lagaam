@@ -7,7 +7,7 @@ confidence rather than throwing or inventing a number.
 
 import json
 
-from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 
 # Trimmed but real shape of EXPLAIN (TYPE IO, FORMAT JSON) on Trino 476.
 _IO_WITH_STATS = json.dumps(
@@ -101,12 +101,14 @@ def test_empty_or_malformed_json_fails_safe() -> None:
     assert parse_io_estimate("not json").confidence == "low"
 
 
-def test_no_input_tables_is_low_confidence_not_a_crash() -> None:
-    # SELECT 1 scans nothing; low confidence is the safe read, and it must
-    # not throw. (Real Trino emits inputTableColumnInfos: [].)
+def test_a_query_touching_no_table_is_free_not_unpriceable() -> None:
+    # SELECT 1 and UNNEST over a local array scan nothing, and Trino emits
+    # inputTableColumnInfos: []. Blocking them as un-estimable denied queries
+    # that cannot exceed a scan budget by construction.
     est = parse_io_estimate(json.dumps({"inputTableColumnInfos": []}))
-    assert est.confidence == "low"
-    assert est.scanned_bytes is None
+    assert est.confidence == "high"
+    assert est.scanned_bytes == 0
+    assert est.row_estimate == 0
 
 
 def test_infinity_is_rejected_not_summed_into_a_giant_number() -> None:
@@ -124,10 +126,10 @@ def test_infinity_is_rejected_not_summed_into_a_giant_number() -> None:
         assert parse_io_estimate(payload).confidence == "low"
 
 
-def test_columnless_scan_is_not_quoted_as_zero_bytes() -> None:
-    # count(*) / SELECT 1 project no columns: Trino reports 0 bytes for a full
-    # scan of 1.5M rows. A 0-byte high-confidence quote would let an expensive
-    # aggregate slip past the budget — must degrade to low.
+def test_columnless_scan_is_priced_from_its_rows() -> None:
+    # count(*) projects no columns, so Trino reports 0 bytes over real rows.
+    # Quoting that as free would clear any budget; blocking it outright would
+    # deny a query no rewrite can fix. Price it from the row count instead.
     payload = json.dumps(
         {
             "inputTableColumnInfos": [
@@ -137,12 +139,15 @@ def test_columnless_scan_is_not_quoted_as_zero_bytes() -> None:
         }
     )
     est = parse_io_estimate(payload)
-    assert est.confidence == "low"
-    assert est.scanned_bytes is None
+    assert est.confidence == "high"
+    assert est.scanned_bytes == 1_500_000
+    assert est.row_estimate == 1_500_000
 
 
-def test_genuinely_empty_scan_stays_trustworthy() -> None:
-    # 0 rows AND 0 bytes is an honest empty result, not a hidden scan.
+def test_zero_bytes_is_never_trustworthy() -> None:
+    # 0 rows AND 0 bytes reads as an honest empty table, but a stats-less
+    # connector reports the same shape for a full scan. Blocking a truly
+    # empty table is recoverable; clearing an unpriced scan is not.
     payload = json.dumps(
         {
             "inputTableColumnInfos": [
@@ -151,8 +156,8 @@ def test_genuinely_empty_scan_stays_trustworthy() -> None:
         }
     )
     est = parse_io_estimate(payload)
-    assert est.confidence == "high"
-    assert est.scanned_bytes == 0
+    assert est.confidence == "low"
+    assert est.scanned_bytes is None
 
 
 def test_negative_size_is_rejected() -> None:
@@ -165,3 +170,53 @@ def test_negative_size_is_rejected() -> None:
         }
     )
     assert parse_io_estimate(payload).confidence == "low"
+
+
+def test_null_estimate_member_fails_safe() -> None:
+    # A JSON null is valid JSON with the key present, so it survives the
+    # KeyError guard — .get() returns None, not the default.
+    payload = json.dumps({"inputTableColumnInfos": [{"estimate": None}]})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
+    assert est.scanned_bytes is None
+
+
+def test_null_table_list_fails_safe() -> None:
+    payload = json.dumps({"inputTableColumnInfos": None})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
+
+
+def test_non_dict_table_list_fails_safe() -> None:
+    payload = json.dumps({"inputTableColumnInfos": "not a list"})
+    est = parse_io_estimate(payload)
+    assert est.confidence == "low"
+
+
+def test_plan_entry_counts_reads_the_table_identity() -> None:
+    payload = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {"outputRowCount": 1.0, "outputSizeInBytes": 1.0},
+                },
+                {
+                    "table": {
+                        "catalog": "TPCH",
+                        "schemaTable": {"schema": "TINY", "table": "ORDERS"},
+                    },
+                    "estimate": {"outputRowCount": 1.0, "outputSizeInBytes": 1.0},
+                },
+            ]
+        }
+    )
+    assert plan_entry_counts(payload) == {"tpch.tiny.orders": 2}
+
+
+def test_plan_entry_counts_of_a_malformed_plan_is_empty() -> None:
+    assert plan_entry_counts("not json") == {}
+    assert plan_entry_counts(json.dumps({"inputTableColumnInfos": None})) == {}

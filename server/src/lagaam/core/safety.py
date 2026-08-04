@@ -8,6 +8,8 @@ This is parse-level safety, not authorization — table permissions (U7) and
 engine-side access control remain the real enforcement layers.
 """
 
+import re
+
 import sqlglot
 from sqlglot import exp
 
@@ -25,7 +27,109 @@ _DENY_NODES = (
     exp.TruncateTable,
     exp.Grant,
     exp.Command,
+    # Parses under a Select, but the Trino generator emits CREATE TABLE AS.
+    exp.Into,
 )
+
+
+# Bounds measured against sqlglot 30.12 and reasoned about in docs/adr/0007.
+_MAX_SQL_CHARS = 200_000
+
+# Tightest of the three: nested ARRAY[...] already costs 0.76s at depth 15.
+_MAX_BRACKET_DEPTH = 12
+
+# sqlglot's generator recurses per AST level; rendering raises around 263.
+_MAX_NESTING_DEPTH = 100
+
+_GROUPING_LIMIT = re.compile(
+    r"(GROUP\s+BY\s+(?:ROLLUP|CUBE|GROUPING\s+SETS)\b.*?)\s+(LIMIT\s+\d+)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+_OPENERS = frozenset("([")
+_CLOSERS = frozenset(")]")
+
+
+def _bracket_depth(sql: str) -> int:
+    """Deepest nesting of ``(``/``)``/``[``/``]`` in the raw text.
+
+    Runs before parsing, since sqlglot's recursive-descent parser can blow
+    the stack on nesting depth alone — a RecursionError the parser raises
+    itself, which no post-parse check can catch. Both parens and square
+    brackets feed that recursion (ARRAY[...] nests exactly like a function
+    call), so both count toward one combined depth, matching what the
+    parser's own call stack tracks. A delimiter inside a string literal or a
+    quoted identifier is data, not nesting, so quoting is tracked and those
+    characters are skipped.
+    """
+    depth = 0
+    peak = 0
+    quote: str | None = None
+    i = 0
+    length = len(sql)
+    while i < length:
+        char = sql[i]
+        if quote is not None:
+            if char == quote:
+                # A doubled quote ('' or "") is an escaped quote, still inside the literal.
+                if i + 1 < length and sql[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+        if char in ("'", '"'):
+            quote = char
+        elif char in _OPENERS:
+            depth += 1
+            peak = max(peak, depth)
+        elif char in _CLOSERS:
+            depth -= 1
+        i += 1
+    return peak
+
+
+def _too_deeply_nested(tree: exp.Expr) -> bool:
+    """True if the AST nests past what the SQL generator can render.
+
+    Iterative by construction: a recursive depth check would raise the very
+    RecursionError it exists to prevent.
+    """
+    stack = [(tree, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > _MAX_NESTING_DEPTH:
+            return True
+        for child in node.args.values():
+            for item in child if isinstance(child, list) else [child]:
+                if isinstance(item, exp.Expr):
+                    stack.append((item, depth + 1))
+    return False
+
+
+def _parse_statements(sql: str, dialect: str) -> list[exp.Expr | None]:
+    """Parse the agent's SQL, working around one parser gap.
+
+    sqlglot 30.12 and 30.13 cannot read a LIMIT directly after GROUP BY
+    ROLLUP/CUBE/GROUPING SETS, though Trino runs it. Rejecting it would deny
+    a core BI shape over a parser bug, so the LIMIT is re-attached to the
+    tree after parsing the query without it. Only that exact tail is touched,
+    and only after the unmodified SQL has already failed.
+    """
+    try:
+        return list(sqlglot.parse(sql, dialect=dialect))
+    except sqlglot.errors.ParseError:
+        match = _GROUPING_LIMIT.search(sql)
+        if match is None:
+            raise
+        statements = list(sqlglot.parse(sql[: match.end(1)], dialect=dialect))
+        rows = int(re.sub(r"\D", "", match.group(2)))
+        tail = statements[-1] if statements else None
+        if not isinstance(tail, exp.Query):
+            raise
+        statements[-1] = tail.limit(rows)
+        return statements
 
 
 def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
@@ -36,8 +140,20 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     the tree, and ``*`` projections. Injects ``LIMIT default_limit`` when
     the outer query has none.
     """
+    if len(sql) > _MAX_SQL_CHARS:
+        raise SqlValidationError(
+            f"The SQL is {len(sql):,} characters, over the "
+            f"{_MAX_SQL_CHARS:,} this server parses. Select fewer columns, "
+            "shorten any IN list, or split the query."
+        )
+    if _bracket_depth(sql) > _MAX_BRACKET_DEPTH:
+        raise SqlValidationError(
+            "The SQL is nested too deeply for this server to process safely. "
+            "Flatten the subqueries — most nesting can be replaced by a CTE "
+            "or a join — and retry."
+        )
     try:
-        statements = sqlglot.parse(sql, dialect=dialect)
+        statements = _parse_statements(sql, dialect)
     except sqlglot.errors.ParseError as errs:
         first = errs.errors[0] if errs.errors else {}
         where = f" (line {first.get('line')}, col {first.get('col')})" if first else ""
@@ -63,6 +179,12 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
         raise SqlValidationError(
             "This tool is read-only: only SELECT queries are allowed. "
             "Use the metadata tools for catalogs and schemas."
+        )
+    if _too_deeply_nested(tree):
+        raise SqlValidationError(
+            "The SQL is nested too deeply for this server to process safely. "
+            "Flatten the subqueries — most nesting can be replaced by a CTE "
+            "or a join — and retry."
         )
     denied = tree.find(*_DENY_NODES)
     if denied is not None:
@@ -94,4 +216,85 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     if tree.args.get("limit") is None:
         tree = tree.limit(default_limit)
 
-    return tree.sql(dialect=dialect)
+    # Comments carry nothing the engine needs, and kilobytes of them are how
+    # an agent pushes the real query out of a truncated audit line.
+    rendered = tree.sql(dialect=dialect, comments=False)
+    return _reparseable(rendered, tree, dialect)
+
+
+def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
+    """The validated SQL in a form the parser can read back.
+
+    Every downstream gate re-parses this string and denies what it cannot
+    read, so a shape sqlglot emits but cannot re-read is a shape the server
+    refuses outright. sqlglot 30.12 and 30.13 cannot parse a LIMIT directly
+    after GROUP BY ROLLUP/CUBE/GROUPING SETS — which is ordinary BI SQL, not
+    an attack — so the LIMIT moves outside a wrapper the parser accepts.
+    """
+    try:
+        reread = sqlglot.parse_one(rendered, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        pass
+    else:
+        _deny_writes(reread)
+        return _within_char_cap(rendered)
+
+    limit = tree.args.get("limit")
+    if limit is None or not isinstance(tree, exp.Query):
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        )
+    inner = tree.copy()
+    inner.set("limit", None)
+    wrapped = (
+        exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(limit.expression)
+    )
+    rendered = wrapped.sql(dialect=dialect, comments=False)
+    try:
+        reread = sqlglot.parse_one(rendered, dialect=dialect)
+    except sqlglot.errors.SqlglotError:
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        ) from None
+    _deny_writes(reread)
+    return _within_char_cap(rendered)
+
+
+def _within_char_cap(rendered: str) -> str:
+    """The rendered SQL, if it still fits what this server vouches for.
+
+    Rendering expands SQL — measured 1.33x on a wide coalesce — so checking
+    only the input let a 198,043-character query leave as 264,053, which is
+    the string the engine runs and the audit line records.
+    """
+    if len(rendered) > _MAX_SQL_CHARS:
+        raise SqlValidationError(
+            f"The SQL expands to {len(rendered):,} characters, over the "
+            f"{_MAX_SQL_CHARS:,} this server parses. Select fewer columns, "
+            "shorten any IN list, or split the query."
+        )
+    return rendered
+
+
+def _deny_writes(tree: exp.Expr) -> None:
+    """Judge the rendered SQL, since that is what the engine will run.
+
+    SELECT .. INTO parses as a Select and passes every check on the input
+    tree, then renders as CREATE TABLE .. AS SELECT — which Trino executes
+    during EXPLAIN, upstream of the budget gate. Judging only the tree we
+    parsed leaves the guarantee to the generator; judging what we emit keeps
+    "the SQL that executes is the SQL that was judged" true by construction.
+    """
+    if not isinstance(tree, exp.Query):
+        raise SqlValidationError(
+            "This tool is read-only: only SELECT queries are allowed. "
+            "Use the metadata tools for catalogs and schemas."
+        )
+    denied = tree.find(*_DENY_NODES)
+    if denied is not None:
+        raise SqlValidationError(
+            "This tool is read-only: write/DDL constructs are not allowed "
+            f"(found {denied.key.upper()}). Send a plain SELECT query."
+        )

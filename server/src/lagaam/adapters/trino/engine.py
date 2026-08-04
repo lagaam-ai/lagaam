@@ -13,7 +13,9 @@ import trino.dbapi
 import trino.exceptions
 
 from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
-from lagaam.adapters.trino.explain import parse_io_estimate
+from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
+from lagaam.adapters.trino.numbers import finite_number
+from lagaam.adapters.trino.plan import max_intermediate_rows
 from lagaam.core.errors import (
     EngineError,
     LagaamError,
@@ -22,7 +24,11 @@ from lagaam.core.errors import (
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
-from lagaam.core.scans import has_repeated_scan
+from lagaam.core.scans import (
+    has_unpriceable_shape,
+    scan_counts_saturated,
+    table_scan_counts,
+)
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
@@ -40,10 +46,76 @@ _NOT_FOUND_ERRORS = {"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}
 _HIDDEN_SCHEMAS = {"information_schema"}
 
 
+# trino.exceptions.HttpError derives from Exception, not from Error, so it
+# escapes an `except Error` — and it is what a coordinator restart, an LB, or
+# expired auth raises.
+_ENGINE_FAILURES = (trino.exceptions.Error, trino.exceptions.HttpError, OSError)
+
+
+_UNREACHABLE = "the query engine is not reachable right now"
+
+# Planning is attacker-reachable work: a 722-char self-referencing CTE chain
+# measured 32s of coordinator time on Trino 476, quadrupling per two links,
+# while passing every parse-time guard in milliseconds. The gate waits for
+# EXPLAIN, so an uncapped plan is how the enforcement point itself goes down.
+# The cap has to be iterative_optimizer_timeout: measured on Trino 476, the
+# 32s plan finished untouched under both query_max_run_time and
+# query_max_planning_time, because the work is the optimizer's own iteration.
+# 10s is ~110x the worst legitimate plan measured (TPC-H Q21 at sf1, 0.09s)
+# and well under the 32s the chain needs, so it kills the attack without
+# coming near real work.
+_PLAN_TIMEOUT = {"iterative_optimizer_timeout": "10s"}
+
+
 def _detail(exc: Exception) -> str:
     """Agent-safe failure text: exc.message, never str(exc), which leaks
-    the query id."""
-    return getattr(exc, "message", None) or str(exc)
+    the query id.
+
+    Vouching for a message the engine composed is safe; vouching for every
+    class not on a denylist is not. Transport and auth failures are Error
+    subclasses carrying no message, so str(exc) named the coordinator's host
+    and any token in the auth text — the leak the denylist meant to prevent.
+    """
+    message = getattr(exc, "message", None)
+    if isinstance(message, str) and message:
+        return message
+    return _UNREACHABLE
+
+
+def _collapse_factor(sql_counts: dict[str, int], plan_counts: dict[str, int]) -> int:
+    """How many scans the plan folded into one entry, at worst.
+
+    The plan folds repeated reads of a table together — measured on Trino 476,
+    a 3-way self-join and a 4-times-referenced CTE each report one entry while
+    processing 3x and 4x the rows. Only the shortfall between what the SQL
+    reads and what the plan reported needs making up.
+
+    Rounded up: 3 references over 2 entries is a real 1.5x shortfall, and
+    floor division would discard it as no shortfall at all.
+    """
+    factors = [
+        -(-count // plan_counts[table])
+        for table, count in sql_counts.items()
+        if plan_counts.get(table)
+    ]
+    return max(factors, default=1)
+
+
+def _scaled(estimate: CostEstimate, factor: int) -> CostEstimate:
+    """Charge a quote for every scan the plan collapsed into one entry."""
+    if factor <= 1 or estimate.confidence == "low":
+        return estimate
+    return CostEstimate(
+        scanned_bytes=(
+            None
+            if estimate.scanned_bytes is None
+            else estimate.scanned_bytes * factor
+        ),
+        row_estimate=(
+            None if estimate.row_estimate is None else estimate.row_estimate * factor
+        ),
+        confidence=estimate.confidence,
+    )
 
 
 def _translate_error(exc: Exception) -> LagaamError:
@@ -86,7 +158,7 @@ class TrinoEngine:
     async def list_catalogs(self) -> CatalogMetadata:
         try:
             return await anyio.to_thread.run_sync(self._list_catalogs)
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise EngineError(_detail(exc)) from exc
 
     async def describe_table(
@@ -96,7 +168,7 @@ class TrinoEngine:
             return await anyio.to_thread.run_sync(
                 self._describe_table, catalog, schema, table
             )
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise EngineError(_detail(exc)) from exc
 
     def dialect(self) -> DialectCard:
@@ -105,7 +177,7 @@ class TrinoEngine:
     async def estimate_cost(self, sql: str) -> CostEstimate:
         try:
             return await anyio.to_thread.run_sync(self._estimate_cost, sql)
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise _translate_error(exc) from exc
 
     async def execute(
@@ -115,7 +187,7 @@ class TrinoEngine:
             return await anyio.to_thread.run_sync(
                 self._execute, sql, max_rows, timeout_seconds
             )
-        except (trino.exceptions.Error, OSError) as exc:
+        except _ENGINE_FAILURES as exc:
             raise _translate_error(exc) from exc
 
     def _connect(
@@ -222,16 +294,51 @@ class TrinoEngine:
         )
 
     def _estimate_cost(self, sql: str) -> CostEstimate:
-        # A table scanned by several operators is billed once in the IO plan;
-        # if so, the byte sum undercounts — don't vouch for it.
-        if has_repeated_scan(sql, TRINO_DIALECT_CARD.sqlglot_dialect):
+        dialect = TRINO_DIALECT_CARD.sqlglot_dialect
+        # Product joins and row generators break the byte sum in ways no
+        # scaling can repair — don't vouch for a quote at all.
+        if has_unpriceable_shape(sql, dialect):
+            return CostEstimate(confidence="low")
+        # A count that hit its walk budget under-reports the reads the plan
+        # folded together, and the byte quote is scaled by that count — so a
+        # saturated walk quotes the query cheaper the more it actually reads.
+        if scan_counts_saturated(sql, dialect):
             return CostEstimate(confidence="low")
         # TYPE IO plans the query without running it; NEVER use ANALYZE here.
-        with self._connect() as conn:
+        with self._connect(_PLAN_TIMEOUT) as conn:
             cur = conn.cursor()
             cur.execute(f"EXPLAIN (TYPE IO, FORMAT JSON) {sql}")
-            io_json = cur.fetchone()[0]
-        return parse_io_estimate(io_json)
+            row = cur.fetchone()
+        # A cancelled or degenerate plan returns no row; that is no quote, not
+        # a crash, and no quote fails safe at the gate.
+        if row is None:
+            return CostEstimate(confidence="low")
+        io_json = row[0]
+        factor = _collapse_factor(
+            table_scan_counts(sql, dialect), plan_entry_counts(io_json)
+        )
+        estimate = _scaled(parse_io_estimate(io_json), factor)
+        widest = self._widest_rows(sql)
+        if widest is None:
+            return estimate
+        return estimate.model_copy(update={"max_intermediate_rows": round(widest)})
+
+    def _widest_rows(self, sql: str) -> float | None:
+        """Rows the plan's widest operator would build, or None if unreadable.
+
+        A plan we cannot get is an unknown row count the budget denies on —
+        never a reason to lose a byte quote we already have.
+        """
+        try:
+            with self._connect(_PLAN_TIMEOUT) as conn:
+                cur = conn.cursor()
+                cur.execute(f"EXPLAIN (TYPE LOGICAL, FORMAT JSON) {sql}")
+                row = cur.fetchone()
+        # Best-effort enrichment of a quote that already exists: any failure
+        # here must degrade to None, never replace a working quote with a crash.
+        except Exception:
+            return None
+        return max_intermediate_rows(row[0]) if row else None
 
     @staticmethod
     def _row_estimate(cur: trino.dbapi.Cursor, quoted: str) -> int | None:
@@ -243,6 +350,10 @@ class TrinoEngine:
             return None  # views and stats-less connectors have no SHOW STATS
         for row in rows:
             # The summary row has column_name None and carries row_count.
-            if row[0] is None and row[4] is not None:
-                return round(row[4])
+            if row and row[0] is None:
+                # SHOW STATS reports row_count as a DOUBLE, and a stats-less
+                # table reports NaN — round() raises on that. A connector may
+                # also return fewer columns than Trino's own five.
+                count = finite_number(row[4]) if len(row) > 4 else None
+                return round(count) if count is not None else None
         return None
