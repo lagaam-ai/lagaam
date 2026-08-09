@@ -177,3 +177,9 @@ bracket depth 1–4 against the cap of 12; 0 of 16 realistic queries blocked.
 Measured on a fresh 55-query corpus written independently of the design:
 **2/55 = 3.6%** (previous design: 8.8%). One was the NaN-join defect above,
 now fixed; the other was sf100's missing statistics.
+
+**Caveat (added 2026-08-09):** the 55-query corpus was never committed, so
+this figure — and the 16/17 mutation score quoted in PR #15 — cannot be
+reproduced from the repository. Both stand as in-session measurements only.
+Until a corpus is committed and the run scripted, neither number belongs in
+a README, release note, or any other public claim.
