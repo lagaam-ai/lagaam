@@ -4,13 +4,14 @@ Every rejection message must tell the agent what to change — these texts
 are part of the API, like the domain errors.
 """
 
+import random
 import time
 
 import pytest
 import sqlglot
 
 from lagaam.core.errors import SqlValidationError
-from lagaam.core.safety import validate_query
+from lagaam.core.safety import _bracket_depth, validate_query
 
 
 def validate(sql: str) -> str:
@@ -196,8 +197,11 @@ def test_empty_input_rejected() -> None:
 
 
 def test_tokenizer_error_fails_closed() -> None:
-    # An unterminated literal raises TokenError, not ParseError — still ours.
-    with pytest.raises(SqlValidationError, match="could not be parsed"):
+    # An unterminated literal is now refused by the pre-parse depth scanner,
+    # which cannot trust a depth it stopped counting mid-literal. Reaching
+    # the tokenizer at all would still be ours: it raises TokenError, not
+    # ParseError, and both are caught.
+    with pytest.raises(SqlValidationError, match="unterminated"):
         validate("'''")
 
 
@@ -376,6 +380,73 @@ def test_a_moderately_nested_array_is_refused_quickly_not_left_to_hang() -> None
     with pytest.raises(SqlValidationError):
         validate_query(_nested_array(16), "trino")
     assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize(
+    ("name", "prefix"),
+    [
+        ("block comment", "/* don't */"),
+        ("line comment", "-- don't\n"),
+        ("block comment, double quote", '/* say "hi */'),
+        ("line comment, double quote", '-- say "hi\n'),
+    ],
+)
+def test_an_apostrophe_in_a_comment_does_not_hide_the_nesting(
+    name: str, prefix: str
+) -> None:
+    # One quote character inside a comment used to put the scanner in
+    # "inside a literal" state for the rest of the query, so every bracket
+    # after it was skipped and the depth read 0. Measured: this turned an
+    # instant rejection into a 5.16s accepted parse at depth 18, and 97.8s
+    # at depth 22 — before the allowlist, before any budget.
+    sql = f"SELECT {prefix} {_nested_array(44).removeprefix('SELECT ')}"
+    started = time.monotonic()
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(sql, "trino")
+    assert "nested" in str(err.value).lower()
+    assert time.monotonic() - started < 1.0
+
+
+def test_an_unterminated_quote_is_refused_rather_than_read_as_zero_depth() -> None:
+    # The scanner cannot know what it did not see the end of. Any odd count
+    # of unmatched quotes leaves it inside a literal at end of input, and the
+    # depth it reports is a floor, not the truth — so it must not be trusted.
+    with pytest.raises(SqlValidationError):
+        validate_query(f"SELECT ' {_nested_array(44).removeprefix('SELECT ')}", "trino")
+
+
+def test_a_comment_does_not_make_a_legitimate_query_unreadable() -> None:
+    # Skipping comments must not swallow the SQL around them.
+    validate_query("SELECT a /* keep */ FROM c.s.t WHERE b = 1 LIMIT 10", "trino")
+    validate_query("SELECT a -- keep\nFROM c.s.t WHERE b = 1 LIMIT 10", "trino")
+
+
+def test_a_comment_marker_inside_a_string_literal_is_still_data() -> None:
+    # The reverse of the bug: '--' and '/*' inside a literal are characters,
+    # not comment starts, so the brackets after them must still be counted.
+    with pytest.raises(SqlValidationError) as err:
+        validate_query(
+            f"SELECT '-- /*' , {_nested_array(44).removeprefix('SELECT ')}", "trino"
+        )
+    assert "nested" in str(err.value).lower()
+
+
+def test_the_scanner_never_under_reports_depth_on_mixed_text() -> None:
+    # The bug class is "raw-text scanner disagrees with the parser", and a
+    # point fix for comments does not retire it. Build text from the pieces
+    # that have fooled the scanner — comments, quotes, escaped quotes,
+    # delimiters as data — around a known nesting, and assert the scanner
+    # never reads lower than the truth. Under-reporting is the direction
+    # that lets a payload through; over-reporting only costs a rejection.
+    rng = random.Random(20260809)
+    noise = ["/* c */", "-- c\n", "'lit'", '"id"', "''''", "'-- /*'", "' ('", " "]
+    for _ in range(400):
+        real = rng.randint(1, 6)
+        chunks = [rng.choice(noise) for _ in range(rng.randint(0, 5))]
+        payload = "(" * real + "1" + ")" * real
+        chunks.insert(rng.randint(0, len(chunks)), payload)
+        sql = "SELECT " + " ".join(chunks)
+        assert _bracket_depth(sql) >= real, sql
 
 
 def test_the_depth_caps_are_the_committed_values() -> None:
