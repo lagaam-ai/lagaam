@@ -19,6 +19,8 @@ Two halves:
 ## Locked architecture decisions (do not relitigate)
 - Hexagonal core: `QueryEngine` interface (port) + adapters. Trino adapter
   first; native Pinot adapter second (v0.2). Core never imports engine SDKs.
+  `server/src/lagaam/core/` (grounding, cost guards, verification) is the IP —
+  guard its boundaries hardest.
 - Token cost = METER: cumulative counting, enforced at the LLM proxy.
 - Query cost = QUOTATION: predicted pre-execution from the engine's own plan
   (bytes from EXPLAIN TYPE IO, widest-operator rows from EXPLAIN TYPE
@@ -36,24 +38,12 @@ Two halves:
 - Monorepo. Apache 2.0. Single star magnet.
 
 ## Stack
-- Half A: Python 3.12+, FastMCP (official MCP Python SDK), sqlglot,
-  trino python client, httpx, pydantic. Package manager: uv.
+- Half A: Python 3.12+, package manager uv. Pinned deps live in
+  server/pyproject.toml — read it there, don't duplicate versions here.
 - Half B: Go + Kubebuilder (controller-runtime). Local cluster: kind.
 - Local dev: Docker Compose profiles (trino / pinot / kafka) — run only what
   the current task needs; laptop RAM is finite.
 - LLM: AWS Bedrock (Claude) primary; keep provider-agnostic via LiteLLM.
-
-## Repo layout
-```
-server/    pyproject.toml (uv project; package = src/lagaam/)
-           src/lagaam/core/ (grounding, cost guards, verification — the IP)
-           src/lagaam/adapters/trino/  src/lagaam/adapters/pinot/
-           tests/  (unit; tests/integration/ needs docker)
-operator/  api/v1alpha1/  internal/controller/   (empty until month 3)
-charts/    Helm chart
-examples/  docker-compose demos, sample Agent YAMLs
-docs/      vision.md, architecture.md, roadmap.md
-```
 
 ## Conventions
 - **Mutation testing must never edit the shared working tree.** Run it in a
@@ -64,7 +54,8 @@ docs/      vision.md, architecture.md, roadmap.md
   pytest processes that pinned a CPU core each for five hours. The safety
   caps are pinned by value in the tests so a stale mutation fails loudly.
 - Tests required for core/ logic (pytest). Adapters get integration tests
-  against dockerized engines.
+  against dockerized engines — `tests/integration/` needs docker, and the
+  default pytest run deselects it.
 - Conventional commits (feat:, fix:, docs:, chore:), atomic: one logical
   change + its tests per commit. Changes land via PR, never direct to main.
 - Inline comments: one line max, only for constraints the code can't show.
