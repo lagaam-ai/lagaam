@@ -63,7 +63,7 @@ CASES = [
         True,
     ),
     Case(
-        "self-join breaks the cost quote",
+        "self-join that doubles the scan",
         "SELECT a.orderkey FROM tpch.sf1.orders a "
         "JOIN tpch.sf1.orders b ON a.custkey = b.custkey LIMIT 10",
         True,

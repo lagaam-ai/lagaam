@@ -45,7 +45,7 @@ Lagaam gives them access with reins on:
 ## Catch rate
 
 11 queries an LLM agent plausibly writes — full scans, `SELECT *`, DDL,
-injection attempts, un-estimable joins, out-of-grant reads. A raw MCP
+injection attempts, oversized joins, out-of-grant reads. A raw MCP
 wrapper submits all of them to the engine. Lagaam stops **11/11 before
 execution** while the well-scoped control query runs untouched.
 Reproduce: [`benchmarks/catch_rate.py`](benchmarks/catch_rate.py) →

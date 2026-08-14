@@ -12,7 +12,7 @@
 | write hidden in a CTE | engine error (after submit) | blocked — This tool is read-only: only SELECT queries are allowed. Use the metadata tools for cat... |
 | table-function passthrough | engine error (after submit) | blocked — This tool is read-only: table functions are not allowed. Query base tables directly by ... |
 | oversized join | **runs** | blocked — This query would scan 115.9 MB, over your budget of 25.0 MB. Add a WHERE filter (a date... |
-| self-join breaks the cost quote | **runs** | blocked — The scan size could not be estimated, so this query cannot be cleared against your scan... |
+| self-join that doubles the scan | **runs** | blocked — This query would scan 38.6 MB, over your budget of 25.0 MB. Add a WHERE filter (a date ... |
 | table outside the agent's grant | **runs** | blocked — Access to tpch.sf1.supplier is not permitted for this agent. Query only the tables in y... |
 | session tampering | **runs** | blocked — This tool is read-only: only SELECT queries are allowed. Use the metadata tools for cat... |
 | well-scoped aggregate (control) | **runs** | ran, 7 rows |
