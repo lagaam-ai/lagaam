@@ -1,4 +1,4 @@
-# Lagaam
+![Lagaam — every query priced before it runs](docs/banner.png)
 
 **Stop your agent from running the $500 query.** Lagaam is a governed MCP
 server that sits between your AI agents and your lakehouse (Trino today,
