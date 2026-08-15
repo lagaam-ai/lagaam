@@ -115,11 +115,20 @@ def _generates_rows(tree: exp.Expr) -> bool:
     over sequence(...) or repeat(col, 10000) manufactures them from an
     argument. Anything the gate cannot recognise counts as manufacturing:
     the plan prices scans, and a generator is not one.
+
+    Bounded generators multiply where they meet: three 1000-row sequences
+    cross-joined are a billion rows, each within the per-generator cap. The
+    cap therefore binds their *product* — counted across the whole statement,
+    which overstates branches a UNION adds rather than multiplies, and the
+    overstatement fails closed.
     """
+    product = 1
     for generator in tree.find_all(*_GENERATORS):
-        if _expands_a_bounded_value(generator):
-            continue
-        return True
+        if not _expands_a_bounded_value(generator):
+            return True
+        product *= _generator_rows(generator)
+        if product > _MAX_INLINE_ROWS:
+            return True
     return False
 
 

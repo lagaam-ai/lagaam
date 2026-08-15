@@ -20,6 +20,12 @@ functions; an unrecognized function feeding a generator is assumed to
 invent rows, because a denylist would silently miss anything sqlglot parses
 as `Anonymous`.
 
+Bounded generators — a literal array or a sequence whose length is spelled
+out — are exempt individually, but their sizes multiply where they meet:
+three 1000-row sequences cross-joined are a billion rows, each inside the
+per-generator cap. The cap therefore also binds the *product* of bounded
+generator sizes across the statement.
+
 ## Consequences
 
 - A flagged query gets no quote (confidence "low"), which the budget
