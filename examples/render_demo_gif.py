@@ -67,7 +67,7 @@ def emit(img, ms):
     durations.append(ms)
 
 
-emit(frame([]), 500)
+# No blank opener: frame 1 doubles as the static preview on GitHub.
 for entry in entries:
     for kind, line in wrap(entry):
         if kind == "sql":
