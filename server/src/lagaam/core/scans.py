@@ -139,7 +139,7 @@ def _generates_rows(tree: exp.Expr) -> bool:
 
 def _generator_product(
     node: exp.Expr,
-    bodies: Mapping[str, exp.Expr | object],
+    bodies: Mapping[str, list[exp.Expr]],
     pending: frozenset[str],
     budget: list[int],
 ) -> int | None:
@@ -171,14 +171,17 @@ def _generator_product(
         if product > _MAX_INLINE_ROWS:
             return None
     for name in _cte_references(node, bodies, pending):
-        body = bodies[name]
-        if not isinstance(body, exp.Expr):
-            return None
-        budget[0] -= 1
-        nested = _generator_product(body, bodies, pending | {name}, budget)
-        if nested is None:
-            return None
-        product *= nested
+        # A name bound more than once costs whatever its dearest binding
+        # costs: scope decides which one a reference reads, and charging the
+        # cheapest is what let a decoy body hide a generator.
+        widest = 1
+        for body in bodies[name]:
+            budget[0] -= 1
+            nested = _generator_product(body, bodies, pending | {name}, budget)
+            if nested is None:
+                return None
+            widest = max(widest, nested)
+        product *= widest
         if product > _MAX_INLINE_ROWS:
             return None
     return product
@@ -193,27 +196,25 @@ def _wrapped_series(node: exp.Expr) -> list[exp.Expr]:
     ]
 
 
-_SHADOWED = object()
-
-
-def _cte_bodies(tree: exp.Expr) -> dict[str, exp.Expr | object]:
-    """Every CTE body by name, with re-used names marked unresolvable.
+def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
+    """Every body each CTE name is bound to, in definition order.
 
     A nested WITH may re-bind a name the outer query also uses, and which
-    body a reference means is scope's answer, not a dict's. Keying flatly let
-    the inner body silently replace the outer one — a decoy that hid a
-    generator behind a name still referenced outside it. Both gates read this
-    map, and both treat a shadowed name as something they cannot size.
+    body a given reference means is scope's answer, not a dict's. Keying
+    flatly let the inner body silently replace the outer one — a decoy that
+    hid a generator behind a name still referenced outside it. Keeping every
+    binding lets a reader charge for the most expensive one instead of
+    guessing, which neither under-counts the decoy shape nor refuses the
+    ordinary query that reuses a name like "base" in a nested scope.
     """
-    bodies: dict[str, exp.Expr | object] = {}
+    bodies: dict[str, list[exp.Expr]] = {}
     for cte in tree.find_all(exp.CTE):
-        name = cte.alias_or_name.lower()
-        bodies[name] = _SHADOWED if name in bodies else cte.this
+        bodies.setdefault(cte.alias_or_name.lower(), []).append(cte.this)
     return bodies
 
 
 def _cte_references(
-    node: exp.Expr, bodies: Mapping[str, exp.Expr | object], pending: frozenset[str]
+    node: exp.Expr, bodies: Mapping[str, list[exp.Expr]], pending: frozenset[str]
 ) -> list[str]:
     """CTE names this subtree reads, once per reference.
 
@@ -426,15 +427,12 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
                 # depth is the engine's business, not the quote's.
                 if name in pending:
                     continue
-                body = bodies[name]
-                # A shadowed name hides which body this reads, and the reads
-                # inside it: spend the budget so the caller denies rather
-                # than quote a count that skipped them.
-                if not isinstance(body, exp.Expr):
-                    budget[0] = 0
-                    return
-                budget[0] -= 1
-                walk(body, weight, pending | {name})
+                # A name bound more than once is counted through every body
+                # it could mean: scope decides which, and skipping the others
+                # let a decoy binding hide the reads behind the name.
+                for body in bodies[name]:
+                    budget[0] -= 1
+                    walk(body, weight, pending | {name})
                 continue
             key = ".".join(parts).lower()
             counts[key] = counts.get(key, 0) + weight

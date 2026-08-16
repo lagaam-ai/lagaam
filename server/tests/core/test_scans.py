@@ -203,14 +203,23 @@ def test_a_shadowed_cte_name_is_not_sized() -> None:
     )
 
 
-def test_a_shadowed_cte_name_saturates_the_scan_count() -> None:
+def test_a_shadowed_cte_name_still_counts_its_reads() -> None:
     # The same decoy hid the reads from the byte gate, which returned {} and
-    # scaled nothing. Saturation is what makes the caller deny.
-    assert scan_counts_saturated(
+    # scaled nothing at all.
+    assert counts(
         "WITH a AS (SELECT x FROM tpch.sf1.orders) "
         "SELECT * FROM (WITH a AS (SELECT 1 AS x) SELECT * FROM a) z "
-        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3",
-        dialect="trino",
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )["tpch.sf1.orders"] >= 3
+
+
+def test_a_name_reused_in_a_nested_scope_still_prices() -> None:
+    # Reusing "base" or "daily" in an inner scope is ordinary SQL; refusing
+    # every collision would trade one bypass for a broken product.
+    assert not unpriceable(
+        "WITH base AS (SELECT orderkey FROM tpch.sf1.orders) "
+        "SELECT * FROM (WITH base AS (SELECT custkey FROM tpch.sf1.customer) "
+        "SELECT * FROM base) z"
     )
 
 
@@ -492,8 +501,6 @@ def test_a_saturated_scan_count_is_reported_as_unpriceable() -> None:
     # DOWN — measured, a 1,471-char CTE chain counts 3,328 reads where the
     # true number is 524,288, so a 61 GiB query quotes at 3 GiB and is
     # admitted. Saturation has to deny, not discount.
-    from lagaam.core.scans import scan_counts_saturated
-
     parts = ["c0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
     for i in range(1, 20):
         parts.append(
