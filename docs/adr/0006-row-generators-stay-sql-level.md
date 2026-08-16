@@ -24,12 +24,30 @@ Bounded generators — a literal array or a sequence whose length is spelled
 out — are exempt individually, but their sizes multiply where they meet:
 three 1000-row sequences cross-joined are a billion rows, each inside the
 per-generator cap. The cap therefore also binds the *product* of bounded
-generator sizes across the statement.
+generator sizes, counted per UNION branch (branches add rows rather than
+multiply them) and once per CTE *reference* rather than once per AST node.
+
+A bounded generator joined to a table is priced rather than refused. The
+planner sizes such a join as the table alone — measured on Trino 476,
+`orders CROSS JOIN UNNEST(sequence(1, 1000))` plans as 1,500,000 rows and
+produces 1.5 billion — so `generator_fanout()` reports the multiplier and
+the adapter scales the plan's own row estimate by it. The budget then
+decides with the table's real cardinality in hand, which a flat cap cannot
+have: 744 hourly buckets is ordinary against a small table and ruinous
+against a large one.
+
+A column feeding a generator is only as bounded as whatever bound it. A
+scanned column's rows are already in the plan, but a projection can build
+one — `repeat(k, 1000000) AS arr` is a column by the time `UNNEST` reads
+it — so columns resolve through the statement's projections, and a cycle
+among them is refused rather than followed.
 
 ## Consequences
 
 - A flagged query gets no quote (confidence "low"), which the budget
-  denies with what-to-change text.
+  denies with what-to-change text. A *sized* generator keeps its quote and
+  is denied only if the scaled row count exceeds the budget, so raising
+  `LAGAAM_MAX_INTERMEDIATE_ROWS` is the lever for a wider spine.
 - The row-preserving allowlist must track Trino's array functions; an
   unknown-but-harmless function is over-blocked — the fail-safe direction.
 - If a future Trino version starts pricing generators, this check becomes

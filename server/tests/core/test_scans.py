@@ -409,6 +409,66 @@ def test_laundering_through_a_chain_of_aliases_is_refused() -> None:
     )
 
 
+def test_a_column_alias_list_does_not_launder_an_array() -> None:
+    # WITH s(arr) AS (...) binds the name on the CTE, not in an Alias node,
+    # so a projection map built only from Alias nodes never saw it.
+    assert unpriceable(
+        "WITH s(arr) AS (SELECT repeat(k, 1000000) FROM hive.s.orders) "
+        "SELECT x FROM s CROSS JOIN UNNEST(s.arr) AS q(x)"
+    )
+    assert unpriceable(
+        "SELECT x FROM (SELECT repeat(k, 1000000) FROM hive.s.orders) s(arr) "
+        "CROSS JOIN UNNEST(s.arr) AS q(x)"
+    )
+    assert unpriceable(
+        "WITH s(arr) AS (SELECT array_agg(n) FROM hive.s.t) "
+        "SELECT x FROM s CROSS JOIN UNNEST(s.arr) q(x) "
+        "CROSS JOIN UNNEST(s.arr) r(y) CROSS JOIN UNNEST(s.arr) w(z)"
+    )
+
+
+def test_forwarding_a_manufactured_array_does_not_launder_it() -> None:
+    # Re-exporting the name through another scope must not lose what built
+    # it, whether the hop renames the column or just passes it along.
+    assert unpriceable(
+        "WITH a(c) AS (SELECT repeat(k, 1000000) FROM hive.s.t), "
+        "b(arr) AS (SELECT c FROM a) "
+        "SELECT x FROM b CROSS JOIN UNNEST(b.arr) q(x)"
+    )
+    assert unpriceable(
+        "WITH s(arr) AS (SELECT repeat(k, 1000000) FROM hive.s.t), "
+        "u AS (SELECT arr FROM s) "
+        "SELECT x FROM u CROSS JOIN UNNEST(u.arr) q(x)"
+    )
+
+
+def test_an_unrelated_alias_does_not_condemn_a_scanned_column() -> None:
+    # Resolving names statement-wide made any alias poison every same-named
+    # column: UNNEST(o.items) is a column of o whatever a CTE calls its own
+    # aggregate. Both of these are ordinary analytics SQL.
+    assert not unpriceable(
+        "WITH a AS (SELECT array_agg(x) AS items FROM hive.s.t GROUP BY g) "
+        "SELECT cnt FROM a, hive.s.orders o CROSS JOIN UNNEST(o.items) q(cnt)"
+    )
+    assert not unpriceable(
+        "WITH z AS (SELECT sequence(1, 5000) AS d FROM hive.s.t) "
+        "SELECT d FROM hive.s.orders o CROSS JOIN UNNEST(o.d) q(d)"
+    )
+
+
+def test_an_alias_chain_does_not_exhaust_the_stack() -> None:
+    # Resolution followed aliases with no depth bound: 600 links in 8 KB of
+    # SQL raised RecursionError out of the gate, and validate_query passes
+    # it because the nesting is shallow. It must answer, and fail closed.
+    chain = ", ".join(
+        ["repeat(k, 5) AS a0"] + [f"a{i - 1} AS a{i}" for i in range(1, 600)]
+    )
+    assert unpriceable(
+        f"SELECT s.a599 AS out FROM (SELECT {chain} FROM hive.s.t) s "
+        "CROSS JOIN UNNEST(s.a599) AS q(x)"
+    )
+
+
 def test_unnesting_a_scanned_column_still_prices() -> None:
     # The ordinary array-column read must survive: its rows belong to a
     # table the plan already counted.

@@ -44,6 +44,10 @@ _MAX_INLINE_ROWS = 1000
 # may invent, so the exact figure beyond it buys nothing.
 _MAX_COUNTED_ROWS = 10_000_000
 
+# Aliases resolve through one another; a chain this long is not analytics, and
+# following it unbounded exhausts the interpreter's stack on 8 KB of SQL.
+_MAX_ALIAS_DEPTH = 32
+
 # Functions that reshape an array without changing how many rows it yields.
 # Anything else feeding a generator is assumed to invent rows: a denylist is
 # unsound here, because a function sqlglot does not model natively parses as
@@ -323,22 +327,106 @@ def _expands_a_bounded_value(
 
 
 def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
-    """Every expression a subquery or CTE binds a name to.
+    """Every expression a subquery or CTE binds a name to, keyed by source.
 
     A generator fed by a column is priced as the table's own rows, which is
     right for a scanned column and wrong for one a projection built:
-    repeat(k, 1000000) AS arr is a column by the time UNNEST reads it. Names
-    are collected across the statement rather than per scope, so an alias
-    reused in two subqueries is charged for either binding.
+    repeat(k, 1000000) AS arr is a column by the time UNNEST reads it.
+
+    Keys are "source.column" where the source is the CTE or derived-table
+    alias the name is visible under, plus a bare "column" fallback for an
+    unqualified reference. Keying on the column name alone made an alias
+    poison every same-named column in the statement — UNNEST(o.items) is a
+    scanned column of o whatever some unrelated CTE calls its aggregate.
+
+    Both spellings of a binding count: SELECT expr AS name, and the column
+    alias list on a CTE or derived table, which names the projections
+    positionally and carries no Alias node at all.
     """
     projections: dict[str, list[exp.Expr]] = {}
+
+    def bind(source: str | None, column: str, value: exp.Expr) -> None:
+        key = f"{source.lower()}.{column.lower()}" if source else column.lower()
+        projections.setdefault(key, []).append(value)
+
+    def bind_alias_list(alias: exp.TableAlias | None, body: exp.Expr) -> None:
+        if alias is None or not alias.columns:
+            return
+        select = body.find(exp.Select)
+        if select is None:
+            return
+        source = alias.name
+        for column, projection in zip(alias.columns, select.expressions, strict=False):
+            bind(source, column.name, projection)
+
+    for cte in tree.find_all(exp.CTE):
+        bind_alias_list(cte.args.get("alias"), cte.this)
+    for subquery in tree.find_all(exp.Subquery):
+        bind_alias_list(subquery.args.get("alias"), subquery.this)
+
     for select in tree.find_all(exp.Select):
+        source = _select_source_name(select)
         for projection in select.expressions:
             if isinstance(projection, exp.Alias):
-                projections.setdefault(projection.alias.lower(), []).append(
-                    projection.this
-                )
+                bind(source, projection.alias, projection.this)
+                bind(None, projection.alias, projection.this)
+            elif isinstance(projection, exp.Column) and source:
+                # SELECT arr FROM s re-exports the name under a new source,
+                # so the outer scope can follow it back to what built it.
+                # Binding it under its own source would only point at itself.
+                if projection.table.lower() != source.lower():
+                    bind(source, projection.name, projection)
     return projections
+
+
+def _column_key(column: exp.Column) -> str:
+    """How this reference names itself: qualified where the SQL qualifies it."""
+    source = column.table
+    name = column.name.lower()
+    return f"{source.lower()}.{name}" if source else name
+
+
+def _column_bindings(
+    column: exp.Column, projections: Mapping[str, list[exp.Expr]]
+) -> list[exp.Expr]:
+    """What a projection bound this reference to, if anything did.
+
+    A qualified reference reads only bindings visible under that source, so
+    an unrelated CTE binding the same name cannot speak for it. An
+    unqualified one has no source to check and falls back to the bare name.
+    """
+    key = _column_key(column)
+    bindings = projections.get(key)
+    if bindings is not None:
+        return bindings
+    if column.table:
+        return []
+    # Unqualified, the SQL does not say which source this reads, so every
+    # binding of the name answers for it: a projection that only forwards
+    # a name (SELECT c FROM a) would otherwise lose the array behind it.
+    # Bindings that resolve to this same reference are skipped — a name
+    # forwarded from a table is a scanned column, not a manufactured one.
+    name = column.name.lower()
+    return [
+        bound
+        for binding_key, bindings in projections.items()
+        if binding_key == name or binding_key.endswith(f".{name}")
+        for bound in bindings
+        if not (isinstance(bound, exp.Column) and _column_key(bound) == key)
+    ]
+
+
+def _select_source_name(select: exp.Select) -> str | None:
+    """The alias a SELECT's rows are visible under, if it has one."""
+    parent = select.parent
+    while parent is not None:
+        if isinstance(parent, exp.Subquery | exp.CTE):
+            alias = parent.args.get("alias")
+            return alias.name if alias is not None else None
+        if isinstance(parent, exp.Select):
+            return None
+        parent = parent.parent
+    return None
 
 
 def _is_bounded_input(
@@ -363,14 +451,15 @@ def _is_bounded_input(
         # A name a projection bound is only as bounded as what it was bound
         # to; a name nothing in the statement binds is a scanned column, whose
         # rows the plan already counted.
-        name = value.name.lower()
-        # An alias defined in terms of itself has no length to read; stopping
-        # keeps the resolution finite without vouching for the column.
-        if name in seen:
+        key = _column_key(value)
+        # An alias defined in terms of itself has no length to read, and a
+        # chain longer than any real query writes exhausts the stack: both
+        # stop here rather than vouch for the column.
+        if key in seen or len(seen) >= _MAX_ALIAS_DEPTH:
             return False
         return all(
-            _is_bounded_input(bound, projections, seen | {name})
-            for bound in projections.get(name, [])
+            _is_bounded_input(bound, projections, seen | {key})
+            for bound in _column_bindings(value, projections)
         )
     if isinstance(value, exp.GenerateSeries):
         # sequence() spells its own length out when both ends are literal, so
@@ -480,11 +569,11 @@ def _generator_rows(
         if length is not None:
             widest = max(widest, length)
     for column in generator.find_all(exp.Column):
-        name = column.name.lower()
-        if name in seen:
+        key = _column_key(column)
+        if key in seen or len(seen) >= _MAX_ALIAS_DEPTH:
             continue
-        for bound in projections.get(name, []):
-            widest = max(widest, _generator_rows(bound, projections, seen | {name}))
+        for bound in _column_bindings(column, projections):
+            widest = max(widest, _generator_rows(bound, projections, seen | {key}))
     return widest
 
 
