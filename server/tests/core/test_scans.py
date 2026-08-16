@@ -442,6 +442,38 @@ def test_forwarding_a_manufactured_array_does_not_launder_it() -> None:
     )
 
 
+def test_a_star_does_not_strip_an_array_of_its_history() -> None:
+    # SELECT * re-exports what an inner projection built without naming it,
+    # so the array reached the generator as a name nothing appeared to bind.
+    assert unpriceable(
+        "SELECT x FROM (SELECT * FROM "
+        "(SELECT repeat(k, 1000000) AS arr FROM hive.s.orders)) s "
+        "CROSS JOIN UNNEST(s.arr) AS t(x)"
+    )
+    # q.* parses as a Column named "*", not a Star node.
+    assert unpriceable(
+        "SELECT x FROM (SELECT q.* FROM "
+        "(SELECT repeat(k, 1000000) AS arr FROM hive.s.orders) q) s "
+        "CROSS JOIN UNNEST(s.arr) AS t(x)"
+    )
+    # A star over a scanned table still reads as scanned columns.
+    assert not unpriceable(
+        "SELECT t.i FROM (SELECT * FROM hive.s.orders) s "
+        "CROSS JOIN UNNEST(s.items) AS t(i)"
+    )
+
+
+def test_a_later_union_arm_inherits_the_first_arms_names() -> None:
+    # Output names come from the first arm, so an unnamed projection in a
+    # later one still reaches the outer scope — carrying its array with it.
+    assert unpriceable(
+        "SELECT x FROM (SELECT ARRAY[1] AS arr FROM hive.s.t "
+        "UNION ALL SELECT repeat(k, 1000000) FROM hive.s.orders) s "
+        "CROSS JOIN UNNEST(s.arr) AS t(x)"
+    )
+    assert not unpriceable("SELECT k FROM hive.s.a UNION ALL SELECT k FROM hive.s.b")
+
+
 def test_an_unrelated_alias_does_not_condemn_a_scanned_column() -> None:
     # Resolving names statement-wide made any alias poison every same-named
     # column: UNNEST(o.items) is a column of o whatever a CTE calls its own

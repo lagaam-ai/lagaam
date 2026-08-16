@@ -344,6 +344,7 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     positionally and carries no Alias node at all.
     """
     projections: dict[str, list[exp.Expr]] = {}
+    stars: list[tuple[str, exp.Select]] = []
 
     def bind(source: str | None, column: str, value: exp.Expr) -> None:
         key = f"{source.lower()}.{column.lower()}" if source else column.lower()
@@ -371,12 +372,49 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
                 bind(source, projection.alias, projection.this)
                 bind(None, projection.alias, projection.this)
             elif isinstance(projection, exp.Column) and source:
+                # q.* parses as a Column whose name is the star, not a Star
+                # node, so a qualified star re-exports like a bare one.
+                if projection.name == "*":
+                    stars.append((source, select))
                 # SELECT arr FROM s re-exports the name under a new source,
                 # so the outer scope can follow it back to what built it.
                 # Binding it under its own source would only point at itself.
-                if projection.table.lower() != source.lower():
+                elif projection.table.lower() != source.lower():
                     bind(source, projection.name, projection)
+            elif isinstance(projection, exp.Star) and source:
+                stars.append((source, select))
+            elif source and _positional_name(select, projection):
+                # A UNION arm names its columns by position from the first
+                # arm; an unnamed projection in a later one still reaches the
+                # outer scope under that name.
+                bind(source, _positional_name(select, projection) or "", projection)
+    # A star re-exports every name its own scope can see, so what an inner
+    # projection built passes outward unnamed. Resolving each one to the
+    # names below it keeps a manufactured array from shedding its history
+    # by being selected with *.
+    for source, select in stars:
+        for inner in select.find_all(exp.Alias):
+            bind(source, inner.alias, inner.this)
     return projections
+
+
+def _positional_name(select: exp.Select, projection: exp.Expr) -> str | None:
+    """The name a set operation gives this projection, taken from the first
+    arm, which is where SQL fixes the output column names."""
+    union = select.parent
+    if not isinstance(union, exp.Union):
+        return None
+    first = union.this.find(exp.Select) if union.this else None
+    if first is None or first is select:
+        return None
+    try:
+        position = select.expressions.index(projection)
+    except ValueError:
+        return None
+    if position >= len(first.expressions):
+        return None
+    named = first.expressions[position]
+    return named.alias_or_name or None
 
 
 def _column_key(column: exp.Column) -> str:
