@@ -484,6 +484,44 @@ def test_a_star_over_a_cte_reference_follows_it_home() -> None:
     )
 
 
+def test_a_cte_read_through_a_table_alias_keeps_its_bindings() -> None:
+    # Bindings are keyed by the CTE's own name; a reference spelled through
+    # an alias asked for z.arr, found nothing, and read as a scanned column.
+    assert unpriceable(
+        "WITH a AS (SELECT repeat(o.id, 10000000) AS arr FROM hive.s.orders o) "
+        "SELECT count(*) AS c FROM a AS z CROSS JOIN UNNEST(z.arr) AS t(x)"
+    )
+    assert unpriceable(
+        "WITH a AS (SELECT array_agg(o.id) AS arr FROM hive.s.orders o) "
+        "SELECT count(*) FROM a z CROSS JOIN UNNEST(z.arr) AS t(x)"
+    )
+    # An aliased CTE that only forwards a scanned column still prices.
+    assert not unpriceable(
+        "WITH a AS (SELECT items FROM hive.s.orders) "
+        "SELECT x FROM a AS z CROSS JOIN UNNEST(z.items) AS t(x)"
+    )
+
+
+def test_a_diamond_of_star_ctes_resolves_in_under_a_second() -> None:
+    # Each link stars over the previous one twice: following every path
+    # re-walked the same bodies 2^depth times, 5s on a 1 KB query, before
+    # the budgeted walk begins. Visiting a body once per source is enough.
+    import time
+
+    parts = ["c0 AS (SELECT repeat(k, 10) AS arr FROM hive.s.t)"]
+    parts += [
+        f"c{i} AS (SELECT * FROM c{i - 1} x JOIN c{i - 1} y ON x.arr = y.arr)"
+        for i in range(1, 20)
+    ]
+    sql = (
+        "WITH " + ", ".join(parts) + " SELECT v FROM c19 "
+        "CROSS JOIN UNNEST(c19.arr) AS q(v)"
+    )
+    start = time.perf_counter()
+    unpriceable(sql)
+    assert time.perf_counter() - start < 1.0
+
+
 def test_a_later_union_arm_inherits_the_first_arms_names() -> None:
     # Output names come from the first arm, so an unnamed projection in a
     # later one still reaches the outer scope — carrying its array with it.

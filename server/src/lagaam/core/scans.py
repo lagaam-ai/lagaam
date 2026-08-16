@@ -398,20 +398,42 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
         cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)
     }
 
-    def bind_star(source: str, select: exp.Select, seen: frozenset[str]) -> None:
+    # A body reached twice binds the same names both times, so visiting it
+    # once per source is enough: without this a diamond of star CTEs walks
+    # every path, and 1 KB of SQL costs seconds before the budgeted walk.
+    visited: set[tuple[str, int]] = set()
+
+    def bind_star(source: str, select: exp.Select) -> None:
+        if (source, id(select)) in visited:
+            return
+        visited.add((source, id(select)))
         for inner in select.find_all(exp.Alias):
             bind(source, inner.alias, inner.this)
         for table in select.find_all(exp.Table):
             parts = [part.name for part in table.parts]
             name = parts[0].lower()
-            if len(parts) > 1 or name not in cte_bodies or name in seen:
+            if len(parts) > 1 or name not in cte_bodies:
                 continue
             body = cte_bodies[name].find(exp.Select)
             if body is not None:
-                bind_star(source, body, seen | {name})
+                bind_star(source, body)
 
     for source, select in stars:
-        bind_star(source, select, frozenset())
+        bind_star(source, select)
+
+    # A CTE read through a table alias — FROM a AS z — asks for z.arr, while
+    # the binding was recorded under the CTE's own name. Re-binding each
+    # alias keeps the array from shedding its history by being renamed.
+    for table in tree.find_all(exp.Table):
+        parts = [part.name for part in table.parts]
+        name = parts[0].lower()
+        alias = table.alias.lower()
+        if len(parts) > 1 or not alias or alias == name:
+            continue
+        for key, values in list(projections.items()):
+            if key.startswith(f"{name}."):
+                for value in values:
+                    bind(alias, key.split(".", 1)[1], value)
     return projections
 
 
