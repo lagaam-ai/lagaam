@@ -502,6 +502,63 @@ def test_a_cte_read_through_a_table_alias_keeps_its_bindings() -> None:
     )
 
 
+def test_an_alias_does_not_speak_for_an_unrelated_relation() -> None:
+    # Copying a CTE's bindings onto every same-named alias in the statement
+    # merged relations that share nothing: orders AS o and daily AS o are
+    # different tables, and the aggregate's binding condemned the scan.
+    assert not unpriceable(
+        "WITH daily AS (SELECT d, array_agg(sku) AS items FROM hive.s.sales "
+        "GROUP BY d) "
+        "SELECT s FROM hive.s.orders AS o CROSS JOIN UNNEST(o.items) AS q(s) "
+        "UNION ALL SELECT cardinality(x.items) FROM daily AS o CROSS JOIN daily x"
+    )
+    # A CTE read through an alias must not become unpriceable for it.
+    assert not unpriceable(
+        "WITH daily AS (SELECT d, items FROM hive.s.sales) "
+        "SELECT s FROM daily AS o CROSS JOIN UNNEST(o.items) AS q(s)"
+    )
+    # Forwarding a scanned array down a pipeline revisits names without
+    # building anything: that is a column a table supplies, not a cycle
+    # with a length nobody can read.
+    assert not unpriceable(
+        "WITH daily AS (SELECT d, items FROM hive.s.sales), "
+        "enriched AS (SELECT o.d, o.items FROM daily AS o) "
+        "SELECT e.d, s FROM enriched AS e CROSS JOIN UNNEST(e.items) AS q(s)"
+    )
+
+
+def test_a_values_row_binds_its_column_alias_list() -> None:
+    # VALUES carries its own TableAlias, so a manufactured array named there
+    # reached UNNEST as a name nothing appeared to bind.
+    assert unpriceable(
+        "SELECT x FROM hive.s.t CROSS JOIN (VALUES (repeat(1, 10000))) AS v(arr) "
+        "CROSS JOIN UNNEST(v.arr) AS q(x)"
+    )
+    assert unpriceable(
+        "SELECT x FROM (VALUES (repeat(1, 10000000))) AS v(arr) "
+        "CROSS JOIN UNNEST(v.arr) AS q(x)"
+    )
+    # A literal row spelled out inline is still a lookup table.
+    assert not unpriceable(
+        "SELECT x FROM hive.s.t CROSS JOIN (VALUES (ARRAY[1, 2])) AS v(arr) "
+        "CROSS JOIN UNNEST(v.arr) AS q(x)"
+    )
+
+
+def test_a_wide_query_of_aliases_resolves_in_under_a_second() -> None:
+    # Copying every binding onto every alias was quadratic in query width:
+    # 600 aliases over 600 bindings cost 9.9s in 17 KB, before the budgeted
+    # walk and before any engine call.
+    import time
+
+    binds = ", ".join(f"c{j} b{j}" for j in range(600))
+    refs = " ".join(f"CROSS JOIN a z{i}" for i in range(600))
+    sql = f"WITH a AS (SELECT {binds} FROM hive.s.t) SELECT 1 FROM a z {refs}"
+    start = time.perf_counter()
+    unpriceable(sql)
+    assert time.perf_counter() - start < 1.0
+
+
 def test_a_diamond_of_star_ctes_resolves_in_under_a_second() -> None:
     # Each link stars over the previous one twice: following every path
     # re-walked the same bodies 2^depth times, 5s on a 1 KB query, before

@@ -344,11 +344,16 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     positionally and carries no Alias node at all.
     """
     projections: dict[str, list[exp.Expr]] = {}
+    bound_columns: dict[str, dict[str, list[exp.Expr]]] = {}
     stars: list[tuple[str, exp.Select]] = []
 
     def bind(source: str | None, column: str, value: exp.Expr) -> None:
         key = f"{source.lower()}.{column.lower()}" if source else column.lower()
         projections.setdefault(key, []).append(value)
+        if source:
+            bound_columns.setdefault(source.lower(), {}).setdefault(
+                column.lower(), []
+            ).append(value)
 
     def bind_alias_list(alias: exp.TableAlias | None, body: exp.Expr) -> None:
         if alias is None or not alias.columns:
@@ -364,6 +369,16 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
         bind_alias_list(cte.args.get("alias"), cte.this)
     for subquery in tree.find_all(exp.Subquery):
         bind_alias_list(subquery.args.get("alias"), subquery.this)
+    # VALUES holds its own alias and column list, and its row is a projection
+    # like any other: (VALUES (repeat(1, 10000))) AS v(arr) builds an array.
+    for values in tree.find_all(exp.Values):
+        alias = values.args.get("alias")
+        if alias is None or not alias.columns:
+            continue
+        for row in values.expressions:
+            items = row.expressions if isinstance(row, exp.Tuple) else [row]
+            for column, item in zip(alias.columns, items, strict=False):
+                bind(alias.name, column.name, item)
 
     for select in tree.find_all(exp.Select):
         source = _select_source_name(select)
@@ -421,20 +436,44 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     for source, select in stars:
         bind_star(source, select)
 
-    # A CTE read through a table alias — FROM a AS z — asks for z.arr, while
-    # the binding was recorded under the CTE's own name. Re-binding each
-    # alias keeps the array from shedding its history by being renamed.
+    # FROM a AS z asks for z.arr while the binding sits under the CTE's own
+    # name. Only aliases that name exactly one CTE resolve: an alias used for
+    # two relations, or one that shadows a real table, means more than a name
+    # can say, and guessing merged unrelated scans with an aggregate's array.
+    for alias, name in _alias_sources(tree).items():
+        for column, bound in bound_columns.get(name, {}).items():
+            projections.setdefault(f"{alias}.{column}", []).extend(bound)
+    return projections
+
+
+def _alias_sources(tree: exp.Expr) -> dict[str, str]:
+    """Which CTE each table alias reads, for aliases that name exactly one.
+
+    FROM a AS z asks for z.arr while the binding was recorded under the CTE's
+    own name, so the alias needs resolving. Copying the bindings themselves
+    was both quadratic in query width and blind to scope — it merged every
+    relation sharing an alias letter. An alias used for two different CTEs
+    resolves to neither: which one a reference means is more than a name can
+    say, and guessing is what condemned unrelated scans.
+    """
+    cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    sources: dict[str, str] = {}
+    ambiguous: set[str] = set()
     for table in tree.find_all(exp.Table):
         parts = [part.name for part in table.parts]
         name = parts[0].lower()
         alias = table.alias.lower()
-        if len(parts) > 1 or not alias or alias == name:
+        if len(parts) > 1 or not alias or alias == name or name not in cte_names:
+            # An alias over a real table shadows any CTE of that name: the
+            # columns it carries are that table's, and the plan counts them.
+            if alias and (len(parts) > 1 or name not in cte_names):
+                ambiguous.add(alias)
             continue
-        for key, values in list(projections.items()):
-            if key.startswith(f"{name}."):
-                for value in values:
-                    bind(alias, key.split(".", 1)[1], value)
-    return projections
+        if sources.setdefault(alias, name) != name:
+            ambiguous.add(alias)
+    return {
+        alias: name for alias, name in sources.items() if alias not in ambiguous
+    }
 
 
 def _positional_name(select: exp.Select, projection: exp.Expr) -> str | None:
@@ -464,7 +503,8 @@ def _column_key(column: exp.Column) -> str:
 
 
 def _column_bindings(
-    column: exp.Column, projections: Mapping[str, list[exp.Expr]]
+    column: exp.Column,
+    projections: Mapping[str, list[exp.Expr]],
 ) -> list[exp.Expr]:
     """What a projection bound this reference to, if anything did.
 
@@ -529,14 +569,20 @@ def _is_bounded_input(
         # to; a name nothing in the statement binds is a scanned column, whose
         # rows the plan already counted.
         key = _column_key(value)
-        # An alias defined in terms of itself has no length to read, and a
-        # chain longer than any real query writes exhausts the stack: both
-        # stop here rather than vouch for the column.
-        if key in seen or len(seen) >= _MAX_ALIAS_DEPTH:
+        # A chain longer than any real query writes exhausts the stack, so it
+        # stops here rather than vouch for the column.
+        if len(seen) >= _MAX_ALIAS_DEPTH:
             return False
+        bindings = _column_bindings(value, projections)
+        if key in seen:
+            # A name reached twice through nothing but other names is a
+            # column some table supplies: a pipeline of CTEs forwarding an
+            # array column revisits names without building anything. A cycle
+            # that passes through an expression has a length nobody reads.
+            return all(isinstance(bound, exp.Column) for bound in bindings)
         return all(
             _is_bounded_input(bound, projections, seen | {key})
-            for bound in _column_bindings(value, projections)
+            for bound in bindings
         )
     if isinstance(value, exp.GenerateSeries):
         # sequence() spells its own length out when both ends are literal, so
