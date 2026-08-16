@@ -148,6 +148,40 @@ def test_the_generator_product_cap_is_the_committed_value() -> None:
     assert unpriceable(base.format(items="'x', 'y', 'z'"))
 
 
+def test_a_cte_aliased_generator_multiplies_per_reference() -> None:
+    # find_all sees one generator node; the query cross-joins it three times
+    # for a billion rows. Counting nodes instead of reads was the bypass.
+    generator = "WITH g AS (SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)) "
+    assert unpriceable(
+        generator + "SELECT a.n FROM g a CROSS JOIN g b CROSS JOIN g c"
+    )
+    # One reference is the same 1000 rows the per-generator cap already allows.
+    assert not unpriceable(generator + "SELECT n FROM g")
+
+
+def test_a_bare_series_in_a_table_position_is_a_generator() -> None:
+    # sequence() manufactures rows with or without an UNNEST around it;
+    # guarding only the wrapper left the same series free in FROM.
+    assert unpriceable("SELECT n FROM generate_series(1, 1000000000) AS t(n)")
+    assert unpriceable("SELECT n FROM TABLE(sequence(1, 1000000)) AS t(n)")
+    assert unpriceable(
+        "SELECT o.k, t.n FROM hive.s.orders o "
+        "CROSS JOIN generate_series(1, 1000000) AS t(n)"
+    )
+
+
+def test_a_bare_series_counts_toward_the_product() -> None:
+    # Mixed shapes: an unwrapped series must multiply like a wrapped one.
+    assert unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 40)) AS a(n) "
+        "CROSS JOIN generate_series(1, 1000000) AS t(n)"
+    )
+    assert not unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 10)) AS a(n) "
+        "CROSS JOIN generate_series(1, 10) AS t(n)"
+    )
+
+
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
     # A column's rows belong to a table the plan already priced; only the
     # inline generator's 1000 rows multiply, and 1000 sits on the cap.

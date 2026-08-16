@@ -120,16 +120,74 @@ def _generates_rows(tree: exp.Expr) -> bool:
     cross-joined are a billion rows, each within the per-generator cap. The
     cap therefore binds their *product* — counted across the whole statement,
     which overstates branches a UNION adds rather than multiplies, and the
-    overstatement fails closed.
+    overstatement fails closed. A generator inside a CTE multiplies once per
+    reference to that CTE, not once per node in the tree.
+    """
+    bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
+    return _generator_product(_without_cte_bodies(tree), bodies, frozenset()) is None
+
+
+def _generator_product(
+    node: exp.Expr, bodies: dict[str, exp.Expr], pending: frozenset[str]
+) -> int | None:
+    """Rows this subtree's generators multiply out to, or None past the cap.
+
+    None also stands for a generator the gate cannot bound at all: both mean
+    the same thing to the caller — no quote — so they share a return.
     """
     product = 1
-    for generator in tree.find_all(*_GENERATORS):
+    for generator in node.find_all(*_GENERATORS):
         if not _expands_a_bounded_value(generator):
-            return True
+            return None
         product *= _generator_rows(generator)
         if product > _MAX_INLINE_ROWS:
-            return True
-    return False
+            return None
+    # A series in a table position manufactures rows without an UNNEST to
+    # wrap it; guarding only the wrapper would leave the same sequence free.
+    wrapped = {id(series) for series in _wrapped_series(node)}
+    for series in node.find_all(exp.GenerateSeries):
+        if id(series) in wrapped:
+            continue
+        length = _sequence_length(series)
+        if length is None or length > _MAX_INLINE_ROWS:
+            return None
+        product *= length
+        if product > _MAX_INLINE_ROWS:
+            return None
+    for name in _cte_references(node, bodies, pending):
+        nested = _generator_product(bodies[name], bodies, pending | {name})
+        if nested is None:
+            return None
+        product *= nested
+        if product > _MAX_INLINE_ROWS:
+            return None
+    return product
+
+
+def _wrapped_series(node: exp.Expr) -> list[exp.Expr]:
+    """Series already counted through the generator that wraps them."""
+    return [
+        series
+        for generator in node.find_all(*_GENERATORS)
+        for series in generator.find_all(exp.GenerateSeries)
+    ]
+
+
+def _cte_references(
+    node: exp.Expr, bodies: dict[str, exp.Expr], pending: frozenset[str]
+) -> list[str]:
+    """CTE names this subtree reads, once per reference.
+
+    A self-referencing CTE is skipped: its depth is the engine's business,
+    and following it would not terminate.
+    """
+    names = []
+    for table in node.find_all(exp.Table):
+        parts = [part.name for part in table.parts]
+        name = parts[0].lower()
+        if len(parts) == 1 and name in bodies and name not in pending:
+            names.append(name)
+    return names
 
 
 def _expands_a_bounded_value(generator: exp.Expr) -> bool:
