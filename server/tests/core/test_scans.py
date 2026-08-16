@@ -186,6 +186,17 @@ def test_a_bare_series_counts_toward_the_product() -> None:
     )
 
 
+def test_nesting_past_the_stack_fails_closed() -> None:
+    # Deep nesting raises RecursionError, which is not a SqlglotError: the
+    # gate used to propagate it instead of refusing. validate_query's depth
+    # cap stops this earlier in the request path, but a module that cannot
+    # read a shape must not answer "priceable" for it.
+    deep = "ARRAY[1,2,3]"
+    for _ in range(100):
+        deep = f"array_sort({deep})"
+    assert unpriceable(f"SELECT v FROM hive.s.t CROSS JOIN UNNEST({deep}) AS z(v)")
+
+
 def test_a_shadowed_cte_name_is_not_sized() -> None:
     # A nested WITH re-binding an outer CTE's name used to overwrite it, so
     # the walk read a decoy body and missed the generator still referenced

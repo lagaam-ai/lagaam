@@ -364,11 +364,15 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
     planner does size, and the budget prices from the plan itself.
 
     Unparseable SQL counts as unpriceable: if we cannot prove the shape is
-    safe, we assume the risky answer.
+    safe, we assume the risky answer. Nesting deep enough to exhaust the
+    interpreter's stack raises RecursionError rather than a parser error, and
+    that is the same answer — a shape nobody read is not a shape anybody
+    vouched for. validate_query's depth cap stops such SQL earlier; this
+    keeps the module's own contract if it is ever called without it.
     """
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    except sqlglot.errors.SqlglotError:
+    except (sqlglot.errors.SqlglotError, RecursionError):
         return True
     return _generates_rows(tree)
 
@@ -394,7 +398,9 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
     """The read counts, and whether the walk budget ran out reaching them."""
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    except sqlglot.errors.SqlglotError:
+    # Nesting past the interpreter's stack raises RecursionError, not a
+    # parser error; either way the shape check has already refused this SQL.
+    except (sqlglot.errors.SqlglotError, RecursionError):
         return {}, False
 
     bodies = _cte_bodies(tree)
