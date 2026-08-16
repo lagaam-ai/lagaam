@@ -16,6 +16,7 @@ per table however often the query reads it, so a self-join's *bytes* are
 undercounted even though its rows are not.
 """
 
+from collections.abc import Mapping
 from datetime import date
 
 import sqlglot
@@ -120,16 +121,103 @@ def _generates_rows(tree: exp.Expr) -> bool:
     cross-joined are a billion rows, each within the per-generator cap. The
     cap therefore binds their *product* — counted across the whole statement,
     which overstates branches a UNION adds rather than multiplies, and the
-    overstatement fails closed.
+    overstatement fails closed. A generator inside a CTE multiplies once per
+    reference to that CTE, not once per node in the tree.
     """
+    bodies = _cte_bodies(tree)
+    # A doubling CTE chain re-walks each body once per reference, so the walk
+    # grows exponentially in a query that stays under 1.5 KB: the same budget
+    # that bounds the byte gate's walk bounds this one.
+    budget = [_MAX_SCAN_COUNT]
+    return (
+        _generator_product(
+            _without_cte_bodies(tree), bodies, frozenset(), budget
+        )
+        is None
+    )
+
+
+def _generator_product(
+    node: exp.Expr,
+    bodies: Mapping[str, list[exp.Expr]],
+    pending: frozenset[str],
+    budget: list[int],
+) -> int | None:
+    """Rows this subtree's generators multiply out to, or None past the cap.
+
+    None also stands for a generator the gate cannot bound at all, and for a
+    walk that ran out of budget: all three mean the same thing to the caller
+    — no quote — so they share a return.
+    """
+    if budget[0] <= 0:
+        return None
     product = 1
-    for generator in tree.find_all(*_GENERATORS):
-        if not _expands_a_bounded_value(generator):
-            return True
-        product *= _generator_rows(generator)
+    wrapped: set[int] = set()
+    loose: list[exp.GenerateSeries] = []
+    references: list[str] = []
+    # One walk, charged per node: a body re-read once per reference costs its
+    # own size every time, and only counting the reads left that size — which
+    # the attacker writes — outside the budget entirely.
+    for child in node.walk():
+        budget[0] -= 1
+        if budget[0] <= 0:
+            return None
+        if isinstance(child, _GENERATORS):
+            if not _expands_a_bounded_value(child):
+                return None
+            product *= _generator_rows(child)
+            if product > _MAX_INLINE_ROWS:
+                return None
+            wrapped.update(id(series) for series in child.find_all(exp.GenerateSeries))
+        elif isinstance(child, exp.GenerateSeries):
+            loose.append(child)
+        elif isinstance(child, exp.Table):
+            parts = [part.name for part in child.parts]
+            name = parts[0].lower()
+            if len(parts) == 1 and name in bodies and name not in pending:
+                references.append(name)
+    # A series in a table position manufactures rows without an UNNEST to
+    # wrap it; guarding only the wrapper would leave the same sequence free.
+    for series in loose:
+        if id(series) in wrapped:
+            continue
+        length = _sequence_length(series)
+        if length is None or length > _MAX_INLINE_ROWS:
+            return None
+        product *= length
         if product > _MAX_INLINE_ROWS:
-            return True
-    return False
+            return None
+    for name in references:
+        # A name bound more than once costs whatever its dearest binding
+        # costs: scope decides which one a reference reads, and charging the
+        # cheapest is what let a decoy body hide a generator.
+        widest = 1
+        for body in bodies[name]:
+            nested = _generator_product(body, bodies, pending | {name}, budget)
+            if nested is None:
+                return None
+            widest = max(widest, nested)
+        product *= widest
+        if product > _MAX_INLINE_ROWS:
+            return None
+    return product
+
+
+def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
+    """Every body each CTE name is bound to, in definition order.
+
+    A nested WITH may re-bind a name the outer query also uses, and which
+    body a given reference means is scope's answer, not a dict's. Keying
+    flatly let the inner body silently replace the outer one — a decoy that
+    hid a generator behind a name still referenced outside it. Keeping every
+    binding lets a reader charge for the most expensive one instead of
+    guessing, which neither under-counts the decoy shape nor refuses the
+    ordinary query that reuses a name like "base" in a nested scope.
+    """
+    bodies: dict[str, list[exp.Expr]] = {}
+    for cte in tree.find_all(exp.CTE):
+        bodies.setdefault(cte.alias_or_name.lower(), []).append(cte.this)
+    return bodies
 
 
 def _expands_a_bounded_value(generator: exp.Expr) -> bool:
@@ -276,11 +364,15 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
     planner does size, and the budget prices from the plan itself.
 
     Unparseable SQL counts as unpriceable: if we cannot prove the shape is
-    safe, we assume the risky answer.
+    safe, we assume the risky answer. Nesting deep enough to exhaust the
+    interpreter's stack raises RecursionError rather than a parser error, and
+    that is the same answer — a shape nobody read is not a shape anybody
+    vouched for. validate_query's depth cap stops such SQL earlier; this
+    keeps the module's own contract if it is ever called without it.
     """
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    except sqlglot.errors.SqlglotError:
+    except (sqlglot.errors.SqlglotError, RecursionError):
         return True
     return _generates_rows(tree)
 
@@ -306,10 +398,12 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
     """The read counts, and whether the walk budget ran out reaching them."""
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    except sqlglot.errors.SqlglotError:
+    # Nesting past the interpreter's stack raises RecursionError, not a
+    # parser error; either way the shape check has already refused this SQL.
+    except (sqlglot.errors.SqlglotError, RecursionError):
         return {}, False
 
-    bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
+    bodies = _cte_bodies(tree)
     counts: dict[str, int] = {}
     # A chain of CTEs each referenced twice doubles walk work per level of
     # depth; a running total caught before recursing bounds that growth
@@ -329,8 +423,12 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
                 # depth is the engine's business, not the quote's.
                 if name in pending:
                     continue
-                budget[0] -= 1
-                walk(bodies[name], weight, pending | {name})
+                # A name bound more than once is counted through every body
+                # it could mean: scope decides which, and skipping the others
+                # let a decoy binding hide the reads behind the name.
+                for body in bodies[name]:
+                    budget[0] -= 1
+                    walk(body, weight, pending | {name})
                 continue
             key = ".".join(parts).lower()
             counts[key] = counts.get(key, 0) + weight

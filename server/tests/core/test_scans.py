@@ -5,7 +5,11 @@ estimates cannot see. table_scan_counts recovers the IO plan's per-table
 undercount when a table is read more than once.
 """
 
-from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
+from lagaam.core.scans import (
+    has_unpriceable_shape,
+    scan_counts_saturated,
+    table_scan_counts,
+)
 
 
 def unpriceable(sql: str) -> bool:
@@ -146,6 +150,123 @@ def test_the_generator_product_cap_is_the_committed_value() -> None:
     )
     assert not unpriceable(base.format(items="'x', 'y'"))
     assert unpriceable(base.format(items="'x', 'y', 'z'"))
+
+
+def test_a_cte_aliased_generator_multiplies_per_reference() -> None:
+    # find_all sees one generator node; the query cross-joins it three times
+    # for a billion rows. Counting nodes instead of reads was the bypass.
+    generator = "WITH g AS (SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)) "
+    assert unpriceable(
+        generator + "SELECT a.n FROM g a CROSS JOIN g b CROSS JOIN g c"
+    )
+    # One reference is the same 1000 rows the per-generator cap already allows.
+    assert not unpriceable(generator + "SELECT n FROM g")
+
+
+def test_a_bare_series_in_a_table_position_is_a_generator() -> None:
+    # sequence() manufactures rows with or without an UNNEST around it;
+    # guarding only the wrapper left the same series free in FROM.
+    assert unpriceable("SELECT n FROM generate_series(1, 1000000000) AS t(n)")
+    assert unpriceable("SELECT n FROM TABLE(sequence(1, 1000000)) AS t(n)")
+    assert unpriceable(
+        "SELECT o.k, t.n FROM hive.s.orders o "
+        "CROSS JOIN generate_series(1, 1000000) AS t(n)"
+    )
+
+
+def test_a_bare_series_counts_toward_the_product() -> None:
+    # Mixed shapes: an unwrapped series must multiply like a wrapped one.
+    assert unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 40)) AS a(n) "
+        "CROSS JOIN generate_series(1, 1000000) AS t(n)"
+    )
+    assert not unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 10)) AS a(n) "
+        "CROSS JOIN generate_series(1, 10) AS t(n)"
+    )
+
+
+def test_nesting_past_the_stack_fails_closed() -> None:
+    # Deep nesting raises RecursionError, which is not a SqlglotError: the
+    # gate used to propagate it instead of refusing. validate_query's depth
+    # cap stops this earlier in the request path, but a module that cannot
+    # read a shape must not answer "priceable" for it.
+    deep = "ARRAY[1,2,3]"
+    for _ in range(100):
+        deep = f"array_sort({deep})"
+    assert unpriceable(f"SELECT v FROM hive.s.t CROSS JOIN UNNEST({deep}) AS z(v)")
+
+
+def test_a_shadowed_cte_name_is_not_sized() -> None:
+    # A nested WITH re-binding an outer CTE's name used to overwrite it, so
+    # the walk read a decoy body and missed the generator still referenced
+    # outside it: 1000^3 rows quoted as none.
+    assert unpriceable(
+        "WITH a AS (SELECT x FROM UNNEST(sequence(1,1000)) AS s(x)) "
+        "SELECT * FROM (WITH a AS (SELECT 1 AS x) SELECT * FROM a) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )
+    # A decoy that collides with nothing leaves the outer body readable.
+    assert unpriceable(
+        "WITH a AS (SELECT x FROM UNNEST(sequence(1,1000)) AS s(x)) "
+        "SELECT * FROM (WITH zz AS (SELECT 1 AS x) SELECT * FROM zz) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )
+
+
+def test_a_shadowed_cte_name_still_counts_its_reads() -> None:
+    # The same decoy hid the reads from the byte gate, which returned {} and
+    # scaled nothing at all.
+    assert counts(
+        "WITH a AS (SELECT x FROM tpch.sf1.orders) "
+        "SELECT * FROM (WITH a AS (SELECT 1 AS x) SELECT * FROM a) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )["tpch.sf1.orders"] >= 3
+
+
+def test_a_name_reused_in_a_nested_scope_still_prices() -> None:
+    # Reusing "base" or "daily" in an inner scope is ordinary SQL; refusing
+    # every collision would trade one bypass for a broken product.
+    assert not unpriceable(
+        "WITH base AS (SELECT orderkey FROM tpch.sf1.orders) "
+        "SELECT * FROM (WITH base AS (SELECT custkey FROM tpch.sf1.customer) "
+        "SELECT * FROM base) z"
+    )
+
+
+def test_a_generator_walk_of_a_doubling_chain_stays_under_a_second() -> None:
+    # A chain whose product never trips the cap runs the walk in full: at 24
+    # links an unbudgeted walk took 201s on a 1.2 KB query, before any engine
+    # call. The walk budget must bound it the way the byte gate's already is.
+    import time
+
+    head = "WITH c0 AS (SELECT a FROM hive.s.t),"
+    links = ",".join(
+        f"c{i} AS (SELECT 1 AS x FROM c{i - 1} a CROSS JOIN c{i - 1} b)"
+        for i in range(1, 24)
+    )
+    start = time.perf_counter()
+    unpriceable(f"{head}{links} SELECT x FROM c23")
+    assert time.perf_counter() - start < 1.0
+
+
+def test_a_doubling_chain_of_fat_bodies_stays_under_a_second() -> None:
+    # Budgeting the reads alone left body size — which the attacker writes —
+    # unbudgeted: 10,000 re-reads of a padded body took 2.3s on 4 KB and
+    # 10.6s on 19 KB. The budget has to be spent per node visited.
+    import time
+
+    pad = "+".join(["1"] * 600)
+    parts = [f"c0 AS (SELECT k, {pad} AS p FROM hive.s.t)"]
+    parts += [
+        f"c{i} AS (SELECT a.k, {pad} AS p FROM c{i - 1} a "
+        f"JOIN c{i - 1} b ON a.k = b.k)"
+        for i in range(1, 15)
+    ]
+    sql = "WITH " + ", ".join(parts) + " SELECT k FROM c14"
+    start = time.perf_counter()
+    unpriceable(sql)
+    assert time.perf_counter() - start < 1.0
 
 
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
@@ -410,8 +531,6 @@ def test_a_saturated_scan_count_is_reported_as_unpriceable() -> None:
     # DOWN — measured, a 1,471-char CTE chain counts 3,328 reads where the
     # true number is 524,288, so a 61 GiB query quotes at 3 GiB and is
     # admitted. Saturation has to deny, not discount.
-    from lagaam.core.scans import scan_counts_saturated
-
     parts = ["c0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
     for i in range(1, 20):
         parts.append(
