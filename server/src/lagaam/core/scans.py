@@ -391,10 +391,27 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     # A star re-exports every name its own scope can see, so what an inner
     # projection built passes outward unnamed. Resolving each one to the
     # names below it keeps a manufactured array from shedding its history
-    # by being selected with *.
-    for source, select in stars:
+    # by being selected with *. A star whose FROM is a CTE name sees nothing
+    # in its own subtree — the bindings live in that CTE's body under the
+    # WITH — so the reference is followed there too.
+    cte_bodies = {
+        cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)
+    }
+
+    def bind_star(source: str, select: exp.Select, seen: frozenset[str]) -> None:
         for inner in select.find_all(exp.Alias):
             bind(source, inner.alias, inner.this)
+        for table in select.find_all(exp.Table):
+            parts = [part.name for part in table.parts]
+            name = parts[0].lower()
+            if len(parts) > 1 or name not in cte_bodies or name in seen:
+                continue
+            body = cte_bodies[name].find(exp.Select)
+            if body is not None:
+                bind_star(source, body, seen | {name})
+
+    for source, select in stars:
+        bind_star(source, select, frozenset())
     return projections
 
 

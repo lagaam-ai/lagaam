@@ -463,6 +463,27 @@ def test_a_star_does_not_strip_an_array_of_its_history() -> None:
     )
 
 
+def test_a_star_over_a_cte_reference_follows_it_home() -> None:
+    # A star's own subtree holds no Alias when its FROM is a CTE name: the
+    # array is built in the CTE body under the WITH, which is not below it.
+    assert unpriceable(
+        "WITH a AS (SELECT repeat(o.k, 1000000000) AS arr FROM hive.s.orders o), "
+        "b AS (SELECT * FROM a) "
+        "SELECT x FROM b CROSS JOIN UNNEST(b.arr) t(x)"
+    )
+    # Extra hops must not help either.
+    assert unpriceable(
+        "WITH a AS (SELECT array_agg(v) AS arr FROM hive.s.big), "
+        "b AS (SELECT * FROM a), c AS (SELECT * FROM b) "
+        "SELECT x FROM c CROSS JOIN UNNEST(c.arr) v(x)"
+    )
+    # A star over a CTE that only reads a table still reads as scanned.
+    assert not unpriceable(
+        "WITH a AS (SELECT items FROM hive.s.orders), b AS (SELECT * FROM a) "
+        "SELECT x FROM b CROSS JOIN UNNEST(b.items) t(x)"
+    )
+
+
 def test_a_later_union_arm_inherits_the_first_arms_names() -> None:
     # Output names come from the first arm, so an unnamed projection in a
     # later one still reaches the outer scope — carrying its array with it.
