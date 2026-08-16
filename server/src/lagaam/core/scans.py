@@ -39,12 +39,10 @@ _MAX_SCAN_COUNT = 10_000
 # 20,000 inline values is 30 billion rows the plan prices as one scan.
 _MAX_INLINE_ROWS = 1000
 
-# Joined to a table, a generator is not a relation of its own size — it is a
-# multiplier on every scanned row, and the plan sizes that join as the table
-# alone. 6M lineitems against 1000 generated rows is 6 billion. Gap-filling a
-# leap year (366) and crossing a status list are the shapes that must survive,
-# so the fanout allowance sits above them and far below a scan multiplier.
-_MAX_FANOUT_ROWS = 500
+# Counting stops here. A product this large is already past anything the row
+# budget would clear against a real table, and past what a table-less query
+# may invent, so the exact figure beyond it buys nothing.
+_MAX_COUNTED_ROWS = 10_000_000
 
 # Functions that reshape an array without changing how many rows it yields.
 # Anything else feeding a generator is assumed to invent rows: a denylist is
@@ -129,13 +127,12 @@ def _generates_rows(tree: exp.Expr) -> bool:
     cap therefore binds their *product*. A generator inside a CTE multiplies
     once per reference to that CTE, not once per node in the tree.
 
-    What the product is measured against depends on what it multiplies. Alone,
-    a generator is a relation of its own size. Joined to a table, it is a
-    multiplier on every row the plan already counted — and the plan sizes that
-    join as the table alone — so the allowance drops to the fanout a real
-    query needs. Each UNION branch is judged on its own: branches add rows
-    rather than multiply them, so a product across them would both overstate
-    the total and let nine table-multiplying branches hide under one cap.
+    A generator joined to a table is not refused here for its size: it is a
+    multiplier on rows the plan already counted, and generator_fanout() hands
+    that multiplier to the caller so the plan's own estimate can carry it.
+    What this refuses is a generator whose size cannot be read at all. Each
+    UNION branch is judged on its own — branches add rows rather than multiply
+    them, so a statement-wide product would overstate ordinary queries.
     """
     bodies = _cte_bodies(tree)
     # A doubling CTE chain re-walks each body once per reference, so the walk
@@ -148,7 +145,11 @@ def _generates_rows(tree: exp.Expr) -> bool:
         product = _generator_product(branch, bodies, frozenset(), budget, projections)
         if product is None:
             return True
-        if product > _fanout_allowance(branch, bodies):
+        # A branch that reads no table is only as large as what it invents,
+        # and nothing downstream prices that — so the cap binds here.
+        if product > _MAX_INLINE_ROWS and not _reads_a_table(
+            branch, bodies, frozenset()
+        ):
             return True
     return False
 
@@ -160,16 +161,35 @@ def _union_branches(node: exp.Expr) -> list[exp.Expr]:
     return [node]
 
 
-def _fanout_allowance(branch: exp.Expr, bodies: Mapping[str, list[exp.Expr]]) -> int:
-    """How many generated rows this branch may carry.
+def generator_fanout(sql: str, dialect: str) -> int:
+    """How many times a generator multiplies each row the plan counted.
 
-    A branch that reads a real table spends its generators as a multiplier on
-    that table's rows, which the plan prices as a single scan; one that reads
-    none is only as large as what it manufactures.
+    The plan sizes orders CROSS JOIN UNNEST(sequence(1, 1000)) as the table
+    alone — measured on Trino 476, 1,500,000 rows for 1.5 billion produced.
+    Returning the multiplier lets the caller scale the plan's own estimate
+    instead of the gate guessing what a table it cannot see costs: a spine
+    of 744 hours is ordinary against a small table and ruinous against a
+    large one, and only the plan knows which this is.
+
+    1 for SQL with no generator, and for one the shape check has already
+    refused — a query with no quote needs no multiplier.
     """
-    if _reads_a_table(branch, bodies, frozenset()):
-        return _MAX_FANOUT_ROWS
-    return _MAX_INLINE_ROWS
+    try:
+        tree = sqlglot.parse_one(sql, dialect=dialect)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return 1
+    bodies = _cte_bodies(tree)
+    budget = [_MAX_SCAN_COUNT]
+    projections = _projected_expressions(tree)
+    widest = 1
+    for branch in _union_branches(_without_cte_bodies(tree)):
+        if not _reads_a_table(branch, bodies, frozenset()):
+            continue
+        product = _generator_product(branch, bodies, frozenset(), budget, projections)
+        if product is None:
+            return 1
+        widest = max(widest, product)
+    return widest
 
 
 def _reads_a_table(
@@ -177,6 +197,11 @@ def _reads_a_table(
 ) -> bool:
     """True if this subtree scans a table, following CTE references into it."""
     for table in node.find_all(exp.Table):
+        # A table expression is not always a table: TABLE(sequence(...)) wraps
+        # a generator in a node named for the keyword, and reading that as a
+        # scan would lend the generator a row count nothing counted.
+        if any(table.find_all(exp.GenerateSeries, *_GENERATORS)):
+            continue
         parts = [part.name for part in table.parts]
         name = parts[0].lower()
         if len(parts) > 1 or name not in bodies:
@@ -220,7 +245,7 @@ def _generator_product(
             if not _expands_a_bounded_value(child, projections):
                 return None
             product *= _generator_rows(child, projections)
-            if product > _MAX_INLINE_ROWS:
+            if product > _MAX_COUNTED_ROWS:
                 return None
             wrapped.update(id(series) for series in child.find_all(exp.GenerateSeries))
         elif isinstance(child, exp.GenerateSeries):
@@ -236,10 +261,10 @@ def _generator_product(
         if id(series) in wrapped:
             continue
         length = _sequence_length(series)
-        if length is None or length > _MAX_INLINE_ROWS:
+        if length is None or length > _MAX_COUNTED_ROWS:
             return None
         product *= length
-        if product > _MAX_INLINE_ROWS:
+        if product > _MAX_COUNTED_ROWS:
             return None
     for name in references:
         # A name bound more than once costs whatever its dearest binding
@@ -254,7 +279,7 @@ def _generator_product(
                 return None
             widest = max(widest, nested)
         product *= widest
-        if product > _MAX_INLINE_ROWS:
+        if product > _MAX_COUNTED_ROWS:
             return None
     return product
 

@@ -6,6 +6,7 @@ undercount when a table is read more than once.
 """
 
 from lagaam.core.scans import (
+    generator_fanout,
     has_unpriceable_shape,
     scan_counts_saturated,
     table_scan_counts,
@@ -14,6 +15,10 @@ from lagaam.core.scans import (
 
 def unpriceable(sql: str) -> bool:
     return has_unpriceable_shape(sql, dialect="trino")
+
+
+def fanout(sql: str) -> int:
+    return generator_fanout(sql, dialect="trino")
 
 
 def test_single_scan_is_priceable() -> None:
@@ -167,11 +172,16 @@ def test_a_bare_series_in_a_table_position_is_a_generator() -> None:
     # sequence() manufactures rows with or without an UNNEST around it;
     # guarding only the wrapper left the same series free in FROM.
     assert unpriceable("SELECT n FROM generate_series(1, 1000000000) AS t(n)")
+    # TABLE(...) wraps the series in a node named for the keyword; reading
+    # that as a scan would lend the generator a row count nothing counted.
     assert unpriceable("SELECT n FROM TABLE(sequence(1, 1000000)) AS t(n)")
-    assert unpriceable(
+    # Joined to a real table it is a multiplier the quote carries instead.
+    joined = (
         "SELECT o.k, t.n FROM hive.s.orders o "
         "CROSS JOIN generate_series(1, 1000000) AS t(n)"
     )
+    assert not unpriceable(joined)
+    assert fanout(joined) == 1_000_000
 
 
 def test_a_bare_series_counts_toward_the_product() -> None:
@@ -282,15 +292,33 @@ def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
 # --- fanout against a table the plan prices as one scan --------------------
 
 
-def test_a_generator_crossed_with_a_table_is_capped_lower() -> None:
+def test_a_generator_crossed_with_a_table_reports_its_fanout() -> None:
     # The plan sizes this join as the table's row count, so the generator's
     # rows are a multiplier on every scanned row: 6M lineitems x 1000 is 6e9
-    # rows quoted as one scan. Standalone the same 1000 rows are just 1000.
-    assert unpriceable(
+    # rows quoted as one scan. The quote carries the multiplier rather than
+    # the gate guessing what a table it cannot see costs.
+    sql = (
         "SELECT o.orderkey, t.n FROM tpch.sf1.lineitem o "
         "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)"
     )
+    assert not unpriceable(sql)
+    assert fanout(sql) == 1000
+    # Standalone, nothing downstream prices it, so its own size is the cap.
+    assert fanout("SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)") == 1
     assert not unpriceable("SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)")
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 1001)) AS t(n)")
+
+
+def test_an_hourly_spine_over_a_month_is_not_refused_outright() -> None:
+    # 744 hourly buckets is ordinary against a small table and ruinous
+    # against a large one; only the plan knows which, so the gate reports
+    # the multiplier and the row budget decides.
+    sql = (
+        "SELECT o.k, s.n FROM hive.s.t o "
+        "CROSS JOIN UNNEST(sequence(1, 744)) AS s(n)"
+    )
+    assert not unpriceable(sql)
+    assert fanout(sql) == 744
 
 
 def test_a_date_spine_against_a_table_still_prices() -> None:
@@ -307,15 +335,11 @@ def test_a_date_spine_against_a_table_still_prices() -> None:
     )
 
 
-def test_the_fanout_cap_is_the_committed_value() -> None:
-    # 500 sits on the fanout cap; 501 crosses it. A stale mutation of
-    # _MAX_FANOUT_ROWS fails loudly here.
-    base = (
-        "SELECT o.orderkey, t.n FROM tpch.sf1.orders o "
-        "CROSS JOIN UNNEST(sequence(1, {n})) AS t(n)"
-    )
-    assert not unpriceable(base.format(n=500))
-    assert unpriceable(base.format(n=501))
+def test_the_standalone_cap_is_the_committed_value() -> None:
+    # 1000 sits on the inline cap; 1001 crosses it. A stale mutation of
+    # _MAX_INLINE_ROWS fails loudly here.
+    assert not unpriceable("SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)")
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 1001)) AS t(n)")
 
 
 def test_union_branches_are_judged_one_at_a_time() -> None:
@@ -332,11 +356,12 @@ def test_union_branches_are_judged_one_at_a_time() -> None:
     assert counts(nine) == {"tpch.sf1.lineitem": 9}
     # A single branch over the fanout cap is still refused, and a product
     # cannot be smuggled in by splitting it across branches.
-    over = (
+    # The widest branch is the multiplier the whole statement carries.
+    wide = (
         "SELECT o.orderkey FROM tpch.sf1.lineitem o "
-        "CROSS JOIN UNNEST(sequence(1, 501)) AS t(n)"
+        "CROSS JOIN UNNEST(sequence(1, 900)) AS t(n)"
     )
-    assert unpriceable(f"{branch.format(i=0)} UNION ALL {over}")
+    assert fanout(f"{branch.format(i=0)} UNION ALL {wide}") == 900
 
 
 # --- arrays laundered through a projection ---------------------------------
