@@ -152,16 +152,33 @@ def _generator_product(
     if budget[0] <= 0:
         return None
     product = 1
-    for generator in node.find_all(*_GENERATORS):
-        if not _expands_a_bounded_value(generator):
+    wrapped: set[int] = set()
+    loose: list[exp.GenerateSeries] = []
+    references: list[str] = []
+    # One walk, charged per node: a body re-read once per reference costs its
+    # own size every time, and only counting the reads left that size — which
+    # the attacker writes — outside the budget entirely.
+    for child in node.walk():
+        budget[0] -= 1
+        if budget[0] <= 0:
             return None
-        product *= _generator_rows(generator)
-        if product > _MAX_INLINE_ROWS:
-            return None
+        if isinstance(child, _GENERATORS):
+            if not _expands_a_bounded_value(child):
+                return None
+            product *= _generator_rows(child)
+            if product > _MAX_INLINE_ROWS:
+                return None
+            wrapped.update(id(series) for series in child.find_all(exp.GenerateSeries))
+        elif isinstance(child, exp.GenerateSeries):
+            loose.append(child)
+        elif isinstance(child, exp.Table):
+            parts = [part.name for part in child.parts]
+            name = parts[0].lower()
+            if len(parts) == 1 and name in bodies and name not in pending:
+                references.append(name)
     # A series in a table position manufactures rows without an UNNEST to
     # wrap it; guarding only the wrapper would leave the same sequence free.
-    wrapped = {id(series) for series in _wrapped_series(node)}
-    for series in node.find_all(exp.GenerateSeries):
+    for series in loose:
         if id(series) in wrapped:
             continue
         length = _sequence_length(series)
@@ -170,13 +187,12 @@ def _generator_product(
         product *= length
         if product > _MAX_INLINE_ROWS:
             return None
-    for name in _cte_references(node, bodies, pending):
+    for name in references:
         # A name bound more than once costs whatever its dearest binding
         # costs: scope decides which one a reference reads, and charging the
         # cheapest is what let a decoy body hide a generator.
         widest = 1
         for body in bodies[name]:
-            budget[0] -= 1
             nested = _generator_product(body, bodies, pending | {name}, budget)
             if nested is None:
                 return None
@@ -185,15 +201,6 @@ def _generator_product(
         if product > _MAX_INLINE_ROWS:
             return None
     return product
-
-
-def _wrapped_series(node: exp.Expr) -> list[exp.Expr]:
-    """Series already counted through the generator that wraps them."""
-    return [
-        series
-        for generator in node.find_all(*_GENERATORS)
-        for series in generator.find_all(exp.GenerateSeries)
-    ]
 
 
 def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
@@ -211,23 +218,6 @@ def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     for cte in tree.find_all(exp.CTE):
         bodies.setdefault(cte.alias_or_name.lower(), []).append(cte.this)
     return bodies
-
-
-def _cte_references(
-    node: exp.Expr, bodies: Mapping[str, list[exp.Expr]], pending: frozenset[str]
-) -> list[str]:
-    """CTE names this subtree reads, once per reference.
-
-    A self-referencing CTE is skipped: its depth is the engine's business,
-    and following it would not terminate.
-    """
-    names = []
-    for table in node.find_all(exp.Table):
-        parts = [part.name for part in table.parts]
-        name = parts[0].lower()
-        if len(parts) == 1 and name in bodies and name not in pending:
-            names.append(name)
-    return names
 
 
 def _expands_a_bounded_value(generator: exp.Expr) -> bool:

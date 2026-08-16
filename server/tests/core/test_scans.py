@@ -239,6 +239,25 @@ def test_a_generator_walk_of_a_doubling_chain_stays_under_a_second() -> None:
     assert time.perf_counter() - start < 1.0
 
 
+def test_a_doubling_chain_of_fat_bodies_stays_under_a_second() -> None:
+    # Budgeting the reads alone left body size — which the attacker writes —
+    # unbudgeted: 10,000 re-reads of a padded body took 2.3s on 4 KB and
+    # 10.6s on 19 KB. The budget has to be spent per node visited.
+    import time
+
+    pad = "+".join(["1"] * 600)
+    parts = [f"c0 AS (SELECT k, {pad} AS p FROM hive.s.t)"]
+    parts += [
+        f"c{i} AS (SELECT a.k, {pad} AS p FROM c{i - 1} a "
+        f"JOIN c{i - 1} b ON a.k = b.k)"
+        for i in range(1, 15)
+    ]
+    sql = "WITH " + ", ".join(parts) + " SELECT k FROM c14"
+    start = time.perf_counter()
+    unpriceable(sql)
+    assert time.perf_counter() - start < 1.0
+
+
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
     # A column's rows belong to a table the plan already priced; only the
     # inline generator's 1000 rows multiply, and 1000 sits on the cap.
