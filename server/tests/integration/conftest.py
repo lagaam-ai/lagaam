@@ -16,14 +16,18 @@ def trino_ready() -> None:
     if info.get("starting", True):
         pytest.skip("Trino is still starting — retry in a few seconds")
     # starting=false still precedes node registration ("nodes is empty"), so
-    # only a query that actually runs proves the coordinator is usable.
+    # only a query that actually runs proves the coordinator is usable — and
+    # SELECT 1 answers before the connectors do, so the probe reads a catalog
+    # the tests actually use.
     deadline = time.monotonic() + 30
     while True:
         try:
             with trino.dbapi.connect(
                 host="localhost", port=8080, user="lagaam-test"
             ) as conn:
-                conn.cursor().execute("SELECT 1").fetchall()
+                conn.cursor().execute(
+                    "SELECT orderkey FROM tpch.tiny.orders LIMIT 1"
+                ).fetchall()
             return
         except (trino.exceptions.Error, OSError):
             if time.monotonic() > deadline:
