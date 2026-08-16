@@ -504,13 +504,21 @@ def test_a_cte_read_through_a_table_alias_keeps_its_bindings() -> None:
 
 def test_an_alias_does_not_speak_for_an_unrelated_relation() -> None:
     # Copying a CTE's bindings onto every same-named alias in the statement
-    # merged relations that share nothing: orders AS o and daily AS o are
-    # different tables, and the aggregate's binding condemned the scan.
-    assert not unpriceable(
+    # merged relations that share nothing. Two relations under one alias are
+    # now refused rather than merged — the gate cannot tell which one a
+    # reference reads, and an aggregate's array must not be read as a scan.
+    assert unpriceable(
         "WITH daily AS (SELECT d, array_agg(sku) AS items FROM hive.s.sales "
         "GROUP BY d) "
         "SELECT s FROM hive.s.orders AS o CROSS JOIN UNNEST(o.items) AS q(s) "
         "UNION ALL SELECT cardinality(x.items) FROM daily AS o CROSS JOIN daily x"
+    )
+    # Distinct aliases for the two relations leave the scan priceable.
+    assert not unpriceable(
+        "WITH daily AS (SELECT d, array_agg(sku) AS items FROM hive.s.sales "
+        "GROUP BY d) "
+        "SELECT s FROM hive.s.orders AS o CROSS JOIN UNNEST(o.items) AS q(s) "
+        "UNION ALL SELECT cardinality(x.items) FROM daily AS y CROSS JOIN daily x"
     )
     # A CTE read through an alias must not become unpriceable for it.
     assert not unpriceable(
@@ -524,6 +532,28 @@ def test_an_alias_does_not_speak_for_an_unrelated_relation() -> None:
         "WITH daily AS (SELECT d, items FROM hive.s.sales), "
         "enriched AS (SELECT o.d, o.items FROM daily AS o) "
         "SELECT e.d, s FROM enriched AS e CROSS JOIN UNNEST(e.items) AS q(s)"
+    )
+
+
+def test_an_ambiguous_alias_is_refused_rather_than_trusted() -> None:
+    # An alias that names two relations cannot be resolved — and an
+    # unresolved name used to read as a scanned column, so spelling the
+    # ambiguity on purpose laundered the array. Not knowing which relation a
+    # generator reads is a reason to refuse, not to price it as free.
+    assert unpriceable(
+        "WITH a AS (SELECT repeat(o.id, 10000000) AS arr FROM hive.s.orders o) "
+        "SELECT x FROM a AS z, hive.s.other AS z CROSS JOIN UNNEST(z.arr) AS q(x)"
+    )
+    assert unpriceable(
+        "WITH a AS (SELECT repeat(o.id, 10000000) AS arr FROM hive.s.orders o), "
+        "b AS (SELECT 1 AS arr) "
+        "SELECT x FROM a AS z CROSS JOIN b AS z CROSS JOIN UNNEST(z.arr) AS q(x)"
+    )
+    # An alias used once still resolves, and an ordinary query is untouched.
+    assert not unpriceable(
+        "WITH daily AS (SELECT d, items FROM hive.s.sales) "
+        "SELECT s FROM daily AS o, hive.s.other AS p "
+        "CROSS JOIN UNNEST(o.items) AS q(s)"
     )
 
 

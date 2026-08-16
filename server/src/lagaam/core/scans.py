@@ -48,6 +48,10 @@ _MAX_COUNTED_ROWS = 10_000_000
 # following it unbounded exhausts the interpreter's stack on 8 KB of SQL.
 _MAX_ALIAS_DEPTH = 32
 
+# Stands for an alias that names more than one relation: not a CTE name, and
+# not something a lookup may treat as an unbound (therefore scanned) column.
+_AMBIGUOUS = "\x00ambiguous"
+
 # Functions that reshape an array without changing how many rows it yields.
 # Anything else feeding a generator is assumed to invent rows: a denylist is
 # unsound here, because a function sqlglot does not model natively parses as
@@ -440,9 +444,17 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     # name. Only aliases that name exactly one CTE resolve: an alias used for
     # two relations, or one that shadows a real table, means more than a name
     # can say, and guessing merged unrelated scans with an aggregate's array.
-    for alias, name in _alias_sources(tree).items():
+    alias_sources = _alias_sources(tree)
+    for alias, name in alias_sources.items():
+        if name is _AMBIGUOUS:
+            continue
         for column, bound in bound_columns.get(name, {}).items():
             projections.setdefault(f"{alias}.{column}", []).extend(bound)
+    for alias, name in alias_sources.items():
+        if name is _AMBIGUOUS:
+            # A marker key: any column read through this alias resolves to
+            # something the gate cannot read, which fails closed.
+            projections[f"{alias}.{_AMBIGUOUS}"] = []
     return projections
 
 
@@ -457,23 +469,31 @@ def _alias_sources(tree: exp.Expr) -> dict[str, str]:
     say, and guessing is what condemned unrelated scans.
     """
     cte_names = {cte.alias_or_name.lower() for cte in tree.find_all(exp.CTE)}
+    # What each alias names, whether a CTE or a table: an alias that names two
+    # relations is ambiguous whatever kind they are, while one that names a
+    # single table is ordinary SQL and resolves to no CTE at all.
+    named: dict[str, set[str]] = {}
     sources: dict[str, str] = {}
-    ambiguous: set[str] = set()
     for table in tree.find_all(exp.Table):
         parts = [part.name for part in table.parts]
         name = parts[0].lower()
         alias = table.alias.lower()
-        if len(parts) > 1 or not alias or alias == name or name not in cte_names:
-            # An alias over a real table shadows any CTE of that name: the
-            # columns it carries are that table's, and the plan counts them.
-            if alias and (len(parts) > 1 or name not in cte_names):
-                ambiguous.add(alias)
+        if not alias or alias == name:
             continue
-        if sources.setdefault(alias, name) != name:
-            ambiguous.add(alias)
-    return {
+        named.setdefault(alias, set()).add(".".join(parts).lower())
+        if len(parts) == 1 and name in cte_names:
+            sources[alias] = name
+    ambiguous = {alias for alias, relations in named.items() if len(relations) > 1}
+    resolved = {
         alias: name for alias, name in sources.items() if alias not in ambiguous
     }
+    # An alias naming more than one relation resolves to nothing readable.
+    # It is recorded so a reference through it can be refused: an alias the
+    # gate cannot follow is a shape it cannot size, and spelling that
+    # ambiguity on purpose is how a manufactured array hid behind it.
+    for alias in ambiguous:
+        resolved.setdefault(alias, _AMBIGUOUS)
+    return resolved
 
 
 def _positional_name(select: exp.Select, projection: exp.Expr) -> str | None:
@@ -569,6 +589,11 @@ def _is_bounded_input(
         # to; a name nothing in the statement binds is a scanned column, whose
         # rows the plan already counted.
         key = _column_key(value)
+        # An alias naming more than one relation says nothing about which one
+        # this reads, and a generator whose input cannot be identified is not
+        # one the gate may vouch for.
+        if value.table and f"{value.table.lower()}.{_AMBIGUOUS}" in projections:
+            return False
         # A chain longer than any real query writes exhausts the stack, so it
         # stops here rather than vouch for the column.
         if len(seen) >= _MAX_ALIAS_DEPTH:
