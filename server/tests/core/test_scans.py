@@ -113,6 +113,51 @@ def test_unnest_of_a_literal_array_is_priceable() -> None:
     )
 
 
+def test_a_product_of_bounded_generators_is_unpriceable() -> None:
+    # Each generator passes the per-generator cap; crossed, they multiply.
+    # Three 1000-row sequences are a billion rows the plan prices as none.
+    assert unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 1000)) AS a(n) "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS b(n) "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS c(n)"
+    )
+    assert unpriceable(
+        "SELECT a.n FROM UNNEST(sequence(1, 100)) AS a(n) "
+        "CROSS JOIN UNNEST(sequence(1, 100)) AS b(n)"
+    )
+
+
+def test_a_small_generator_product_stays_priceable() -> None:
+    # A date spine crossed with a short status list is ordinary gap-filling;
+    # only the *product* past the cap is refused, not multiplicity itself.
+    assert not unpriceable(
+        "SELECT s.d, v.x FROM UNNEST(sequence(DATE '1996-01-01', "
+        "DATE '1996-01-31', INTERVAL '1' DAY)) AS s(d) "
+        "CROSS JOIN UNNEST(ARRAY['O', 'F', 'P']) AS v(x)"
+    )
+
+
+def test_the_generator_product_cap_is_the_committed_value() -> None:
+    # 500 x 2 sits exactly on the 1000-row cap; 500 x 3 crosses it. A stale
+    # mutation of _MAX_INLINE_ROWS fails loudly here.
+    base = (
+        "SELECT a.n FROM UNNEST(sequence(1, 500)) AS a(n) "
+        "CROSS JOIN UNNEST(ARRAY[{items}]) AS b(v)"
+    )
+    assert not unpriceable(base.format(items="'x', 'y'"))
+    assert unpriceable(base.format(items="'x', 'y', 'z'"))
+
+
+def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
+    # A column's rows belong to a table the plan already priced; only the
+    # inline generator's 1000 rows multiply, and 1000 sits on the cap.
+    assert not unpriceable(
+        "SELECT t.i, s.n FROM hive.s.orders o "
+        "CROSS JOIN UNNEST(o.items) AS t(i) "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS s(n)"
+    )
+
+
 # --- scaling a quote the plan may have collapsed --------------------------
 
 
