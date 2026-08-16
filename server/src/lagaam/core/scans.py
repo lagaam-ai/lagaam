@@ -39,6 +39,13 @@ _MAX_SCAN_COUNT = 10_000
 # 20,000 inline values is 30 billion rows the plan prices as one scan.
 _MAX_INLINE_ROWS = 1000
 
+# Joined to a table, a generator is not a relation of its own size — it is a
+# multiplier on every scanned row, and the plan sizes that join as the table
+# alone. 6M lineitems against 1000 generated rows is 6 billion. Gap-filling a
+# leap year (366) and crossing a status list are the shapes that must survive,
+# so the fanout allowance sits above them and far below a scan multiplier.
+_MAX_FANOUT_ROWS = 500
+
 # Functions that reshape an array without changing how many rows it yields.
 # Anything else feeding a generator is assumed to invent rows: a denylist is
 # unsound here, because a function sqlglot does not model natively parses as
@@ -119,22 +126,68 @@ def _generates_rows(tree: exp.Expr) -> bool:
 
     Bounded generators multiply where they meet: three 1000-row sequences
     cross-joined are a billion rows, each within the per-generator cap. The
-    cap therefore binds their *product* — counted across the whole statement,
-    which overstates branches a UNION adds rather than multiplies, and the
-    overstatement fails closed. A generator inside a CTE multiplies once per
-    reference to that CTE, not once per node in the tree.
+    cap therefore binds their *product*. A generator inside a CTE multiplies
+    once per reference to that CTE, not once per node in the tree.
+
+    What the product is measured against depends on what it multiplies. Alone,
+    a generator is a relation of its own size. Joined to a table, it is a
+    multiplier on every row the plan already counted — and the plan sizes that
+    join as the table alone — so the allowance drops to the fanout a real
+    query needs. Each UNION branch is judged on its own: branches add rows
+    rather than multiply them, so a product across them would both overstate
+    the total and let nine table-multiplying branches hide under one cap.
     """
     bodies = _cte_bodies(tree)
     # A doubling CTE chain re-walks each body once per reference, so the walk
     # grows exponentially in a query that stays under 1.5 KB: the same budget
     # that bounds the byte gate's walk bounds this one.
     budget = [_MAX_SCAN_COUNT]
-    return (
-        _generator_product(
-            _without_cte_bodies(tree), bodies, frozenset(), budget
-        )
-        is None
-    )
+    projections = _projected_expressions(tree)
+    detached = _without_cte_bodies(tree)
+    for branch in _union_branches(detached):
+        product = _generator_product(branch, bodies, frozenset(), budget, projections)
+        if product is None:
+            return True
+        if product > _fanout_allowance(branch, bodies):
+            return True
+    return False
+
+
+def _union_branches(node: exp.Expr) -> list[exp.Expr]:
+    """Each arm of a set operation, or the query itself if there is none."""
+    if isinstance(node, exp.Union):
+        return [*_union_branches(node.this), *_union_branches(node.expression)]
+    return [node]
+
+
+def _fanout_allowance(branch: exp.Expr, bodies: Mapping[str, list[exp.Expr]]) -> int:
+    """How many generated rows this branch may carry.
+
+    A branch that reads a real table spends its generators as a multiplier on
+    that table's rows, which the plan prices as a single scan; one that reads
+    none is only as large as what it manufactures.
+    """
+    if _reads_a_table(branch, bodies, frozenset()):
+        return _MAX_FANOUT_ROWS
+    return _MAX_INLINE_ROWS
+
+
+def _reads_a_table(
+    node: exp.Expr, bodies: Mapping[str, list[exp.Expr]], pending: frozenset[str]
+) -> bool:
+    """True if this subtree scans a table, following CTE references into it."""
+    for table in node.find_all(exp.Table):
+        parts = [part.name for part in table.parts]
+        name = parts[0].lower()
+        if len(parts) > 1 or name not in bodies:
+            return True
+        if name in pending:
+            continue
+        if any(
+            _reads_a_table(body, bodies, pending | {name}) for body in bodies[name]
+        ):
+            return True
+    return False
 
 
 def _generator_product(
@@ -142,6 +195,7 @@ def _generator_product(
     bodies: Mapping[str, list[exp.Expr]],
     pending: frozenset[str],
     budget: list[int],
+    projections: Mapping[str, list[exp.Expr]],
 ) -> int | None:
     """Rows this subtree's generators multiply out to, or None past the cap.
 
@@ -163,9 +217,9 @@ def _generator_product(
         if budget[0] <= 0:
             return None
         if isinstance(child, _GENERATORS):
-            if not _expands_a_bounded_value(child):
+            if not _expands_a_bounded_value(child, projections):
                 return None
-            product *= _generator_rows(child)
+            product *= _generator_rows(child, projections)
             if product > _MAX_INLINE_ROWS:
                 return None
             wrapped.update(id(series) for series in child.find_all(exp.GenerateSeries))
@@ -193,7 +247,9 @@ def _generator_product(
         # cheapest is what let a decoy body hide a generator.
         widest = 1
         for body in bodies[name]:
-            nested = _generator_product(body, bodies, pending | {name}, budget)
+            nested = _generator_product(
+                body, bodies, pending | {name}, budget, projections
+            )
             if nested is None:
                 return None
             widest = max(widest, nested)
@@ -220,7 +276,11 @@ def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     return bodies
 
 
-def _expands_a_bounded_value(generator: exp.Expr) -> bool:
+def _expands_a_bounded_value(
+    generator: exp.Expr,
+    projections: Mapping[str, list[exp.Expr]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
     """True if the generator's input is bounded by something already priced.
 
     Two bounded shapes: a literal the agent spelled out (UNNEST(ARRAY['O','F'])
@@ -234,11 +294,35 @@ def _expands_a_bounded_value(generator: exp.Expr) -> bool:
     ]
     if not inputs:
         return False
-    return all(_is_bounded_input(value) for value in inputs)
+    return all(_is_bounded_input(value, projections, seen) for value in inputs)
 
 
-def _is_bounded_input(value: exp.Expr) -> bool:
+def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
+    """Every expression a subquery or CTE binds a name to.
+
+    A generator fed by a column is priced as the table's own rows, which is
+    right for a scanned column and wrong for one a projection built:
+    repeat(k, 1000000) AS arr is a column by the time UNNEST reads it. Names
+    are collected across the statement rather than per scope, so an alias
+    reused in two subqueries is charged for either binding.
+    """
+    projections: dict[str, list[exp.Expr]] = {}
+    for select in tree.find_all(exp.Select):
+        for projection in select.expressions:
+            if isinstance(projection, exp.Alias):
+                projections.setdefault(projection.alias.lower(), []).append(
+                    projection.this
+                )
+    return projections
+
+
+def _is_bounded_input(
+    value: exp.Expr,
+    projections: Mapping[str, list[exp.Expr]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> bool:
     """True if this generator argument yields a length something else fixes."""
+    projections = projections if projections is not None else {}
     if isinstance(value, exp.Array | exp.Struct):
         # A literal spells out its own length — but spelling out 20,000 of
         # them multiplies every scanned row by 20,000 just the same.
@@ -251,7 +335,18 @@ def _is_bounded_input(value: exp.Expr) -> bool:
             for element in (value.expressions or [])
         )
     if isinstance(value, exp.Column):
-        return True
+        # A name a projection bound is only as bounded as what it was bound
+        # to; a name nothing in the statement binds is a scanned column, whose
+        # rows the plan already counted.
+        name = value.name.lower()
+        # An alias defined in terms of itself has no length to read; stopping
+        # keeps the resolution finite without vouching for the column.
+        if name in seen:
+            return False
+        return all(
+            _is_bounded_input(bound, projections, seen | {name})
+            for bound in projections.get(name, [])
+        )
     if isinstance(value, exp.GenerateSeries):
         # sequence() spells its own length out when both ends are literal, so
         # a date spine can be priced instead of refused. Anything the length
@@ -269,7 +364,9 @@ def _is_bounded_input(value: exp.Expr) -> bool:
         ]
         # A reshaping function with no argument left to check is reshaping a
         # literal, which cannot add rows.
-        return all(_is_bounded_input(argument) for argument in arguments)
+        return all(
+            _is_bounded_input(argument, projections, seen) for argument in arguments
+        )
     return False
 
 
@@ -335,14 +432,21 @@ def _literal_int(value: exp.Expr | None, allow_string: bool = False) -> int | No
         return None
 
 
-def _generator_rows(generator: exp.Expr) -> int:
+def _generator_rows(
+    generator: exp.Expr,
+    projections: Mapping[str, list[exp.Expr]] | None = None,
+    seen: frozenset[str] = frozenset(),
+) -> int:
     """Rows a bounded generator yields: a literal array's length, or 1 for a
-    column, whose rows belong to a table the plan already priced.
+    scanned column, whose rows belong to a table the plan already priced.
 
     Every literal array under the generator counts, not only a direct child:
     MAP(ARRAY[...], ARRAY[...]) yields its key array's length, and reading
-    only the top node would price a 5000-entry lookup as one row.
+    only the top node would price a 5000-entry lookup as one row. A column a
+    projection bound counts as whatever it was bound to — array_agg over a
+    1000-row sequence is a 1000-element array by the time UNNEST reads it.
     """
+    projections = projections if projections is not None else {}
     widest = 1
     for value in generator.find_all(exp.Array, exp.Struct):
         widest = max(widest, len(value.expressions or []))
@@ -350,6 +454,12 @@ def _generator_rows(generator: exp.Expr) -> int:
         length = _sequence_length(series)
         if length is not None:
             widest = max(widest, length)
+    for column in generator.find_all(exp.Column):
+        name = column.name.lower()
+        if name in seen:
+            continue
+        for bound in projections.get(name, []):
+            widest = max(widest, _generator_rows(bound, projections, seen | {name}))
     return widest
 
 

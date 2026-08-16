@@ -271,11 +271,128 @@ def test_a_doubling_chain_of_fat_bodies_stays_under_a_second() -> None:
 
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
     # A column's rows belong to a table the plan already priced; only the
-    # inline generator's 1000 rows multiply, and 1000 sits on the cap.
+    # inline generator's rows multiply.
     assert not unpriceable(
         "SELECT t.i, s.n FROM hive.s.orders o "
         "CROSS JOIN UNNEST(o.items) AS t(i) "
-        "CROSS JOIN UNNEST(sequence(1, 1000)) AS s(n)"
+        "CROSS JOIN UNNEST(sequence(1, 100)) AS s(n)"
+    )
+
+
+# --- fanout against a table the plan prices as one scan --------------------
+
+
+def test_a_generator_crossed_with_a_table_is_capped_lower() -> None:
+    # The plan sizes this join as the table's row count, so the generator's
+    # rows are a multiplier on every scanned row: 6M lineitems x 1000 is 6e9
+    # rows quoted as one scan. Standalone the same 1000 rows are just 1000.
+    assert unpriceable(
+        "SELECT o.orderkey, t.n FROM tpch.sf1.lineitem o "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)"
+    )
+    assert not unpriceable("SELECT n FROM UNNEST(sequence(1, 1000)) AS t(n)")
+
+
+def test_a_date_spine_against_a_table_still_prices() -> None:
+    # Gap-filling a year of dates per row, or crossing a short status list,
+    # is the ordinary shape this gate must not refuse.
+    assert not unpriceable(
+        "SELECT o.orderkey, s.d FROM tpch.sf1.orders o CROSS JOIN UNNEST("
+        "sequence(DATE '1996-01-01', DATE '1996-12-31', INTERVAL '1' DAY)"
+        ") AS s(d)"
+    )
+    assert not unpriceable(
+        "SELECT o.orderkey, v.x FROM tpch.sf1.orders o "
+        "CROSS JOIN UNNEST(ARRAY['O', 'F', 'P']) AS v(x)"
+    )
+
+
+def test_the_fanout_cap_is_the_committed_value() -> None:
+    # 500 sits on the fanout cap; 501 crosses it. A stale mutation of
+    # _MAX_FANOUT_ROWS fails loudly here.
+    base = (
+        "SELECT o.orderkey, t.n FROM tpch.sf1.orders o "
+        "CROSS JOIN UNNEST(sequence(1, {n})) AS t(n)"
+    )
+    assert not unpriceable(base.format(n=500))
+    assert unpriceable(base.format(n=501))
+
+
+def test_union_branches_are_judged_one_at_a_time() -> None:
+    # Branches add rows rather than multiply them, so each is measured on its
+    # own: a fanout that is fine once is fine nine times over, and the extra
+    # scans are the byte gate's business — table_scan_counts reports nine
+    # reads, which scales that quote nine-fold.
+    branch = (
+        "SELECT o.orderkey FROM tpch.sf1.lineitem o "
+        "CROSS JOIN UNNEST(sequence(1, 2)) AS t{i}(n)"
+    )
+    nine = " UNION ALL ".join(branch.format(i=i) for i in range(9))
+    assert not unpriceable(nine)
+    assert counts(nine) == {"tpch.sf1.lineitem": 9}
+    # A single branch over the fanout cap is still refused, and a product
+    # cannot be smuggled in by splitting it across branches.
+    over = (
+        "SELECT o.orderkey FROM tpch.sf1.lineitem o "
+        "CROSS JOIN UNNEST(sequence(1, 501)) AS t(n)"
+    )
+    assert unpriceable(f"{branch.format(i=0)} UNION ALL {over}")
+
+
+# --- arrays laundered through a projection ---------------------------------
+
+
+def test_an_array_built_in_a_subquery_projection_is_not_bounded() -> None:
+    # A column of a derived table is not a scanned column: the projection
+    # can manufacture the array. 1.5M orders x 1e6 repeats is 1.5e12 rows.
+    assert unpriceable(
+        "SELECT x FROM (SELECT repeat(o.orderkey, 1000000) AS arr "
+        "FROM tpch.sf1.orders o) s CROSS JOIN UNNEST(s.arr) AS t(x)"
+    )
+
+
+def test_a_generator_laundered_through_array_agg_is_refused() -> None:
+    # array_agg turns a bounded generator into a column, which used to reset
+    # its rows to 1 and let three unnests of it count as 1x1x1.
+    assert unpriceable(
+        "SELECT count(*) FROM (SELECT array_agg(n) AS arr FROM "
+        "UNNEST(sequence(1, 1000)) t(n)) g "
+        "CROSS JOIN UNNEST(g.arr) a(x) CROSS JOIN UNNEST(g.arr) b(y) "
+        "CROSS JOIN UNNEST(g.arr) c(z)"
+    )
+
+
+def test_an_alias_defined_in_terms_of_itself_terminates() -> None:
+    # Resolving a column through projections must not follow a cycle: these
+    # shapes recursed until the interpreter's stack gave out.
+    assert unpriceable(
+        "SELECT x FROM (SELECT array_sort(arr) AS arr FROM hive.s.t) s "
+        "CROSS JOIN UNNEST(s.arr) AS t(x)"
+    )
+    assert unpriceable(
+        "SELECT x FROM (SELECT array_sort(b) AS a, array_sort(a) AS b "
+        "FROM hive.s.t) s CROSS JOIN UNNEST(s.a) AS t(x)"
+    )
+
+
+def test_laundering_through_a_chain_of_aliases_is_refused() -> None:
+    # Renaming the manufactured array on the way out must not launder it.
+    assert unpriceable(
+        "SELECT x FROM (SELECT a1 AS a2 FROM "
+        "(SELECT repeat(k, 1000000) AS a1 FROM hive.s.t) q) s "
+        "CROSS JOIN UNNEST(s.a2) AS t(x)"
+    )
+
+
+def test_unnesting_a_scanned_column_still_prices() -> None:
+    # The ordinary array-column read must survive: its rows belong to a
+    # table the plan already counted.
+    assert not unpriceable(
+        "SELECT t.i FROM hive.s.orders o CROSS JOIN UNNEST(o.items) AS t(i)"
+    )
+    assert not unpriceable(
+        "SELECT t.i FROM (SELECT items FROM hive.s.orders) s "
+        "CROSS JOIN UNNEST(s.items) AS t(i)"
     )
 
 
