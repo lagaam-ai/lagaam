@@ -16,6 +16,7 @@ per table however often the query reads it, so a self-join's *bytes* are
 undercounted even though its rows are not.
 """
 
+from collections.abc import Mapping
 from datetime import date
 
 import sqlglot
@@ -123,18 +124,33 @@ def _generates_rows(tree: exp.Expr) -> bool:
     overstatement fails closed. A generator inside a CTE multiplies once per
     reference to that CTE, not once per node in the tree.
     """
-    bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
-    return _generator_product(_without_cte_bodies(tree), bodies, frozenset()) is None
+    bodies = _cte_bodies(tree)
+    # A doubling CTE chain re-walks each body once per reference, so the walk
+    # grows exponentially in a query that stays under 1.5 KB: the same budget
+    # that bounds the byte gate's walk bounds this one.
+    budget = [_MAX_SCAN_COUNT]
+    return (
+        _generator_product(
+            _without_cte_bodies(tree), bodies, frozenset(), budget
+        )
+        is None
+    )
 
 
 def _generator_product(
-    node: exp.Expr, bodies: dict[str, exp.Expr], pending: frozenset[str]
+    node: exp.Expr,
+    bodies: Mapping[str, exp.Expr | object],
+    pending: frozenset[str],
+    budget: list[int],
 ) -> int | None:
     """Rows this subtree's generators multiply out to, or None past the cap.
 
-    None also stands for a generator the gate cannot bound at all: both mean
-    the same thing to the caller — no quote — so they share a return.
+    None also stands for a generator the gate cannot bound at all, and for a
+    walk that ran out of budget: all three mean the same thing to the caller
+    — no quote — so they share a return.
     """
+    if budget[0] <= 0:
+        return None
     product = 1
     for generator in node.find_all(*_GENERATORS):
         if not _expands_a_bounded_value(generator):
@@ -155,7 +171,11 @@ def _generator_product(
         if product > _MAX_INLINE_ROWS:
             return None
     for name in _cte_references(node, bodies, pending):
-        nested = _generator_product(bodies[name], bodies, pending | {name})
+        body = bodies[name]
+        if not isinstance(body, exp.Expr):
+            return None
+        budget[0] -= 1
+        nested = _generator_product(body, bodies, pending | {name}, budget)
         if nested is None:
             return None
         product *= nested
@@ -173,8 +193,27 @@ def _wrapped_series(node: exp.Expr) -> list[exp.Expr]:
     ]
 
 
+_SHADOWED = object()
+
+
+def _cte_bodies(tree: exp.Expr) -> dict[str, exp.Expr | object]:
+    """Every CTE body by name, with re-used names marked unresolvable.
+
+    A nested WITH may re-bind a name the outer query also uses, and which
+    body a reference means is scope's answer, not a dict's. Keying flatly let
+    the inner body silently replace the outer one — a decoy that hid a
+    generator behind a name still referenced outside it. Both gates read this
+    map, and both treat a shadowed name as something they cannot size.
+    """
+    bodies: dict[str, exp.Expr | object] = {}
+    for cte in tree.find_all(exp.CTE):
+        name = cte.alias_or_name.lower()
+        bodies[name] = _SHADOWED if name in bodies else cte.this
+    return bodies
+
+
 def _cte_references(
-    node: exp.Expr, bodies: dict[str, exp.Expr], pending: frozenset[str]
+    node: exp.Expr, bodies: Mapping[str, exp.Expr | object], pending: frozenset[str]
 ) -> list[str]:
     """CTE names this subtree reads, once per reference.
 
@@ -367,7 +406,7 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
     except sqlglot.errors.SqlglotError:
         return {}, False
 
-    bodies = {cte.alias_or_name.lower(): cte.this for cte in tree.find_all(exp.CTE)}
+    bodies = _cte_bodies(tree)
     counts: dict[str, int] = {}
     # A chain of CTEs each referenced twice doubles walk work per level of
     # depth; a running total caught before recursing bounds that growth
@@ -387,8 +426,15 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
                 # depth is the engine's business, not the quote's.
                 if name in pending:
                     continue
+                body = bodies[name]
+                # A shadowed name hides which body this reads, and the reads
+                # inside it: spend the budget so the caller denies rather
+                # than quote a count that skipped them.
+                if not isinstance(body, exp.Expr):
+                    budget[0] = 0
+                    return
                 budget[0] -= 1
-                walk(bodies[name], weight, pending | {name})
+                walk(body, weight, pending | {name})
                 continue
             key = ".".join(parts).lower()
             counts[key] = counts.get(key, 0) + weight

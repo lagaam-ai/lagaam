@@ -5,7 +5,11 @@ estimates cannot see. table_scan_counts recovers the IO plan's per-table
 undercount when a table is read more than once.
 """
 
-from lagaam.core.scans import has_unpriceable_shape, table_scan_counts
+from lagaam.core.scans import (
+    has_unpriceable_shape,
+    scan_counts_saturated,
+    table_scan_counts,
+)
 
 
 def unpriceable(sql: str) -> bool:
@@ -180,6 +184,50 @@ def test_a_bare_series_counts_toward_the_product() -> None:
         "SELECT a.n FROM UNNEST(sequence(1, 10)) AS a(n) "
         "CROSS JOIN generate_series(1, 10) AS t(n)"
     )
+
+
+def test_a_shadowed_cte_name_is_not_sized() -> None:
+    # A nested WITH re-binding an outer CTE's name used to overwrite it, so
+    # the walk read a decoy body and missed the generator still referenced
+    # outside it: 1000^3 rows quoted as none.
+    assert unpriceable(
+        "WITH a AS (SELECT x FROM UNNEST(sequence(1,1000)) AS s(x)) "
+        "SELECT * FROM (WITH a AS (SELECT 1 AS x) SELECT * FROM a) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )
+    # A decoy that collides with nothing leaves the outer body readable.
+    assert unpriceable(
+        "WITH a AS (SELECT x FROM UNNEST(sequence(1,1000)) AS s(x)) "
+        "SELECT * FROM (WITH zz AS (SELECT 1 AS x) SELECT * FROM zz) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3"
+    )
+
+
+def test_a_shadowed_cte_name_saturates_the_scan_count() -> None:
+    # The same decoy hid the reads from the byte gate, which returned {} and
+    # scaled nothing. Saturation is what makes the caller deny.
+    assert scan_counts_saturated(
+        "WITH a AS (SELECT x FROM tpch.sf1.orders) "
+        "SELECT * FROM (WITH a AS (SELECT 1 AS x) SELECT * FROM a) z "
+        "CROSS JOIN a w1 CROSS JOIN a w2 CROSS JOIN a w3",
+        dialect="trino",
+    )
+
+
+def test_a_generator_walk_of_a_doubling_chain_stays_under_a_second() -> None:
+    # A chain whose product never trips the cap runs the walk in full: at 24
+    # links an unbudgeted walk took 201s on a 1.2 KB query, before any engine
+    # call. The walk budget must bound it the way the byte gate's already is.
+    import time
+
+    head = "WITH c0 AS (SELECT a FROM hive.s.t),"
+    links = ",".join(
+        f"c{i} AS (SELECT 1 AS x FROM c{i - 1} a CROSS JOIN c{i - 1} b)"
+        for i in range(1, 24)
+    )
+    start = time.perf_counter()
+    unpriceable(f"{head}{links} SELECT x FROM c23")
+    assert time.perf_counter() - start < 1.0
 
 
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
