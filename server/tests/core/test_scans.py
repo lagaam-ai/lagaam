@@ -1299,3 +1299,43 @@ def test_a_long_spine_against_a_table_is_priced_not_refused() -> None:
         "SELECT n.n_name, t.n FROM tpch.sf1.nation n "
         "CROSS JOIN UNNEST(sequence(1, 100000000)) AS t(n)"
     )
+
+
+def test_a_table_the_generator_never_meets_does_not_raise_the_cap() -> None:
+    # The loosened cap asks whether the plan will carry these rows, and a
+    # table inside EXISTS, an uncorrelated scalar subquery or an IN predicate
+    # carries nothing: the generator still runs alone. Reading "a table is
+    # mentioned somewhere" instead let a 10,000,000-row spine through where
+    # 1000 is the limit.
+    for where in (
+        "WHERE EXISTS (SELECT 1 FROM tpch.sf1.orders o)",
+        "WHERE n IN (SELECT o.orderkey FROM tpch.sf1.orders o)",
+    ):
+        assert unpriceable(
+            f"SELECT n FROM UNNEST(sequence(1, 5000000)) AS t(n) {where}"
+        ), where
+    assert unpriceable(
+        "SELECT n, (SELECT count(*) FROM tpch.sf1.orders) "
+        "FROM UNNEST(sequence(1, 5000000)) AS t(n)"
+    )
+    assert unpriceable(
+        "SELECT n FROM UNNEST(sequence(1, 5000000)) AS t(n) "
+        "WHERE n NOT IN (SELECT o.orderkey FROM tpch.sf1.orders o)"
+    )
+    # Controls: a table the generator really is crossed with prices it, in
+    # every spelling, and an unrelated EXISTS alongside changes nothing.
+    spine = "UNNEST(sequence(1, 5000000)) AS t(n)"
+    for joined in (
+        f"SELECT o.orderkey, t.n FROM tpch.sf1.orders o CROSS JOIN {spine}",
+        f"SELECT o.orderkey, t.n FROM tpch.sf1.orders o, {spine}",
+        (
+            "WITH b AS (SELECT orderkey FROM tpch.sf1.orders) "
+            f"SELECT b.orderkey, t.n FROM b CROSS JOIN {spine}"
+        ),
+        (
+            f"SELECT o.orderkey, t.n FROM tpch.sf1.orders o CROSS JOIN {spine} "
+            "WHERE EXISTS (SELECT 1 FROM tpch.sf1.nation x)"
+        ),
+    ):
+        assert not unpriceable(joined), joined
+        assert fanout(joined) == 5_000_000, joined

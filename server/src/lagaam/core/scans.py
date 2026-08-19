@@ -222,6 +222,26 @@ def generator_fanout(sql: str, dialect: str) -> int:
     return widest
 
 
+def _without_unmet_relations(node: exp.Expr) -> exp.Expr:
+    """The subtree with the relations nothing joins to detached.
+
+    A table under EXISTS or an IN predicate answers a question about each
+    row; one in a scalar subquery in the SELECT list contributes a value to
+    it. Neither pairs its rows with the branch's, so neither is a table a
+    generator's rows can be a multiplier on.
+    """
+    copy = node.copy()
+    for predicate in list(copy.find_all(exp.Exists, exp.In)):
+        for relation in list(predicate.find_all(exp.Table)):
+            relation.pop()
+    for select in list(copy.find_all(exp.Select)):
+        for projection in select.expressions:
+            for subquery in list(projection.find_all(exp.Subquery)):
+                for relation in list(subquery.find_all(exp.Table)):
+                    relation.pop()
+    return copy
+
+
 def _reads_a_table(
     node: exp.Expr, bodies: Mapping[str, list[exp.Expr]], pending: frozenset[str]
 ) -> bool:
@@ -271,7 +291,10 @@ def _generator_product(
     # Whether the plan will carry this branch's rows decides how large a
     # spelled-out spine may be: crossed with a table it is a multiplier the
     # budget applies to a real cardinality, and alone it is all there is.
-    priced = _reads_a_table(node, bodies, pending)
+    # It has to be a table the generator actually MEETS — one inside EXISTS,
+    # an IN predicate or an uncorrelated scalar subquery carries nothing, and
+    # counting it let a 10,000,000-row spine through where 1000 is the limit.
+    priced = _reads_a_table(_without_unmet_relations(node), bodies, pending)
     product = 1
     wrapped: set[int] = set()
     loose: list[exp.GenerateSeries] = []
