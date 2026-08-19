@@ -528,13 +528,24 @@ def _non_aggregate_projections(select: exp.Select) -> list[exp.Expr]:
     return standing
 
 
-def _group_key_column(key: exp.Expr, select: exp.Select) -> exp.Column | None:
-    """The column a group key names, or None if it names something else.
+# What a group key contributes to the partition: a column it names, the
+# nothing a constant adds, or something this cannot read.
+_NAMES_NO_COLUMN = "unreadable"
+_PARTITIONS_NOTHING = "constant"
+
+
+def _group_key_column(
+    key: exp.Expr, select: exp.Select, seen: frozenset[int] = frozenset()
+) -> exp.Column | str:
+    """What a group key contributes: the column it names, or why it names none.
 
     A key is read by what it partitions on, not by how it is spelled:
     parentheses wrap the same column, and a positional ordinal points at a
     projection which may itself be one. An expression over a column names no
-    column — grouping by it can merge rows, so it is not an identity.
+    column — grouping by it can merge rows. A constant names none either, but
+    it also partitions nothing, so it neither makes an identity nor breaks
+    one: GROUP BY x and GROUP BY x, TRUE are the same partition, and reading
+    the second as a reduction dropped a 10,000,000x multiplier.
     """
     while isinstance(key, exp.Paren):
         key = key.this
@@ -544,14 +555,36 @@ def _group_key_column(key: exp.Expr, select: exp.Select) -> exp.Column | None:
         try:
             position = int(key.name)
         except ValueError:
-            return None
+            return _NAMES_NO_COLUMN
         if not 1 <= position <= len(select.expressions):
-            return None
+            return _NAMES_NO_COLUMN
+        # Two projections can name each other's position; following that
+        # exhausted the stack, and the error was swallowed as "no multiplier".
+        if position in seen:
+            return _NAMES_NO_COLUMN
         projected = select.expressions[position - 1]
         if isinstance(projected, exp.Alias):
             projected = projected.this
-        return _group_key_column(projected, select)
-    return None
+        return _group_key_column(projected, select, seen | {position})
+    if _partitions_nothing(key):
+        return _PARTITIONS_NOTHING
+    return _NAMES_NO_COLUMN
+
+
+def _partitions_nothing(key: exp.Expr) -> bool:
+    """True if this key has one value for every row, so it adds no groups.
+
+    Anything built without reading a column is the same for every row,
+    whatever shape it is written in: a literal, a boolean, arithmetic over
+    them, a call like current_date that takes no argument at all. Listing
+    the shapes instead let `1 + 1` and `abs(-1)` through as unreadable.
+
+    A subquery is not constant for this purpose even when it is scalar: it
+    is not read here, and a key nobody read is not one to vouch for.
+    """
+    if key.find(exp.Column, exp.Subquery, exp.Star) is not None:
+        return False
+    return key.find(exp.Literal, exp.Boolean, exp.Null, exp.Func) is not None
 
 
 def _groups_by_what_the_generators_make(
@@ -566,8 +599,12 @@ def _groups_by_what_the_generators_make(
     # GROUP BY (x) partition exactly as GROUP BY x does, and requiring a
     # bare Column node excused both.
     resolved = [_group_key_column(key, select) for key in stated]
-    columns = [key for key in resolved if key is not None]
-    if len(columns) != len(stated) or not columns:
+    if any(key is _NAMES_NO_COLUMN for key in resolved):
+        return False
+    # A constant is dropped rather than counted: it adds no groups, so it
+    # neither makes the partition an identity nor stops it being one.
+    columns = [key for key in resolved if isinstance(key, exp.Column)]
+    if not columns:
         return False
     # Keyed by the relation that supplies each column, not by name alone: a
     # qualifier is what distinguishes one relation's "x" from another's, and

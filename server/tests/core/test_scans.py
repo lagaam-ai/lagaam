@@ -1693,3 +1693,74 @@ def test_counting_reads_refuses_rather_than_raising_on_deep_nesting() -> None:
 
     assert table_scan_counts(chain, "trino") == {}
     assert scan_counts_saturated(chain, "trino")
+
+
+def test_an_ordinal_outside_the_projection_list_names_nothing() -> None:
+    # A positional key is only a column where the position exists: without
+    # the bounds check an out-of-range ordinal raised IndexError out of the
+    # gate, and GROUP BY 0 read the last projection as the first.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    spine = "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {key}"
+    assert fanout(outer.format(body=spine.format(key="1"))) == 10_000
+    for key in ("0", "-1", "9"):
+        assert fanout(outer.format(body=spine.format(key=key))) == 1, key
+
+
+def test_the_relation_a_join_names_is_kept() -> None:
+    # Stripping a JOIN's predicate must not strip the relation it joins: a
+    # spine joined to a real table is priced from that table's cardinality,
+    # and dropping it would refuse an ordinary query outright.
+    joined = (
+        "SELECT t.n FROM UNNEST(sequence(1, 5000000)) AS t(n) "
+        "JOIN tpch.sf1.orders o ON o.orderkey = t.n"
+    )
+    assert not unpriceable(joined)
+    assert fanout(joined) == 5_000_000
+
+
+def test_a_constant_group_key_adds_no_partition_and_hides_nothing() -> None:
+    # A constant key partitions nothing: GROUP BY x and GROUP BY x, TRUE are
+    # the same partition. Treating "this key names no column" as "this is not
+    # the identity" let one extra token drop a 10,000,000x multiplier.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    spine = "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
+    for keys in (
+        "x",
+        "x, TRUE",
+        "x, NULL",
+        "x, 'k'",
+        "TRUE, x",
+        "1, TRUE",
+        "x, current_date",
+        "x, 1 + 1",
+        "x, abs(-1)",
+        "x, -1",
+    ):
+        assert fanout(outer.format(body=spine.format(keys=keys))) == 10_000, keys
+    # A call over the column is not a constant, whatever it is called.
+    for keys in ("x, abs(x)", "x, x + 1", "x, cast(x AS varchar)", "x, (SELECT 1)"):
+        assert fanout(outer.format(body=spine.format(keys=keys))) == 1, keys
+    # A constant alone partitions everything into one group, which is a real
+    # collapse, and an expression over a column still merges rows.
+    assert fanout(outer.format(body=spine.format(keys="TRUE"))) == 1
+    assert fanout(outer.format(body=spine.format(keys="x % 7"))) == 1
+    assert fanout(outer.format(body=spine.format(keys="x % 7, TRUE"))) == 1
+
+
+def test_an_ordinal_that_points_at_itself_terminates() -> None:
+    # Positional keys resolve through the projection they name, and two
+    # projections that name each other's position are a cycle: it exhausted
+    # the stack, and the RecursionError was swallowed into "no multiplier".
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    cyclic = (
+        "SELECT x AS v, 3 AS a, 2 AS c FROM UNNEST(sequence(1, 10000)) AS t(x) "
+        "GROUP BY 1, 2, 3"
+    )
+    # Keys 2 and 3 name each other, so they name no column: a reduction the
+    # SQL cannot size, charged rather than followed.
+    assert fanout(outer.format(body=cyclic)) == 1
+    assert not unpriceable(outer.format(body=cyclic))
+    self_pointing = (
+        "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY 1"
+    )
+    assert fanout(outer.format(body=self_pointing)) == 1
