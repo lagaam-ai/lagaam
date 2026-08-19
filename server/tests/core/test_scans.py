@@ -1738,7 +1738,7 @@ def test_a_constant_group_key_adds_no_partition_and_hides_nothing() -> None:
     ):
         assert fanout(outer.format(body=spine.format(keys=keys))) == 10_000, keys
     # A call over the column is not a constant, whatever it is called.
-    for keys in ("x, abs(x)", "x, x + 1", "x, cast(x AS varchar)", "x, (SELECT 1)"):
+    for keys in ("x, abs(x)", "x, x + 1", "x, cast(x AS varchar)"):
         assert fanout(outer.format(body=spine.format(keys=keys))) == 1, keys
     # A constant alone partitions everything into one group, which is a real
     # collapse, and an expression over a column still merges rows.
@@ -1764,3 +1764,57 @@ def test_an_ordinal_that_points_at_itself_terminates() -> None:
         "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY 1"
     )
     assert fanout(outer.format(body=self_pointing)) == 1
+
+
+def test_a_key_that_varies_per_row_is_not_a_constant() -> None:
+    # "Reads no column" was standing in for "has one value per row", and
+    # rand() and uuid() are the two expressions in SQL furthest from
+    # constant. Dropped as if they added no groups, they forged an identity
+    # out of a key list that was a genuine reduction: measured on Trino,
+    # 1000x1000 spines grouped by t.x alone yield 1,000 groups and by
+    # t.x, uuid() a million.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    for keys in ("t.x, s.y", "t.x, uuid()", "t.x, rand()", "t.x, coalesce(rand(), 0)"):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 9_000_000, keys
+    # A key that really is one value per row still adds no groups.
+    assert fanout(outer.format(body=two.format(keys="t.x, s.y, TRUE"))) == 9_000_000
+    assert fanout(outer.format(body=two.format(keys="t.x, TRUE"))) == 1
+
+
+def test_a_key_the_gate_cannot_read_keeps_the_multiplier() -> None:
+    # An unreadable key was answering "not an identity", which DROPS the
+    # multiplier — the under-quote direction. What the gate cannot read must
+    # not be able to discount a query: one extra token took a 10,000,000x
+    # multiplier to 1.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    spine = "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
+    for keys in ("x", "x, TRUE", "x, (SELECT 1)"):
+        assert fanout(outer.format(body=spine.format(keys=keys))) == 10_000, keys
+    # A key that genuinely merges rows still collapses.
+    assert fanout(outer.format(body=spine.format(keys="x % 7"))) == 1
+
+
+def test_a_statement_of_many_generators_stays_under_a_second() -> None:
+    # Deciding where each generator's rows land walks the branch again per
+    # generator, and that walk was the one the budget never charged: the
+    # cost is quadratic in generator count, so 49 KB of SQL took 5.7s before
+    # Trino was contacted.
+    import time
+
+    generators = ",".join(
+        f"UNNEST(sequence(1, 1)) AS t{i}(x{i})" for i in range(1200)
+    )
+    keys = ",".join(f"x{i}" for i in range(1200))
+    wide = (
+        "SELECT 1 FROM tpch.sf1.orders o, "
+        f"(SELECT 1 AS v FROM {generators} GROUP BY {keys}) g"
+    )
+
+    start = time.perf_counter()
+    unpriceable(wide)
+    fanout(wide)
+    assert time.perf_counter() - start < 1.0

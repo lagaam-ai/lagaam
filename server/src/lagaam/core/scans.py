@@ -16,7 +16,7 @@ per table however often the query reads it, so a self-join's *bytes* are
 undercounted even though its rows are not.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import date
 
 import sqlglot
@@ -373,6 +373,10 @@ def _generator_product(
     # an IN predicate or an uncorrelated scalar subquery carries nothing, and
     # counting it let a 10,000,000-row spine through where 1000 is the limit.
     priced = _reads_a_table(_without_unmet_relations(node), bodies, pending)
+    # One answer per select for "does this scope narrow" and "does it scan":
+    # both are about the select alone, and asking per generator made the walk
+    # quadratic in generator count.
+    landing: dict[tuple[str, int], bool] = {}
     product = 1
     wrapped: set[int] = set()
     loose: list[exp.GenerateSeries] = []
@@ -394,7 +398,7 @@ def _generator_product(
                 child, projections, budget=budget, priced_by_a_table=priced
             ):
                 return None
-            if for_pricing and not _multiplies_its_branch(child, node):
+            if for_pricing and not _multiplies_its_branch(child, node, landing):
                 continue
             product *= _generator_rows(child, projections, budget=budget)
             if product > _MAX_COUNTED_ROWS:
@@ -412,7 +416,7 @@ def _generator_product(
     for series in loose:
         if id(series) in wrapped:
             continue
-        if for_pricing and not _multiplies_its_branch(series, node):
+        if for_pricing and not _multiplies_its_branch(series, node, landing):
             continue
         length = _sequence_length(series)
         if length is None or length > _MAX_COUNTED_ROWS:
@@ -456,6 +460,26 @@ def _generator_product(
         if product > _MAX_COUNTED_ROWS:
             return None
     return product
+
+
+def _remembered(
+    question: str,
+    select: exp.Select,
+    answer: "Callable[[exp.Select], bool]",
+    answered: dict[tuple[str, int], bool] | None,
+) -> bool:
+    """One answer per select, not one per generator that asks.
+
+    Both questions are about the select alone, but they were re-asked once
+    per generator and each walks the whole subtree: the cost was quadratic
+    in generator count, and 49 KB of SQL took 5.7 seconds.
+    """
+    if answered is None:
+        return answer(select)
+    key = (question, id(select))
+    if key not in answered:
+        answered[key] = answer(select)
+    return answered[key]
 
 
 def _scans_a_table(select: exp.Select) -> bool:
@@ -528,10 +552,46 @@ def _non_aggregate_projections(select: exp.Select) -> list[exp.Expr]:
     return standing
 
 
+# Calls that answer the same for every row of a query. Anything absent is
+# assumed to vary — rand() and uuid() read no column and differ per row, and
+# an allowlist is the only sound direction when the failure mode is a
+# multiplier silently dropped.
+_ONE_VALUE_PER_QUERY = {
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "currenttimestamp",
+    "currentdate",
+    "currenttime",
+    "now",
+    "localtime",
+    "localtimestamp",
+    "abs",
+    "ceil",
+    "floor",
+    "round",
+    "length",
+    "upper",
+    "lower",
+    "concat",
+    "typeof",
+    "cast",
+    "try_cast",
+    "coalesce",
+    "nullif",
+    "if",
+    "array",
+    "struct",
+    "map",
+    "interval",
+}
+
 # What a group key contributes to the partition: a column it names, the
-# nothing a constant adds, or something this cannot read.
+# nothing a constant adds, a split of some column this cannot follow, or a
+# value that varies without reading a column at all.
 _NAMES_NO_COLUMN = "unreadable"
 _PARTITIONS_NOTHING = "constant"
+_ONLY_SPLITS_FURTHER = "row-varying"
 
 
 def _group_key_column(
@@ -568,23 +628,48 @@ def _group_key_column(
         return _group_key_column(projected, select, seen | {position})
     if _partitions_nothing(key):
         return _PARTITIONS_NOTHING
+    # A key that reads no column cannot merge rows the columns separated —
+    # it can only cut them finer, so it neither makes nor breaks an identity.
+    # One that does read a column may reshape it (x % 7 merges seven rows
+    # into one), and that this cannot follow.
+    if key.find(exp.Column, exp.Star) is None:
+        return _ONLY_SPLITS_FURTHER
     return _NAMES_NO_COLUMN
 
 
 def _partitions_nothing(key: exp.Expr) -> bool:
-    """True if this key has one value for every row, so it adds no groups.
+    """True if this key provably has one value for every row.
 
-    Anything built without reading a column is the same for every row,
-    whatever shape it is written in: a literal, a boolean, arithmetic over
-    them, a call like current_date that takes no argument at all. Listing
-    the shapes instead let `1 + 1` and `abs(-1)` through as unreadable.
-
-    A subquery is not constant for this purpose even when it is scalar: it
-    is not read here, and a key nobody read is not one to vouch for.
+    "Reads no column" is not that property: rand() and uuid() read nothing
+    and differ on every row, and dropping them as constants forged an
+    identity out of a key list that really did reduce. So this is an
+    allowlist of the shapes that cannot vary — literals and arithmetic over
+    them, and the deterministic calls that take no argument at all. A
+    function not named here varies until something proves otherwise, which
+    keeps the multiplier rather than discounting it.
     """
-    if key.find(exp.Column, exp.Subquery, exp.Star) is not None:
-        return False
-    return key.find(exp.Literal, exp.Boolean, exp.Null, exp.Func) is not None
+    if isinstance(key, exp.Literal | exp.Boolean | exp.Null):
+        return True
+    # The empty grouping: every row falls in one group.
+    if isinstance(key, exp.Tuple) and not key.expressions:
+        return True
+    # A scalar subquery is evaluated once for the statement, so it answers
+    # the same for every row — it cannot split the partition.
+    if isinstance(key, exp.Subquery):
+        return True
+    if isinstance(key, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
+        return _partitions_nothing(key.this)
+    if isinstance(key, exp.Binary):
+        return _partitions_nothing(key.this) and _partitions_nothing(key.expression)
+    if isinstance(key, exp.Func):
+        if _func_name(key) not in _ONE_VALUE_PER_QUERY:
+            return False
+        return all(
+            _partitions_nothing(argument)
+            for argument in _func_arguments(key)
+            if not isinstance(argument, exp.DataType)
+        )
+    return False
 
 
 def _groups_by_what_the_generators_make(
@@ -599,6 +684,14 @@ def _groups_by_what_the_generators_make(
     # GROUP BY (x) partition exactly as GROUP BY x does, and requiring a
     # bare Column node excused both.
     resolved = [_group_key_column(key, select) for key in stated]
+    # A key reading no column can only cut the partition finer, never merge
+    # what the columns separated, so the grouping still returns at least one
+    # row per row produced. Reading it as "not an identity" DROPS the
+    # multiplier, which is how `, uuid()` discounted a query by nine million.
+    if any(key is _ONLY_SPLITS_FURTHER for key in resolved):
+        return True
+    # A key over a column may reshape it — x % 7 merges seven rows into one —
+    # and that this cannot follow, so it stays a reduction.
     if any(key is _NAMES_NO_COLUMN for key in resolved):
         return False
     # A constant is dropped rather than counted: it adds no groups, so it
@@ -677,7 +770,11 @@ def _collapses_on_the_way_out(body: exp.Expr) -> bool:
     return _narrows_its_rows(select)
 
 
-def _multiplies_its_branch(generator: exp.Expr, root: exp.Expr) -> bool:
+def _multiplies_its_branch(
+    generator: exp.Expr,
+    root: exp.Expr,
+    answered: dict[tuple[str, int], bool] | None = None,
+) -> bool:
     """True if this generator's rows meet the branch's rows and multiply them.
 
     A generator in a FROM or a JOIN crosses whatever else the branch reads.
@@ -707,8 +804,8 @@ def _multiplies_its_branch(generator: exp.Expr, root: exp.Expr) -> bool:
             # rows as six million.
             if (
                 parent is not branch_select
-                and _narrows_its_rows(parent)
-                and not _scans_a_table(parent)
+                and _remembered("narrows", parent, _narrows_its_rows, answered)
+                and not _remembered("scans", parent, _scans_a_table, answered)
             ):
                 return False
         # EXISTS and IN test for a match; neither pairs the outer row with
