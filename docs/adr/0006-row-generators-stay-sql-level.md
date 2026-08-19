@@ -62,6 +62,15 @@ among them is refused rather than followed.
   `LAGAAM_MAX_INTERMEDIATE_ROWS` is the lever for a wider spine.
 - The row-preserving allowlist must track Trino's array functions; an
   unknown-but-harmless function is over-blocked — the fail-safe direction.
+- A GROUP BY over a generator's own columns returns one row per row it
+  made, so the multiplier survives it. Whether any *other* key reduces that
+  partition is a cardinality question, and this ADR's own rule keeps those
+  with the plan: `(SELECT s.y)` alongside a subset of the keys restores the
+  identity, `(SELECT s.y > 0)` holds two values and does not, and the SQL
+  does not say which. Both are charged the full multiplier. That over-quotes
+  the second — a denial the operator can raise `LAGAAM_MAX_INTERMEDIATE_ROWS`
+  for — where reading them the other way would under-quote the first, which
+  is a query admitted at a fraction of its cost. The gate takes the denial.
 - A generator *equi-joined* to a table is charged its full size even though
   the join key may match one row apiece: `orders LEFT JOIN UNNEST(spine) ON
   s.d = o.orderdate` quotes 182x its real work. Reading the key's

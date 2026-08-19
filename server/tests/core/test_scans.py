@@ -1934,3 +1934,34 @@ def test_a_derived_relation_supplies_names_like_any_other() -> None:
         assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
     # A key that really does read the outer row still splits.
     assert fanout(outer.format(body=two.format(keys="t.x, (SELECT s.y)"))) == 9_000_000
+
+
+def test_a_correlated_key_restoring_a_subset_over_quotes_on_purpose() -> None:
+    # A correlated key varies with the row, but HOW MUCH is a cardinality
+    # question ADR 0004 keeps with the plan, and the two directions are
+    # indistinguishable in the SQL: measured on Trino, two 100x100 spines
+    # grouped by `t.x, (SELECT s.y)` give 10,000 groups — the identity — and
+    # by `t.x, (SELECT s.y > 0)` give 100, because that key holds two values.
+    #
+    # Both are charged the full multiplier. That over-quotes the second,
+    # which the row budget then denies; reading them the other way would
+    # under-quote the first, which is a query admitted at a fraction of its
+    # cost. Between a denial the operator can raise a budget for and a
+    # multiplier silently lost, this gate takes the denial.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    for keys in (
+        "t.x, (SELECT s.y)",
+        "t.x, (SELECT s.y > 0)",
+        "t.x, (SELECT 1 WHERE s.y > 0)",
+    ):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 9_000_000, keys
+    # A key reading no column is per-row by construction, so it restores a
+    # subset without the guesswork.
+    assert fanout(outer.format(body=two.format(keys="t.x, uuid()"))) == 9_000_000
+    # And with nothing to restore, it decides nothing either way.
+    lone = "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
+    assert fanout(outer.format(body=lone.format(keys="(SELECT x)"))) == 1

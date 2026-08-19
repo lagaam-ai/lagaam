@@ -654,6 +654,7 @@ def _group_key_column(
     # into one), and that this cannot follow.
     if key.find(exp.Column, exp.Star) is None:
         return _ONLY_SPLITS_FURTHER
+    
     # A correlated subquery adds the row's own value to the partition rather
     # than replacing a key with a reshaping of it: measured on Trino, two
     # 100x100 spines grouped by `t.x, (SELECT s.y)` give 10,000 groups where
