@@ -183,9 +183,34 @@ def _generates_rows(tree: exp.Expr) -> bool:
 
 
 def _union_branches(node: exp.Expr) -> list[exp.Expr]:
-    """Each arm of a set operation, or the query itself if there is none."""
+    """Each arm rows are ADDED across, or the query itself if there is none.
+
+    Only UNION: an INTERSECT or EXCEPT arm cannot add rows to the result, so
+    judging it separately would let each arm carry its own product. Left
+    whole, the widest generator in either arm binds the statement — the
+    conservative reading.
+    """
     if isinstance(node, exp.Union):
         return [*_union_branches(node.this), *_union_branches(node.expression)]
+    return [node]
+
+
+def _projecting_arms(node: exp.Expr) -> list[exp.Expr]:
+    """Every arm of a set operation that can put a value under a name.
+
+    Wider than _union_branches on purpose: this answers "what could this
+    name hold", and INTERSECT and EXCEPT arms project just as UNION arms do.
+    A parenthesised arm parses as a Subquery, so one pair of brackets hid an
+    arm from a walk that only recursed on Union — and the array it built
+    read as a scanned column.
+    """
+    if isinstance(node, exp.SetOperation):
+        return [
+            *_projecting_arms(node.this),
+            *_projecting_arms(node.expression),
+        ]
+    if isinstance(node, exp.Subquery):
+        return _projecting_arms(node.this)
     return [node]
 
 
@@ -389,14 +414,71 @@ def _scans_a_table(select: exp.Select) -> bool:
     return False
 
 
+def _narrows_its_rows(select: exp.Select) -> bool:
+    """True if fewer rows leave this select than its FROM produced.
+
+    The question is cardinality, not syntax. A bare aggregate yields exactly
+    one row. A GROUP BY yields one row per distinct key — a reduction only if
+    the key is something other than what the generator itself enumerates:
+    GROUP BY over a distinct spine is the identity, and reading it as a
+    collapse priced 60 billion rows as six million. A window function is an
+    aggregate node that adds a column and removes no row at all.
+    """
+    grouped = select.args.get("group")
+    if grouped is not None:
+        # Whether a GROUP BY reduces anything is a cardinality question, and
+        # ADR 0004 keeps those with the plan. The one case SQL settles on its
+        # own is a key list that names exactly the columns the generators in
+        # this select produce: one row per row they made, the identity, which
+        # read as a collapse priced 60 billion rows as six million. Anything
+        # else — a key from a joined relation, an expression, a subset — is
+        # charged as a reduction, the fail-safe direction for a multiplier.
+        return not _groups_by_what_the_generators_make(select, grouped)
+    # A window function carries an OVER clause; only a plain aggregate with
+    # no grouping reduces the select to a single row.
+    return any(
+        aggregate.find_ancestor(exp.Window) is None
+        for aggregate in select.find_all(exp.AggFunc, bfs=False)
+        if _is_in_this_select(aggregate, select)
+    )
+
+
+def _groups_by_what_the_generators_make(
+    select: exp.Select, grouped: exp.Group
+) -> bool:
+    """True if the group keys are exactly the columns this select's
+    generators enumerate, so grouping returns one row per row they made."""
+    keys = [key for key in grouped.expressions if isinstance(key, exp.Column)]
+    if len(keys) != len(grouped.expressions) or not keys:
+        return False
+    produced: set[str] = set()
+    relations = 0
+    for source in select.find_all(exp.Table, exp.Unnest, bfs=False):
+        relations += 1
+        if not isinstance(source, exp.Unnest):
+            continue
+        alias = source.args.get("alias")
+        for column in getattr(alias, "columns", []) or []:
+            produced.add(column.name.lower())
+    # Every relation in the FROM must be one of those generators: a joined
+    # table brings rows the keys do not identify, and how many is the plan's
+    # answer, not the SQL's.
+    if relations != len(list(select.find_all(exp.Unnest, bfs=False))):
+        return False
+    return bool(produced) and {key.name.lower() for key in keys} == produced
+
+
+def _is_in_this_select(node: exp.Expr, select: exp.Select) -> bool:
+    """True if the nearest enclosing select is this one, not a nested query."""
+    return node.find_ancestor(exp.Select) is select
+
+
 def _collapses_on_the_way_out(body: exp.Expr) -> bool:
-    """True if this scope's select aggregates, so its rows leave it narrowed."""
+    """True if this scope's select narrows its rows before they leave it."""
     select = body if isinstance(body, exp.Select) else body.find(exp.Select)
     if select is None:
         return False
-    return bool(
-        list(select.find_all(exp.AggFunc, bfs=False)) or select.args.get("group")
-    )
+    return _narrows_its_rows(select)
 
 
 def _multiplies_its_branch(generator: exp.Expr, root: exp.Expr) -> bool:
@@ -423,16 +505,14 @@ def _multiplies_its_branch(generator: exp.Expr, root: exp.Expr) -> bool:
             # to each row rather than rows of its own.
             if node.arg_key == "expressions":
                 return False
-            # An aggregate only spares the work if the scope builds nothing
-            # of its own: one already crossed with a table runs after those
-            # rows exist, and excusing it quoted 6 billion rows as six
-            # million.
-            if parent is not branch_select and _scans_a_table(parent):
-                node = parent
-                continue
-            if parent is not branch_select and (
-                list(parent.find_all(exp.AggFunc, bfs=False))
-                or parent.args.get("group")
+            # A narrowing scope spares the work only where it builds nothing
+            # of its own: one over a generator already crossed with a table
+            # runs after those rows exist, and excusing it quoted 6 billion
+            # rows as six million.
+            if (
+                parent is not branch_select
+                and _narrows_its_rows(parent)
+                and not _scans_a_table(parent)
             ):
                 return False
         # EXISTS and IN test for a match; neither pairs the outer row with
@@ -526,7 +606,7 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
         # operation carries whatever any arm projects, and reading only the
         # leading Select let a later arm's manufactured array pass as a
         # scanned column.
-        for branch in _union_branches(body):
+        for branch in _projecting_arms(body):
             select = branch.find(exp.Select)
             if select is None:
                 continue

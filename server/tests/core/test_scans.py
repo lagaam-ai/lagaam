@@ -1339,3 +1339,111 @@ def test_a_table_the_generator_never_meets_does_not_raise_the_cap() -> None:
     ):
         assert not unpriceable(joined), joined
         assert fanout(joined) == 5_000_000, joined
+
+
+def test_an_alias_list_binds_every_set_operation_arm() -> None:
+    # Binding every UNION arm was not enough: _union_branches recursed only
+    # on exp.Union, so one pair of parentheses (which parses as a Subquery)
+    # or an INTERSECT/EXCEPT hid the arm that built the array, and UNNEST
+    # read it as a scanned column again.
+    hidden = "repeat(1, 1000000)"
+    for body in (
+        f"SELECT ARRAY[1] UNION ALL (SELECT ARRAY[2] UNION ALL SELECT {hidden})",
+        f"SELECT ARRAY[1] EXCEPT SELECT {hidden}",
+        f"SELECT ARRAY[1] INTERSECT SELECT {hidden}",
+        f"(SELECT {hidden}) UNION ALL SELECT ARRAY[1]",
+    ):
+        assert unpriceable(
+            f"WITH v(arr) AS ({body}) SELECT o.orderkey, x "
+            "FROM tpch.sf1.orders o CROSS JOIN v CROSS JOIN UNNEST(v.arr) AS t(x)"
+        ), body
+    # Control: every arm bounded stays priceable, and keeps its widest size.
+    bounded = (
+        "WITH v(arr) AS (SELECT ARRAY[1] UNION ALL "
+        "(SELECT ARRAY[2, 3] UNION ALL SELECT ARRAY[4, 5, 6])) "
+        "SELECT o.orderkey, x FROM tpch.sf1.orders o "
+        "CROSS JOIN v CROSS JOIN UNNEST(v.arr) AS t(x)"
+    )
+    assert not unpriceable(bounded)
+    assert fanout(bounded) == 3
+
+
+def test_a_scope_that_narrows_nothing_does_not_excuse_the_multiplier() -> None:
+    # The collapse rule asked whether a scope holds an aggregate node. The
+    # property that matters is whether it REDUCES cardinality, and GROUP BY
+    # on an already-distinct spine is the identity: 10,000 rows in, 10,000
+    # out. A window function is an AggFunc node and collapses nothing at all.
+    spine = "SELECT x{extra} FROM UNNEST(sequence(1, 10000)) AS t(x){tail}"
+    for label, extra, tail in (
+        ("group by the spine key", "", " GROUP BY x"),
+        ("window function", ", count(*) OVER () AS c", ""),
+        ("aggregate only in a scalar subquery", ", (SELECT max(1)) AS m", ""),
+    ):
+        sql = (
+            "SELECT l.orderkey, s.x FROM tpch.sf1.lineitem l CROSS JOIN ("
+            + spine.format(extra=extra, tail=tail)
+            + ") s"
+        )
+        assert fanout(sql) == 10_000, label
+
+    # Control: a real reduction to one row still excuses the multiplier.
+    assert (
+        fanout(
+            "SELECT l.orderkey, s.n FROM tpch.sf1.lineitem l CROSS JOIN "
+            "(SELECT count(*) AS n FROM UNNEST(sequence(1, 10000)) AS t(x)) s"
+        )
+        == 1
+    )
+    # And a group whose key is not the spine still collapses it: the rows
+    # leaving are the distinct keys, which the generator does not set.
+    assert (
+        fanout(
+            "SELECT l.orderkey, s.c FROM tpch.sf1.lineitem l CROSS JOIN "
+            "(SELECT count(*) AS c FROM UNNEST(sequence(1, 10000)) AS t(x) "
+            "GROUP BY x % 7) s"
+        )
+        == 1
+    )
+
+
+def test_a_group_by_collapses_only_where_sql_can_say_so() -> None:
+    # Whether a GROUP BY reduces rows is a cardinality question, and ADR 0004
+    # keeps those with the plan. The one case SQL settles alone is a key list
+    # naming exactly what the select's generators enumerate.
+    outer = "SELECT l.orderkey, s.v FROM tpch.sf1.lineitem l CROSS JOIN ({body}) s"
+
+    # Keys are the whole of what two spines make: the identity, so the
+    # multiplier stands.
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "CROSS JOIN UNNEST(ARRAY[1, 2]) AS u(y) GROUP BY x, y"
+            )
+        )
+        == 20_000
+    )
+    # A subset of them is a reduction the SQL cannot size.
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "CROSS JOIN UNNEST(ARRAY[1, 2]) AS u(y) GROUP BY x"
+            )
+        )
+        == 1
+    )
+    # A scope that also reads a table keeps the multiplier whatever it
+    # groups by: the join may filter the spine to nothing or to all of it,
+    # and which one is the plan's answer. Charging it is the safe half of
+    # that ignorance, and the same over-quote ADR 0006 records for an
+    # equi-joined generator.
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT t.x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "JOIN tpch.sf1.nation n ON n.nationkey = t.x GROUP BY t.x"
+            )
+        )
+        == 10_000
+    )
