@@ -1896,3 +1896,41 @@ def test_a_table_named_outside_the_from_is_not_the_scope_s_own() -> None:
         )
         == 1000
     )
+
+
+def test_a_splitting_key_needs_an_identity_to_split() -> None:
+    # "It can only split what the other keys separate" assumed other keys
+    # exist. Alone, a subquery key has nothing to split and can collapse the
+    # whole spine: measured on Trino, GROUP BY (SELECT 1 WHERE x > 0) over a
+    # 10,000 spine yields one group, and the gate charged 10,000.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    lone = "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
+    for keys in ("(SELECT 1 WHERE x > 0)", "(SELECT x % 7)", "uuid()", "rand()"):
+        assert fanout(outer.format(body=lone.format(keys=keys))) == 1, keys
+    # Alongside a key list that is already the identity, the same key only
+    # cuts it finer and the multiplier stands.
+    with_identity = (
+        "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY x, {keys}"
+    )
+    for keys in ("uuid()", "(SELECT x)"):
+        assert fanout(outer.format(body=with_identity.format(keys=keys))) == 10_000
+
+
+def test_a_derived_relation_supplies_names_like_any_other() -> None:
+    # Only tables and generators counted as relations the subquery owns, so
+    # a derived table or VALUES left the supplied set empty and an ordinary
+    # uncorrelated key read as correlated — kept as a splitter, which held a
+    # nine-million-fold multiplier on a query that reduces.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    for keys in (
+        "t.x, (SELECT max(z) FROM (SELECT 1 AS z) q)",
+        "t.x, (SELECT max(z) FROM (VALUES 1) AS q(z))",
+        "t.x, (SELECT 1)",
+    ):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
+    # A key that really does read the outer row still splits.
+    assert fanout(outer.format(body=two.format(keys="t.x, (SELECT s.y)"))) == 9_000_000

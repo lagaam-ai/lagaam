@@ -674,7 +674,14 @@ def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
     """
     relations: set[str] = set()
     columns: set[str] = set()
-    for relation in subquery.find_all(exp.Table, exp.Unnest):
+    # A derived table and a VALUES list are relations the subquery owns just
+    # as a table is; counting only tables and generators left the supplied
+    # set empty, and every name then read as reaching outside.
+    for relation in subquery.find_all(
+        exp.Table, exp.Unnest, exp.Subquery, exp.Values, exp.Lateral
+    ):
+        if relation is subquery:
+            continue
         alias = relation.args.get("alias")
         name = getattr(alias, "name", "") or getattr(relation, "alias_or_name", "")
         if name:
@@ -684,6 +691,12 @@ def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
         ordinality = relation.args.get("offset")
         if isinstance(ordinality, exp.Identifier):
             columns.add(ordinality.name.lower())
+        # A derived relation names its columns by what it projects.
+        projected = relation.find(exp.Select) if relation is not subquery else None
+        for projection in getattr(projected, "expressions", []) or []:
+            name = projection.alias_or_name
+            if name:
+                columns.add(name.lower())
     for column in subquery.find_all(exp.Column):
         qualifier = str(column.table or "").lower()
         if qualifier:
@@ -749,21 +762,19 @@ def _groups_by_what_the_generators_make(
     # GROUP BY (x) partition exactly as GROUP BY x does, and requiring a
     # bare Column node excused both.
     resolved = [_group_key_column(key, select) for key in stated]
-    # A key reading no column can only cut the partition finer, never merge
-    # what the columns separated, so the grouping still returns at least one
-    # row per row produced. Reading it as "not an identity" DROPS the
-    # multiplier, which is how `, uuid()` discounted a query by nine million.
-    if any(key is _ONLY_SPLITS_FURTHER for key in resolved):
-        return True
     # A key over a column may reshape it — x % 7 merges seven rows into one —
     # and that this cannot follow, so it stays a reduction.
     if any(key is _NAMES_NO_COLUMN for key in resolved):
         return False
     # A constant is dropped rather than counted: it adds no groups, so it
-    # neither makes the partition an identity nor stops it being one.
+    # neither makes the partition an identity nor stops it being one. A key
+    # that only splits is dropped for the same reason — but it can only split
+    # something, so it decides nothing on its own: GROUP BY (SELECT 1 WHERE
+    # x > 0) alone is one group, not one per row.
     columns = [key for key in resolved if isinstance(key, exp.Column)]
     if not columns:
         return False
+    splitting = any(key is _ONLY_SPLITS_FURTHER for key in resolved)
     # Keyed by the relation that supplies each column, not by name alone: a
     # qualifier is what distinguishes one relation's "x" from another's, and
     # dropping it let a key that names a different relation read as the
@@ -810,6 +821,12 @@ def _groups_by_what_the_generators_make(
             qualifier = suppliers[0]
         named.add((qualifier, column))
     if named == produced:
+        return True
+    # A splitting key alongside a subset restores the rest: the columns say
+    # which rows are already separate, and a per-row value separates the
+    # remainder. It cannot merge below them, so the partition is at least
+    # one group per row the generators produced.
+    if splitting and named <= produced:
         return True
     # A counter stands in for the value columns of the generator that made
     # it: one relation numbered per row means grouping by the number is the
