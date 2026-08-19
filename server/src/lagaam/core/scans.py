@@ -594,6 +594,21 @@ _PARTITIONS_NOTHING = "constant"
 _ONLY_SPLITS_FURTHER = "row-varying"
 
 
+def _every_column_is_inside_a_subquery(key: exp.Expr) -> bool:
+    """True if this key reads the row only through subqueries of its own.
+
+    Such a key adds the row's value to the partition rather than replacing a
+    column with a reshaping of it, so it can only split the partition the
+    other keys make. A column read directly — x % 7 — is the reshaping.
+    """
+    if key.find(exp.Subquery) is None:
+        return False
+    return all(
+        column.find_ancestor(exp.Subquery) is not None
+        for column in key.find_all(exp.Column, exp.Star)
+    )
+
+
 def _group_key_column(
     key: exp.Expr, select: exp.Select, seen: frozenset[int] = frozenset()
 ) -> exp.Column | str:
@@ -633,6 +648,14 @@ def _group_key_column(
     # One that does read a column may reshape it (x % 7 merges seven rows
     # into one), and that this cannot follow.
     if key.find(exp.Column, exp.Star) is None:
+        return _ONLY_SPLITS_FURTHER
+    # A correlated subquery adds the row's own value to the partition rather
+    # than replacing a key with a reshaping of it: measured on Trino, two
+    # 100x100 spines grouped by `t.x, (SELECT s.y)` give 10,000 groups where
+    # `t.x` alone gives 100. It can also merge — `(SELECT s.y % 7)` gives 700
+    # — but never below what the other keys already separate, so it cannot
+    # take the partition under one group per row the generators produced.
+    if _every_column_is_inside_a_subquery(key):
         return _ONLY_SPLITS_FURTHER
     return _NAMES_NO_COLUMN
 
@@ -681,6 +704,7 @@ def _partitions_nothing(key: exp.Expr) -> bool:
     # the row outside, and then it varies per row like any column.
     if isinstance(key, exp.Subquery):
         return not _reads_an_outer_column(key)
+    
     if isinstance(key, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
         return _partitions_nothing(key.this)
     if isinstance(key, exp.Binary):

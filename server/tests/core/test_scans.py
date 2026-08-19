@@ -1832,8 +1832,19 @@ def test_a_correlated_subquery_key_is_not_one_valued() -> None:
         "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
         "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
     )
-    correlated = "t.x, (SELECT max(z) FROM UNNEST(ARRAY[s.y % 7]) AS q(z))"
-    assert fanout(outer.format(body=two.format(keys=correlated))) == 1
+    # It adds the row's value to the partition rather than replacing a key
+    # with a reshaping of it, so it can only split what the other keys make
+    # — never take the partition below one group per row produced.
+    for keys in (
+        "t.x, (SELECT s.y)",
+        "t.x, (SELECT s.y) + 1",
+        "t.x, cast((SELECT s.y) AS varchar)",
+        "t.x, coalesce((SELECT s.y), 0)",
+    ):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 9_000_000, keys
+    # A column read directly IS the reshaping, and still collapses.
+    for keys in ("t.x, s.y % 7", "t.x, abs(s.y)"):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
     # An uncorrelated one really is the same value for every row, so it is
     # dropped and the keys that remain decide: here a subset, which reduces.
     assert fanout(outer.format(body=two.format(keys="t.x, (SELECT 1)"))) == 1
