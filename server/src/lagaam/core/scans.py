@@ -489,10 +489,15 @@ def _scans_a_table(select: exp.Select) -> bool:
     in a WHERE predicate — brings no rows this select's rows pair with, and
     counting it said the scope builds relations of its own when it does not.
     """
-    for table in _without_unmet_relations(select).find_all(exp.Table):
-        if any(table.find_all(exp.GenerateSeries, *_GENERATORS)):
-            continue
-        return True
+    # Read from the relation positions rather than by copying the tree and
+    # subtracting: the copy is a deepcopy of everything nested below, so at
+    # depth d the level-i select copied d-i levels and the whole walk grew
+    # quadratically in nesting depth.
+    for relation in _relations_of(select):
+        if isinstance(relation, exp.Table) and not any(
+            relation.find_all(exp.GenerateSeries, *_GENERATORS)
+        ):
+            return True
     return False
 
 
@@ -666,6 +671,41 @@ def _group_key_column(
     return _NAMES_NO_COLUMN
 
 
+def _relations_of(select: exp.Select) -> list[exp.Expr]:
+    """The relations this one select's FROM and JOIN clauses introduce."""
+    return _relations_in_scope(select, nested=False)
+
+
+def _relations_in_scope(
+    node: exp.Expr, nested: bool = True
+) -> list[exp.Expr]:
+    """The relations a scope's FROM and JOIN clauses introduce.
+
+    Those are the ones whose names it can mean; anything else nested inside
+    it — a scalar subquery among the projections, a predicate's EXISTS —
+    binds nothing here.
+    """
+    found: list[exp.Expr] = []
+    selects = node.find_all(exp.Select) if nested else [node]
+    for select in selects:
+        if not isinstance(select, exp.Select):
+            continue
+        sources: list[exp.Expr] = []
+        source = select.args.get("from") or select.args.get("from_")
+        if isinstance(source, exp.Expr):
+            sources.append(source)
+        for join in select.args.get("joins") or []:
+            if isinstance(join, exp.Expr):
+                sources.append(join)
+        for holder in sources:
+            found.extend(
+                holder.find_all(
+                    exp.Table, exp.Unnest, exp.Subquery, exp.Values, exp.Lateral
+                )
+            )
+    return found
+
+
 def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
     """True if this subquery names a column none of its own relations supply.
 
@@ -675,14 +715,10 @@ def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
     """
     relations: set[str] = set()
     columns: set[str] = set()
-    # A derived table and a VALUES list are relations the subquery owns just
-    # as a table is; counting only tables and generators left the supplied
-    # set empty, and every name then read as reaching outside.
-    for relation in subquery.find_all(
-        exp.Table, exp.Unnest, exp.Subquery, exp.Values, exp.Lateral
-    ):
-        if relation is subquery:
-            continue
+    # Only a relation POSITION supplies a name: a scalar subquery among the
+    # projections binds nothing in the enclosing scope, and harvesting its
+    # alias let a bare correlated reference match it and read as its own.
+    for relation in _relations_in_scope(subquery):
         alias = relation.args.get("alias")
         name = getattr(alias, "name", "") or getattr(relation, "alias_or_name", "")
         if name:

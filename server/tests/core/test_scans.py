@@ -1965,3 +1965,29 @@ def test_a_correlated_key_restoring_a_subset_over_quotes_on_purpose() -> None:
     # And with nothing to restore, it decides nothing either way.
     lone = "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
     assert fanout(outer.format(body=lone.format(keys="(SELECT x)"))) == 1
+
+
+def test_only_a_relation_supplies_a_name_to_the_correlation_check() -> None:
+    # Projected names were harvested from every nested node, so a scalar
+    # subquery in the SELECT list — which binds nothing in the enclosing
+    # scope — donated its alias and a bare correlated reference matched it.
+    # Read as uncorrelated, the key was dropped as a constant and the
+    # remaining subset read as a reduction: the multiplier vanished.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    for keys in (
+        "t.x, (SELECT (SELECT 1 AS y) + y)",
+        "t.x, (SELECT y + (SELECT 1 AS y))",
+        "t.x, (SELECT coalesce(y, 0) + (SELECT 0 AS y))",
+    ):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 9_000_000, keys
+    # A relation in a FROM position really does supply the name, and the key
+    # is then uncorrelated: measured on Trino, 100 groups, not 10,000.
+    for keys in (
+        "t.x, (SELECT y FROM (SELECT 1 AS y) q)",
+        "t.x, (SELECT y FROM (VALUES 1) AS q(y))",
+    ):
+        assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
