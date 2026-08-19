@@ -426,6 +426,15 @@ def _narrows_its_rows(select: exp.Select) -> bool:
     """
     grouped = select.args.get("group")
     if grouped is not None:
+        # ROLLUP, CUBE and GROUPING SETS emit the subtotal rows on top of the
+        # groups, so they are the one grouping shape that can ADD rows. They
+        # also keep their keys in their own args, leaving group.expressions
+        # empty — which the identity test below would have read as "no keys".
+        if any(
+            grouped.args.get(shape)
+            for shape in ("rollup", "cube", "grouping_sets", "totals")
+        ):
+            return False
         # Whether a GROUP BY reduces anything is a cardinality question, and
         # ADR 0004 keeps those with the plan. The one case SQL settles on its
         # own is a key list that names exactly the columns the generators in

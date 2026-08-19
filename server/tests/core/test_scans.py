@@ -1447,3 +1447,21 @@ def test_a_group_by_collapses_only_where_sql_can_say_so() -> None:
         )
         == 10_000
     )
+
+
+def test_a_rollup_over_a_spine_still_pays_for_it() -> None:
+    # ROLLUP, CUBE and GROUPING SETS hold their keys in their own args, not
+    # in group.expressions, so the identity test read them as an empty key
+    # list and excused the multiplier. They are also the one grouping shape
+    # that ADDS rows — a rollup emits the subtotal rows on top of the groups
+    # — so excusing them was doubly wrong.
+    outer = "SELECT l.orderkey, s.v FROM tpch.sf1.lineitem l CROSS JOIN ({body}) s"
+    for grouping in (
+        "GROUP BY ROLLUP(x)",
+        "GROUP BY CUBE(x)",
+        "GROUP BY GROUPING SETS ((x), ())",
+    ):
+        sql = outer.format(
+            body=f"SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) {grouping}"
+        )
+        assert fanout(sql) == 10_000, grouping
