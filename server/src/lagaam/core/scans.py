@@ -637,6 +637,28 @@ def _group_key_column(
     return _NAMES_NO_COLUMN
 
 
+def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
+    """True if this subquery names a column none of its own relations supply.
+
+    Read by qualifier: a correlated reference is one qualified by a relation
+    the subquery does not itself introduce, or left bare where the subquery
+    has no relation of its own to have meant.
+    """
+    supplied = set()
+    for relation in subquery.find_all(exp.Table, exp.Unnest):
+        alias = relation.args.get("alias")
+        name = getattr(alias, "name", "") or getattr(relation, "alias_or_name", "")
+        if name:
+            supplied.add(name.lower())
+    for column in subquery.find_all(exp.Column):
+        qualifier = str(column.table or "").lower()
+        if qualifier and qualifier not in supplied:
+            return True
+        if not qualifier and not supplied:
+            return True
+    return False
+
+
 def _partitions_nothing(key: exp.Expr) -> bool:
     """True if this key provably has one value for every row.
 
@@ -653,10 +675,12 @@ def _partitions_nothing(key: exp.Expr) -> bool:
     # The empty grouping: every row falls in one group.
     if isinstance(key, exp.Tuple) and not key.expressions:
         return True
-    # A scalar subquery is evaluated once for the statement, so it answers
-    # the same for every row — it cannot split the partition.
+    # A scalar subquery answers once for the statement — unless it reads the
+    # row, which is what makes it correlated. Its own FROM supplies some of
+    # the columns it names; a name no relation inside it supplies comes from
+    # the row outside, and then it varies per row like any column.
     if isinstance(key, exp.Subquery):
-        return True
+        return not _reads_an_outer_column(key)
     if isinstance(key, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
         return _partitions_nothing(key.this)
     if isinstance(key, exp.Binary):

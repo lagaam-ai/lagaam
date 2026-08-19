@@ -1818,3 +1818,25 @@ def test_a_statement_of_many_generators_stays_under_a_second() -> None:
     unpriceable(wide)
     fanout(wide)
     assert time.perf_counter() - start < 1.0
+
+
+def test_a_correlated_subquery_key_is_not_one_valued() -> None:
+    # A scalar subquery answers once for the statement — unless it reads the
+    # row, which is what makes it correlated. Treating every subquery as
+    # one-valued dropped it from the key list, so it could neither make nor
+    # break an identity; a correlated one reshapes the row's own value and
+    # can merge rows, measured on Trino at 700 groups where the columns
+    # alone give 10,000. It is charged as the reduction it may be.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    correlated = "t.x, (SELECT max(z) FROM UNNEST(ARRAY[s.y % 7]) AS q(z))"
+    assert fanout(outer.format(body=two.format(keys=correlated))) == 1
+    # An uncorrelated one really is the same value for every row, so it is
+    # dropped and the keys that remain decide: here a subset, which reduces.
+    assert fanout(outer.format(body=two.format(keys="t.x, (SELECT 1)"))) == 1
+    # And on a lone spine the same uncorrelated key leaves the identity.
+    lone = "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
+    assert fanout(outer.format(body=lone.format(keys="x, (SELECT 1)"))) == 10_000
