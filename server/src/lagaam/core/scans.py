@@ -34,6 +34,12 @@ _FIXED_INTERVAL_DAYS = {"DAY": 1, "WEEK": 7}
 # magnitude of headroom while still bounding the walk to milliseconds.
 _MAX_SCAN_COUNT = 10_000
 
+# Reads past this many stop being counted exactly. Walking each name once
+# reaches numbers a re-walk never survived to produce — a 400-deep doubling
+# chain is 2^399 — and a count that large would scale a byte quote through
+# arbitrary-precision arithmetic to say what any budget already denies.
+_MAX_COUNTED_READS = 1_000_000
+
 # A relation an agent spells out inline is a lookup table, not a multiplier.
 # Past this many rows it stops being one: crossing a 1.5M-row scan against
 # 20,000 inline values is 30 billion rows the plan prices as one scan.
@@ -51,6 +57,20 @@ _MAX_ALIAS_DEPTH = 32
 # Stands for an alias that names more than one relation: not a CTE name, and
 # not something a lookup may treat as an unbound (therefore scanned) column.
 _AMBIGUOUS = "\x00ambiguous"
+
+# Stands for "this alias reads that relation": one entry per alias instead of
+# one per alias and column, so a wide query costs what it reads, not the
+# product of its width and its aliases.
+_ALIAS_OF = "\x00alias_of"
+
+# Prefix for the by-bare-name index: an unqualified reference reads every
+# binding of that name, and finding them by sweeping the keys made each
+# lookup cost the whole statement's width.
+_BY_NAME = "\x00by_name\x00"
+
+# Steps a standalone resolve may take when no walk lends it one. Callers
+# inside the gate share the walk's budget; this only bounds a direct call.
+_MAX_RESOLVE_STEPS = 10_000
 
 # Functions that reshape an array without changing how many rows it yields.
 # Anything else feeding a generator is assumed to invent rows: a denylist is
@@ -193,7 +213,9 @@ def generator_fanout(sql: str, dialect: str) -> int:
     for branch in _union_branches(_without_cte_bodies(tree)):
         if not _reads_a_table(branch, bodies, frozenset()):
             continue
-        product = _generator_product(branch, bodies, frozenset(), budget, projections)
+        product = _generator_product(
+            branch, bodies, frozenset(), budget, projections, for_pricing=True
+        )
         if product is None:
             return 1
         widest = max(widest, product)
@@ -229,15 +251,27 @@ def _generator_product(
     pending: frozenset[str],
     budget: list[int],
     projections: Mapping[str, list[exp.Expr]],
+    for_pricing: bool = False,
 ) -> int | None:
     """Rows this subtree's generators multiply out to, or None past the cap.
 
     None also stands for a generator the gate cannot bound at all, and for a
     walk that ran out of budget: all three mean the same thing to the caller
     — no quote — so they share a return.
+
+    `for_pricing` asks for the multiplier a caller will apply to the plan's
+    own estimate, so a generator whose rows collapse before they meet the
+    branch contributes nothing. The refusal path leaves it False: whether a
+    generator can be *sized* is a question about the generator, not about
+    where it sits, and skipping one there would let an unbounded spine hide
+    inside an aggregate.
     """
     if budget[0] <= 0:
         return None
+    # Whether the plan will carry this branch's rows decides how large a
+    # spelled-out spine may be: crossed with a table it is a multiplier the
+    # budget applies to a real cardinality, and alone it is all there is.
+    priced = _reads_a_table(node, bodies, pending)
     product = 1
     wrapped: set[int] = set()
     loose: list[exp.GenerateSeries] = []
@@ -250,9 +284,18 @@ def _generator_product(
         if budget[0] <= 0:
             return None
         if isinstance(child, _GENERATORS):
-            if not _expands_a_bounded_value(child, projections):
+            # Resolving a generator's input shares the walk's budget: the
+            # depth cap bounds a single chain of names, not how many chains a
+            # wide statement writes, and the resolvers were the one path
+            # nothing charged. 71 KB of CTEs and unnests cost a minute of CPU
+            # before Trino was contacted.
+            if not _expands_a_bounded_value(
+                child, projections, budget=budget, priced_by_a_table=priced
+            ):
                 return None
-            product *= _generator_rows(child, projections)
+            if for_pricing and not _multiplies_its_branch(child, node):
+                continue
+            product *= _generator_rows(child, projections, budget=budget)
             if product > _MAX_COUNTED_ROWS:
                 return None
             wrapped.update(id(series) for series in child.find_all(exp.GenerateSeries))
@@ -268,28 +311,113 @@ def _generator_product(
     for series in loose:
         if id(series) in wrapped:
             continue
+        if for_pricing and not _multiplies_its_branch(series, node):
+            continue
         length = _sequence_length(series)
         if length is None or length > _MAX_COUNTED_ROWS:
             return None
         product *= length
         if product > _MAX_COUNTED_ROWS:
             return None
+    # The same name read twice reads the same bodies, so its cost is walked
+    # once and applied per reference: re-walking spent the budget on the
+    # body's WIDTH, which is the analyst's to write, and refused an ordinary
+    # 400-column CTE read eight times before it reached any generator.
+    per_name: dict[str, int] = {}
     for name in references:
-        # A name bound more than once costs whatever its dearest binding
-        # costs: scope decides which one a reference reads, and charging the
-        # cheapest is what let a decoy body hide a generator.
-        widest = 1
-        for body in bodies[name]:
-            nested = _generator_product(
-                body, bodies, pending | {name}, budget, projections
-            )
-            if nested is None:
-                return None
-            widest = max(widest, nested)
-        product *= widest
+        if name not in per_name:
+            # A name bound more than once costs whatever its dearest binding
+            # costs: scope decides which one a reference reads, and charging
+            # the cheapest is what let a decoy body hide a generator.
+            widest = 1
+            for body in bodies[name]:
+                nested = _generator_product(
+                    body, bodies, pending | {name}, budget, projections, for_pricing
+                )
+                if nested is None:
+                    return None
+                # Rows leave a CTE through its own select, so an aggregate
+                # there collapses them before any reference can multiply by
+                # them — the sizing question stays open, only the multiplier.
+                # Only where the body builds nothing of its own: an aggregate
+                # over a generator already crossed with a table runs AFTER
+                # those rows exist, and excusing it quoted 6 billion rows as
+                # six million.
+                if (
+                    for_pricing
+                    and _collapses_on_the_way_out(body)
+                    and not _reads_a_table(body, bodies, pending | {name})
+                ):
+                    nested = 1
+                widest = max(widest, nested)
+            per_name[name] = widest
+        product *= per_name[name]
         if product > _MAX_COUNTED_ROWS:
             return None
     return product
+
+
+def _scans_a_table(select: exp.Select) -> bool:
+    """True if this select reads a relation of its own, generators aside."""
+    for table in select.find_all(exp.Table):
+        if any(table.find_all(exp.GenerateSeries, *_GENERATORS)):
+            continue
+        return True
+    return False
+
+
+def _collapses_on_the_way_out(body: exp.Expr) -> bool:
+    """True if this scope's select aggregates, so its rows leave it narrowed."""
+    select = body if isinstance(body, exp.Select) else body.find(exp.Select)
+    if select is None:
+        return False
+    return bool(
+        list(select.find_all(exp.AggFunc, bfs=False)) or select.args.get("group")
+    )
+
+
+def _multiplies_its_branch(generator: exp.Expr, root: exp.Expr) -> bool:
+    """True if this generator's rows meet the branch's rows and multiply them.
+
+    A generator in a FROM or a JOIN crosses whatever else the branch reads.
+    Two shapes do not: rows an aggregate collapses on the way out (a spine
+    counted into one number, then joined), and a predicate subquery, where
+    EXISTS and IN ask whether a match exists rather than pairing with each
+    one. Charging those anyway priced an ordinary 365-day report at 365x its
+    real work, which the row budget then denied — over-quoting refuses a
+    query as surely as under-quoting admits one.
+    """
+    # The branch's own select is where the widest step is built: an aggregate
+    # there runs after the generator's rows already exist, so it spares the
+    # engine nothing. Only a scope the rows must leave — a derived table, a
+    # CTE, a subquery — can collapse them before they reach the branch.
+    branch_select = root if isinstance(root, exp.Select) else root.find(exp.Select)
+    node: exp.Expr | None = generator
+    while node is not None and node is not root:
+        parent = node.parent
+        if isinstance(parent, exp.Select):
+            # A subquery in the SELECT list is scalar: it contributes a value
+            # to each row rather than rows of its own.
+            if node.arg_key == "expressions":
+                return False
+            # An aggregate only spares the work if the scope builds nothing
+            # of its own: one already crossed with a table runs after those
+            # rows exist, and excusing it quoted 6 billion rows as six
+            # million.
+            if parent is not branch_select and _scans_a_table(parent):
+                node = parent
+                continue
+            if parent is not branch_select and (
+                list(parent.find_all(exp.AggFunc, bfs=False))
+                or parent.args.get("group")
+            ):
+                return False
+        # EXISTS and IN test for a match; neither pairs the outer row with
+        # every row the subquery could produce.
+        if isinstance(parent, exp.Exists | exp.In):
+            return False
+        node = parent
+    return True
 
 
 def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
@@ -313,6 +441,8 @@ def _expands_a_bounded_value(
     generator: exp.Expr,
     projections: Mapping[str, list[exp.Expr]] | None = None,
     seen: frozenset[str] = frozenset(),
+    budget: list[int] | None = None,
+    priced_by_a_table: bool = False,
 ) -> bool:
     """True if the generator's input is bounded by something already priced.
 
@@ -327,7 +457,10 @@ def _expands_a_bounded_value(
     ]
     if not inputs:
         return False
-    return all(_is_bounded_input(value, projections, seen) for value in inputs)
+    return all(
+        _is_bounded_input(value, projections, seen, budget, priced_by_a_table)
+        for value in inputs
+    )
 
 
 def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
@@ -354,6 +487,9 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     def bind(source: str | None, column: str, value: exp.Expr) -> None:
         key = f"{source.lower()}.{column.lower()}" if source else column.lower()
         projections.setdefault(key, []).append(value)
+        # The same binding under a bare-name index, so an unqualified
+        # reference finds it by lookup rather than by sweeping every key.
+        projections.setdefault(f"{_BY_NAME}{column.lower()}", []).append(value)
         if source:
             bound_columns.setdefault(source.lower(), {}).setdefault(
                 column.lower(), []
@@ -362,12 +498,19 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     def bind_alias_list(alias: exp.TableAlias | None, body: exp.Expr) -> None:
         if alias is None or not alias.columns:
             return
-        select = body.find(exp.Select)
-        if select is None:
-            return
         source = alias.name
-        for column, projection in zip(alias.columns, select.expressions, strict=False):
-            bind(source, column.name, projection)
+        # Every arm binds the name, not just the first one found: a set
+        # operation carries whatever any arm projects, and reading only the
+        # leading Select let a later arm's manufactured array pass as a
+        # scanned column.
+        for branch in _union_branches(body):
+            select = branch.find(exp.Select)
+            if select is None:
+                continue
+            for column, projection in zip(
+                alias.columns, select.expressions, strict=False
+            ):
+                bind(source, column.name, projection)
 
     for cte in tree.find_all(exp.CTE):
         bind_alias_list(cte.args.get("alias"), cte.this)
@@ -447,14 +590,17 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
     alias_sources = _alias_sources(tree)
     for alias, name in alias_sources.items():
         if name is _AMBIGUOUS:
-            continue
-        for column, bound in bound_columns.get(name, {}).items():
-            projections.setdefault(f"{alias}.{column}", []).extend(bound)
-    for alias, name in alias_sources.items():
-        if name is _AMBIGUOUS:
             # A marker key: any column read through this alias resolves to
             # something the gate cannot read, which fails closed.
             projections[f"{alias}.{_AMBIGUOUS}"] = []
+            continue
+        # Recorded as an indirection rather than copied: writing every bound
+        # column under every alias that names its relation is the alias x
+        # column cross-product, which 3,000 of each turned into nine million
+        # entries — seconds of CPU and gigabytes of RSS on SQL well inside the
+        # length cap, spent before the walk budget is charged at all.
+        if name in bound_columns:
+            projections[f"{alias}.{_ALIAS_OF}"] = [exp.Identifier(this=name)]
     return projections
 
 
@@ -537,18 +683,29 @@ def _column_bindings(
     if bindings is not None:
         return bindings
     if column.table:
+        # FROM cte AS z asks for z.arr while the binding sits under the CTE's
+        # own name; the alias resolves through its recorded relation instead
+        # of every column having been copied under it.
+        source = column.table.lower()
+        alias_of = projections.get(f"{source}.{_ALIAS_OF}")
+        if alias_of:
+            relation = alias_of[0].name.lower()
+            return list(projections.get(f"{relation}.{column.name.lower()}", []))
         return []
     # Unqualified, the SQL does not say which source this reads, so every
     # binding of the name answers for it: a projection that only forwards
     # a name (SELECT c FROM a) would otherwise lose the array behind it.
     # Bindings that resolve to this same reference are skipped — a name
     # forwarded from a table is a scanned column, not a manufactured one.
-    name = column.name.lower()
+    #
+    # The name is looked up in an index built once with the bindings, rather
+    # than swept for out of every key: an O(keys) scan per lookup sat inside
+    # an unbudgeted recursion, and 37 KB of CTEs and unnests cost seconds of
+    # CPU before the engine was ever asked. A name nothing binds indexes to an
+    # empty list, so a miss is a lookup too.
     return [
         bound
-        for binding_key, bindings in projections.items()
-        if binding_key == name or binding_key.endswith(f".{name}")
-        for bound in bindings
+        for bound in projections.get(f"{_BY_NAME}{column.name.lower()}", [])
         if not (isinstance(bound, exp.Column) and _column_key(bound) == key)
     ]
 
@@ -570,9 +727,21 @@ def _is_bounded_input(
     value: exp.Expr,
     projections: Mapping[str, list[exp.Expr]] | None = None,
     seen: frozenset[str] = frozenset(),
+    budget: list[int] | None = None,
+    priced_by_a_table: bool = False,
 ) -> bool:
-    """True if this generator argument yields a length something else fixes."""
+    """True if this generator argument yields a length something else fixes.
+
+    The depth cap bounds how far a chain of names is followed; it does not
+    bound how MANY there are, and breadth is what a wide statement of CTEs
+    and unnests buys cheaply. Running out of budget answers False — an input
+    nobody finished reading is not one the gate may vouch for.
+    """
     projections = projections if projections is not None else {}
+    budget = budget if budget is not None else [_MAX_RESOLVE_STEPS]
+    budget[0] -= 1
+    if budget[0] <= 0:
+        return False
     if isinstance(value, exp.Array | exp.Struct):
         # A literal spells out its own length — but spelling out 20,000 of
         # them multiplies every scanned row by 20,000 just the same.
@@ -606,7 +775,9 @@ def _is_bounded_input(
             # that passes through an expression has a length nobody reads.
             return all(isinstance(bound, exp.Column) for bound in bindings)
         return all(
-            _is_bounded_input(bound, projections, seen | {key})
+            _is_bounded_input(
+                bound, projections, seen | {key}, budget, priced_by_a_table
+            )
             for bound in bindings
         )
     if isinstance(value, exp.GenerateSeries):
@@ -615,7 +786,16 @@ def _is_bounded_input(
         # cannot be computed from — a column bound, a calendar step, a span
         # over the cap — stays unpriceable.
         length = _sequence_length(value)
-        return length is not None and length <= _MAX_INLINE_ROWS
+        if length is None:
+            return False
+        # The flat cap binds only where nothing downstream prices the rows.
+        # Joined to a table, the size is a multiplier generator_fanout() hands
+        # to the budget, which decides with the table's real cardinality in
+        # hand — a seven-year daily spine against a 25-row table is 63,950
+        # rows, and refusing it sight-unseen is the flat cap ADR 0006 dropped.
+        if priced_by_a_table:
+            return length <= _MAX_COUNTED_ROWS
+        return length <= _MAX_INLINE_ROWS
     if isinstance(value, exp.Func):
         if _func_name(value) not in _ROW_PRESERVING_FUNCS:
             return False
@@ -627,7 +807,8 @@ def _is_bounded_input(
         # A reshaping function with no argument left to check is reshaping a
         # literal, which cannot add rows.
         return all(
-            _is_bounded_input(argument, projections, seen) for argument in arguments
+            _is_bounded_input(argument, projections, seen, budget, priced_by_a_table)
+            for argument in arguments
         )
     return False
 
@@ -698,6 +879,7 @@ def _generator_rows(
     generator: exp.Expr,
     projections: Mapping[str, list[exp.Expr]] | None = None,
     seen: frozenset[str] = frozenset(),
+    budget: list[int] | None = None,
 ) -> int:
     """Rows a bounded generator yields: a literal array's length, or 1 for a
     scanned column, whose rows belong to a table the plan already priced.
@@ -707,8 +889,12 @@ def _generator_rows(
     only the top node would price a 5000-entry lookup as one row. A column a
     projection bound counts as whatever it was bound to — array_agg over a
     1000-row sequence is a 1000-element array by the time UNNEST reads it.
+
+    Exhausting the budget returns the cap, not the width found so far: this
+    figure becomes a multiplier, and a partial answer is a discount.
     """
     projections = projections if projections is not None else {}
+    budget = budget if budget is not None else [_MAX_RESOLVE_STEPS]
     widest = 1
     for value in generator.find_all(exp.Array, exp.Struct):
         widest = max(widest, len(value.expressions or []))
@@ -717,11 +903,16 @@ def _generator_rows(
         if length is not None:
             widest = max(widest, length)
     for column in generator.find_all(exp.Column):
+        budget[0] -= 1
+        if budget[0] <= 0:
+            return _MAX_COUNTED_ROWS
         key = _column_key(column)
         if key in seen or len(seen) >= _MAX_ALIAS_DEPTH:
             continue
         for bound in _column_bindings(column, projections):
-            widest = max(widest, _generator_rows(bound, projections, seen | {key}))
+            widest = max(
+                widest, _generator_rows(bound, projections, seen | {key}, budget)
+            )
     return widest
 
 
@@ -782,12 +973,18 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
     # instead of only bounding the counts it would have produced.
     budget = [_MAX_SCAN_COUNT]
 
-    def walk(node: exp.Expr, weight: int, pending: frozenset[str]) -> None:
-        if budget[0] <= 0:
-            return
+    # What one read of a name costs, walked once and then applied per
+    # reference: re-walking a body for every reference spent the budget on the
+    # body's width, so a 5,000-column CTE read 5,000 times took 16 seconds
+    # before any engine was contacted. The counts are identical either way —
+    # a read is still charged once per reference.
+    per_name: dict[tuple[str, frozenset[str]], dict[str, int]] = {}
+
+    def reads(node: exp.Expr, pending: frozenset[str]) -> dict[str, int]:
+        found: dict[str, int] = {}
         for table in node.find_all(exp.Table):
             if budget[0] <= 0:
-                return
+                return found
             parts = [part.name for part in table.parts]
             name = parts[0].lower()
             if len(parts) == 1 and name in bodies:
@@ -795,21 +992,40 @@ def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
                 # depth is the engine's business, not the quote's.
                 if name in pending:
                     continue
-                # A name bound more than once is counted through every body
-                # it could mean: scope decides which, and skipping the others
-                # let a decoy binding hide the reads behind the name.
-                for body in bodies[name]:
-                    budget[0] -= 1
-                    walk(body, weight, pending | {name})
+                # Keyed by the enclosing scope as well: the same name inside
+                # a different set of pending bindings can resolve elsewhere.
+                memo_key = (name, pending)
+                if memo_key not in per_name:
+                    once: dict[str, int] = {}
+                    # A name bound more than once is counted through every
+                    # body it could mean: scope decides which, and skipping
+                    # the others let a decoy binding hide the reads.
+                    for body in bodies[name]:
+                        budget[0] -= 1
+                        for table_key, count in reads(body, pending | {name}).items():
+                            once[table_key] = once.get(table_key, 0) + count
+                    per_name[memo_key] = once
+                for table_key, count in per_name[memo_key].items():
+                    found[table_key] = found.get(table_key, 0) + count
                 continue
             key = ".".join(parts).lower()
-            counts[key] = counts.get(key, 0) + weight
-            budget[0] -= weight
+            found[key] = found.get(key, 0) + 1
+            budget[0] -= 1
+        return found
 
     # From the query with its WITH detached: a CTE body counts once per
     # reference to it, not once where it is defined.
-    walk(_without_cte_bodies(tree), 1, frozenset())
-    return counts, budget[0] <= 0
+    for table_key, count in reads(_without_cte_bodies(tree), frozenset()).items():
+        counts[table_key] = counts.get(table_key, 0) + count
+    # Counting each name once reaches figures a re-walk never survived to
+    # produce: a 400-deep doubling chain is 2^399 reads, a 121-digit integer
+    # that would then scale a byte quote through bignum arithmetic. Past this
+    # many reads the exact number buys nothing — the query is already beyond
+    # any budget — so it saturates, which denies rather than quotes.
+    saturated = budget[0] <= 0 or any(
+        count > _MAX_COUNTED_READS for count in counts.values()
+    )
+    return counts, saturated
 
 
 def scan_counts_saturated(sql: str, dialect: str) -> bool:

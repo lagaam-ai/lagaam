@@ -361,7 +361,12 @@ def test_union_branches_are_judged_one_at_a_time() -> None:
         "SELECT o.orderkey FROM tpch.sf1.lineitem o "
         "CROSS JOIN UNNEST(sequence(1, 900)) AS t(n)"
     )
+    # Asserted in both orders: with the wide branch last, "widest so far" and
+    # "the last one" agree, so only one of the two orders can tell them apart.
     assert fanout(f"{branch.format(i=0)} UNION ALL {wide}") == 900
+    assert fanout(f"{wide} UNION ALL {branch.format(i=0)}") == 900
+    # And against a branch carrying no generator at all.
+    assert fanout(f"{wide} UNION ALL SELECT o.orderkey FROM tpch.sf1.lineitem o") == 900
 
 
 # --- arrays laundered through a projection ---------------------------------
@@ -768,7 +773,11 @@ def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n24() -> None:
     result = counts(_doubling_chain(24))
     elapsed = time.perf_counter() - start
     assert elapsed < 1.0
-    assert result["tpch.sf1.orders"] <= 100_000
+    # 2^23 reads, counted exactly rather than truncated by the walk budget:
+    # an under-count would scale the byte quote DOWN, which is the discount
+    # saturation exists to refuse.
+    assert result["tpch.sf1.orders"] == 2**23
+    assert scan_counts_saturated(_doubling_chain(24), "trino")
 
 
 def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n40() -> None:
@@ -778,7 +787,8 @@ def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n40() -> None:
     result = counts(_doubling_chain(40))
     elapsed = time.perf_counter() - start
     assert elapsed < 1.0
-    assert result["tpch.sf1.orders"] <= 100_000
+    assert result["tpch.sf1.orders"] == 2**39
+    assert scan_counts_saturated(_doubling_chain(40), "trino")
 
 
 def test_three_way_self_join_still_returns_three() -> None:
@@ -859,28 +869,40 @@ def test_a_map_written_inline_is_a_bounded_lookup() -> None:
         f"SELECT t.k FROM hive.s.orders o CROSS JOIN "
         f"UNNEST(MAP(ARRAY[{wide}], ARRAY[{values}])) AS t(k, v)"
     )
-    assert unpriceable(
+    # Joined to a table the size is carried as a multiplier rather than
+    # refused, and the budget denies it against the table's real cardinality:
+    # 99,999 x a 1.5M-row table is 1.5e11 rows, far past any row budget.
+    lookup = (
         "SELECT t.k FROM hive.s.orders o CROSS JOIN "
         "UNNEST(MAP(sequence(1, 99999), sequence(1, 99999))) AS t(k, v)"
     )
+    assert not unpriceable(lookup)
+    assert fanout(lookup) == 99_999
+    # Alone, nothing downstream prices it, so the inline cap still refuses.
+    assert unpriceable(
+        "SELECT t.k FROM UNNEST(MAP(sequence(1, 99999), sequence(1, 99999))) AS t(k, v)"
+    )
 
 
-def test_a_generator_hidden_in_any_argument_is_unpriceable() -> None:
+def test_a_generator_hidden_in_any_argument_is_still_found() -> None:
     # IF keeps its branches under "true"/"false", not "expressions": walking
-    # .this and .expressions alone would wave the generator through.
-    for call in (
-        "if(true, sequence(1, 100000), o.items)",
-        "if(false, o.items, sequence(1, 99999))",
-        "if(o.k > 1, sequence(1, 99999), o.items)",
-        "coalesce(sequence(1, 99999), o.items)",
-        "nullif(sequence(1, 99999), ARRAY[1])",
-        "CAST(sequence(1, 100000) AS ARRAY(INTEGER))",
-        "slice(sequence(1, 100000), 1, 50000)",
-        "filter(sequence(1, 99999), x -> x > 1)",
+    # .this and .expressions alone would wave the generator through. Crossed
+    # with a table the finding shows up as the multiplier rather than as a
+    # refusal, and a generator nobody found would carry no multiplier at all.
+    for call, size in (
+        ("if(true, sequence(1, 100000), o.items)", 100_000),
+        ("if(false, o.items, sequence(1, 99999))", 99_999),
+        ("if(o.k > 1, sequence(1, 99999), o.items)", 99_999),
+        ("coalesce(sequence(1, 99999), o.items)", 99_999),
+        ("nullif(sequence(1, 99999), ARRAY[1])", 99_999),
+        ("CAST(sequence(1, 100000) AS ARRAY(INTEGER))", 100_000),
+        ("slice(sequence(1, 100000), 1, 50000)", 100_000),
+        ("filter(sequence(1, 99999), x -> x > 1)", 99_999),
     ):
-        assert unpriceable(
-            f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
-        ), call
+        joined = f"SELECT t.n FROM hive.s.orders o CROSS JOIN UNNEST({call}) AS t(n)"
+        assert fanout(joined) == size, call
+        # With no table to price it against, the same shape is refused.
+        assert unpriceable(f"SELECT t.n FROM UNNEST({call}) AS t(n)"), call
 
 
 def test_an_unmodelled_generator_function_is_unpriceable() -> None:
@@ -906,11 +928,12 @@ def test_a_generator_hidden_inside_a_literal_array_is_unpriceable() -> None:
     )
 
 
-def test_a_saturated_scan_count_is_reported_as_unpriceable() -> None:
-    # The walk budget bounds CPU, but a partial count scales the byte quote
-    # DOWN — measured, a 1,471-char CTE chain counts 3,328 reads where the
-    # true number is 524,288, so a 61 GiB query quotes at 3 GiB and is
-    # admitted. Saturation has to deny, not discount.
+def test_a_doubling_chain_is_counted_in_full_not_discounted() -> None:
+    # The danger is a partial count, which scales the byte quote DOWN: this
+    # chain reads the table 2^19 times, and counting fewer prices a 61 GiB
+    # query at 3 GiB. Walking each name once and applying it per reference
+    # reaches the exact figure inside the budget, so the quote is now right
+    # rather than merely refused.
     parts = ["c0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
     for i in range(1, 20):
         parts.append(
@@ -919,16 +942,360 @@ def test_a_saturated_scan_count_is_reported_as_unpriceable() -> None:
         )
     exploding = "WITH " + ", ".join(parts) + " SELECT orderkey FROM c19"
 
-    assert scan_counts_saturated(exploding, "trino")
+    assert counts(exploding) == {"tpch.tiny.orders": 2**19}
+    assert not scan_counts_saturated(exploding, "trino")
     assert not scan_counts_saturated(
         "SELECT a.x FROM tpch.tiny.orders a JOIN tpch.tiny.orders b ON a.k = b.k",
         "trino",
     )
 
 
-def test_the_scan_count_cap_is_the_committed_value() -> None:
+def test_a_count_that_cannot_be_finished_is_still_reported_as_saturated() -> None:
+    # Saturation must keep denying where it does occur: an under-count is a
+    # discount, never a pass. A chain deep enough to outrun the budget even
+    # once per name still has to refuse rather than quote what it managed.
+    parts = ["c0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
+    for i in range(1, 400):
+        parts.append(
+            f"c{i} AS (SELECT a.orderkey FROM c{i - 1} a "
+            f"JOIN c{i - 1} b ON a.orderkey = b.orderkey)"
+        )
+    deep = "WITH " + ", ".join(parts) + " SELECT orderkey FROM c399"
+
+    assert scan_counts_saturated(deep, "trino")
+
+
+def test_the_safety_caps_are_the_committed_values() -> None:
     # Same reason as the depth caps in test_safety: a mutation left on disk
-    # by an interrupted run must fail loudly, not pass green.
-    from lagaam.core.scans import _MAX_SCAN_COUNT
+    # by an interrupted run must fail loudly, not pass green. Every cap is
+    # pinned in both directions — a loosened one is the dangerous half, and
+    # the tests around it happened to overshoot it either way.
+    from lagaam.core.scans import (
+        _MAX_ALIAS_DEPTH,
+        _MAX_COUNTED_READS,
+        _MAX_COUNTED_ROWS,
+        _MAX_INLINE_ROWS,
+        _MAX_RESOLVE_STEPS,
+        _MAX_SCAN_COUNT,
+    )
 
     assert _MAX_SCAN_COUNT == 10_000
+    assert _MAX_INLINE_ROWS == 1000
+    assert _MAX_COUNTED_ROWS == 10_000_000
+    assert _MAX_COUNTED_READS == 1_000_000
+    assert _MAX_ALIAS_DEPTH == 32
+    assert _MAX_RESOLVE_STEPS == 10_000
+
+
+# --- a column alias list names every arm, not just the first ---------------
+
+
+def test_an_alias_list_binds_every_union_arm() -> None:
+    # The alias list was resolved against the first Select found under the
+    # body, so a second arm's manufactured array never bound to the name and
+    # UNNEST read it as a scanned column: 1e9 rows priced as one.
+    assert unpriceable(
+        "WITH g(arr) AS (SELECT ARRAY[1] FROM tpch.sf1.orders "
+        "UNION ALL SELECT repeat(1, 1000000) FROM tpch.sf1.orders) "
+        "SELECT x FROM tpch.sf1.orders o CROSS JOIN g "
+        "CROSS JOIN UNNEST(g.arr) AS t(x)"
+    )
+    # The derived-table spelling of the same shape.
+    assert unpriceable(
+        "SELECT x FROM tpch.sf1.orders o CROSS JOIN "
+        "(SELECT ARRAY[1] FROM tpch.sf1.orders "
+        "UNION ALL SELECT repeat(1, 1000000) FROM tpch.sf1.orders) AS g(arr) "
+        "CROSS JOIN UNNEST(g.arr) AS t(x)"
+    )
+    # Control: every arm bounded is still priceable, and keeps its size.
+    both_bounded = (
+        "WITH g(arr) AS (SELECT ARRAY[1, 2] FROM tpch.sf1.orders "
+        "UNION ALL SELECT ARRAY[3, 4, 5] FROM tpch.sf1.orders) "
+        "SELECT x FROM tpch.sf1.orders o CROSS JOIN g "
+        "CROSS JOIN UNNEST(g.arr) AS t(x)"
+    )
+    assert not unpriceable(both_bounded)
+    assert fanout(both_bounded) == 3
+
+
+# --- a sequence reached through a projection is charged once ---------------
+
+
+def test_a_projected_sequence_is_not_charged_twice() -> None:
+    # The series was counted by the column binding AND again as a loose
+    # GenerateSeries, because the suppression set only held series lexically
+    # under the UNNEST. A 500-row spine quoted as 250,000 denies an ordinary
+    # query on the fail-safe side, which is still a denial.
+    through_derived = (
+        "SELECT x FROM hive.s.orders o "
+        "CROSS JOIN (SELECT sequence(1, 500) AS arr) g "
+        "CROSS JOIN UNNEST(g.arr) a(x)"
+    )
+    assert not unpriceable(through_derived)
+    assert fanout(through_derived) == 500
+    through_cte = (
+        "WITH g AS (SELECT sequence(1, 500) AS arr) "
+        "SELECT x FROM hive.s.orders o CROSS JOIN g "
+        "CROSS JOIN UNNEST(g.arr) a(x)"
+    )
+    assert not unpriceable(through_cte)
+    assert fanout(through_cte) == 500
+    # Control: a series read directly still carries its own size, and two
+    # distinct ones still multiply.
+    assert (
+        fanout(
+            "SELECT n FROM hive.s.orders o "
+            "CROSS JOIN UNNEST(sequence(1, 500)) AS t(n)"
+        )
+        == 500
+    )
+    assert (
+        fanout(
+            "SELECT n FROM hive.s.orders o "
+            "CROSS JOIN UNNEST(sequence(1, 500)) AS t(n) "
+            "CROSS JOIN UNNEST(sequence(1, 3)) AS u(m)"
+        )
+        == 1500
+    )
+
+
+# --- a generator only multiplies where it meets the rows -------------------
+
+
+def test_a_generator_that_cannot_multiply_carries_no_fanout() -> None:
+    # The multiplier was read from the branch, not from where the generator
+    # sits, so a spine that yields one value per outer row was charged as if
+    # it crossed every row. Measured against the 50M default budget, a 1.5M
+    # row table x 365 is 547M: an ordinary report denied.
+    scalar = (
+        "SELECT o.orderkey, (SELECT count(*) FROM UNNEST(sequence(1, 1000)) "
+        "AS a(x)) AS c FROM tpch.sf1.orders o"
+    )
+    assert not unpriceable(scalar)
+    assert fanout(scalar) == 1
+
+    exists = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o WHERE EXISTS "
+        "(SELECT 1 FROM UNNEST(sequence(1, 1000)) AS a(x) WHERE a.x = o.orderkey)"
+    )
+    assert not unpriceable(exists)
+    assert fanout(exists) == 1
+
+    semijoin = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o WHERE o.orderkey IN "
+        "(SELECT x FROM UNNEST(sequence(1, 100)) AS a(x))"
+    )
+    assert not unpriceable(semijoin)
+    assert fanout(semijoin) == 1
+
+    # Control: the shapes that DO multiply keep their multiplier.
+    crossed = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS a(x)"
+    )
+    assert fanout(crossed) == 1000
+    comma = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o, "
+        "UNNEST(sequence(1, 1000)) AS a(x)"
+    )
+    assert fanout(comma) == 1000
+    joined = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o "
+        "JOIN UNNEST(sequence(1, 1000)) AS a(x) ON a.x = o.orderkey"
+    )
+    assert fanout(joined) == 1000
+
+
+def test_an_aggregate_over_a_generator_still_pays_for_the_widest_step() -> None:
+    # The first cut of the collapsing rule read "this select aggregates" and
+    # dropped the multiplier — but an aggregate at the branch's own level runs
+    # AFTER the generator's rows exist, so the engine still builds them. The
+    # property is whether the rows must LEAVE a scope, not whether an
+    # aggregate appears somewhere above.
+    assert (
+        fanout(
+            "SELECT count(*) FROM tpch.sf1.orders o "
+            "CROSS JOIN UNNEST(sequence(1, 1000)) AS a(x)"
+        )
+        == 1000
+    )
+    assert (
+        fanout(
+            "SELECT o.orderkey, count(*) FROM tpch.sf1.orders o "
+            "CROSS JOIN UNNEST(sequence(1, 1000)) AS a(x) GROUP BY o.orderkey"
+        )
+        == 1000
+    )
+    # Collapsed on the way out of a scope, it really is one row per group.
+    assert (
+        fanout(
+            "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN "
+            "(SELECT count(*) AS n FROM UNNEST(sequence(1, 1000)) a(x)) g"
+        )
+        == 1
+    )
+    assert (
+        fanout(
+            "WITH g AS (SELECT count(*) AS n FROM UNNEST(sequence(1, 1000)) a(x)) "
+            "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN g"
+        )
+        == 1
+    )
+    # The same scope without an aggregate still multiplies.
+    assert (
+        fanout(
+            "WITH g AS (SELECT x FROM UNNEST(sequence(1, 1000)) a(x)) "
+            "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN g"
+        )
+        == 1000
+    )
+
+
+def test_a_collapsed_generator_is_still_sized_before_it_is_excused() -> None:
+    # Skipping the multiplier must not skip the SIZING: an unbounded spine
+    # hidden behind an aggregate or a predicate subquery has to stay refused,
+    # or the collapse rule becomes the laundering route.
+    assert unpriceable(
+        "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN "
+        "(SELECT count(*) AS n FROM UNNEST(repeat(o.orderkey, 1000000)) a(x)) g"
+    )
+    assert unpriceable(
+        "SELECT 1 FROM tpch.sf1.orders o WHERE EXISTS "
+        "(SELECT 1 FROM UNNEST(repeat(o.orderkey, 1000000)) a(x))"
+    )
+    assert unpriceable(
+        "SELECT o.orderkey, (SELECT count(*) FROM "
+        "UNNEST(repeat(o.orderkey, 1000000)) a(x)) FROM tpch.sf1.orders o"
+    )
+
+
+def test_a_wide_query_of_aliases_and_columns_stays_under_a_second() -> None:
+    # Resolving aliases copied every bound column to every alias naming its
+    # relation, unbudgeted and before the walk budget was charged: the cost
+    # is the alias x column cross-product, not the recursion the visited set
+    # already bounds. Measured at 165 KB — inside the 200,000-char cap — that
+    # was 33 seconds and 12 GB of RSS before Trino was ever contacted.
+    import time
+
+    columns = ", ".join(f"1 AS c{i}" for i in range(3000))
+    aliases = ", ".join(f"b z{i}" for i in range(3000))
+    wide = (
+        f"WITH b AS (SELECT {columns} FROM tpch.tiny.orders) "
+        f"SELECT 1 AS c FROM b, {aliases}"
+    )
+
+    start = time.perf_counter()
+    unpriceable(wide)
+    assert time.perf_counter() - start < 1.0
+
+    # The over-block half of the same defect: the budget was spent re-walking
+    # a body once per reference, so its WIDTH — which the analyst writes —
+    # exhausted it before any generator was reached. A 400-column CTE read
+    # eight times is an ordinary wide fact table, and it must keep its quote.
+    ordinary = (
+        "WITH b AS (SELECT "
+        + ", ".join(f"1 AS c{i}" for i in range(400))
+        + " FROM tpch.tiny.orders) SELECT 1 AS c FROM b, "
+        + ", ".join(f"b z{i}" for i in range(8))
+    )
+    assert not unpriceable(ordinary)
+
+
+def test_an_aggregate_over_a_joined_generator_still_pays_for_it() -> None:
+    # The collapse rule's first cut excused any aggregating scope, so wrapping
+    # a table-crossed generator in one quoted 6 billion rows as six million —
+    # a 1000x discount, and the same defect class the rule was fixing, only
+    # pointing the other way. An aggregate spares the work only where the
+    # scope builds nothing of its own.
+    through_cte = (
+        "WITH big AS (SELECT count(*) AS c FROM tpch.sf1.lineitem l "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)) SELECT * FROM big"
+    )
+    through_derived = (
+        "SELECT * FROM (SELECT count(*) AS c FROM tpch.sf1.lineitem l "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)) big"
+    )
+    plain = (
+        "SELECT count(*) AS c FROM tpch.sf1.lineitem l "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)"
+    )
+    # Identical real work, so identical quotes whichever way it is spelled.
+    assert fanout(through_cte) == 1000
+    assert fanout(through_derived) == 1000
+    assert fanout(plain) == 1000
+    # A scope that really does build the rows alone still collapses them.
+    assert (
+        fanout(
+            "WITH g AS (SELECT count(*) AS n FROM UNNEST(sequence(1, 1000)) a(x)) "
+            "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN g"
+        )
+        == 1
+    )
+
+
+def test_a_wide_statement_of_ctes_and_unnests_stays_bounded() -> None:
+    # Resolving a generator's input was the one path nothing charged: the
+    # depth cap bounds a single chain of names, not how many chains a wide
+    # statement writes. Measured before the budget reached the resolvers,
+    # 71 KB of this cost 62 seconds of CPU — pre-auth, no engine contacted.
+    import time
+
+    ctes = ",".join(
+        f"c{i} AS (SELECT o_orderkey AS arr FROM tpch.sf1.orders)" for i in range(1100)
+    )
+    joins = " ".join(f"CROSS JOIN UNNEST(arr) AS t{j}(x{j})" for j in range(260))
+    wide = f"WITH {ctes} SELECT 1 FROM c0 {joins} LIMIT 10"
+
+    start = time.perf_counter()
+    unpriceable(wide)
+    fanout(wide)
+    assert time.perf_counter() - start < 2.0
+
+
+def test_a_resolve_that_runs_out_of_budget_refuses() -> None:
+    # Exhaustion has to fail closed on both sides: an input nobody finished
+    # reading is not vouched for, and a width nobody finished measuring is
+    # not a small one.
+    import sqlglot
+
+    from lagaam.core.scans import _MAX_COUNTED_ROWS, _generator_rows, _is_bounded_input
+
+    spent = [0]
+    array = sqlglot.parse_one("ARRAY[1, 2, 3]", dialect="trino")
+    assert not _is_bounded_input(array, {}, frozenset(), spent)
+    unnest = sqlglot.parse_one(
+        "SELECT x FROM UNNEST(ARRAY[1, 2, 3]) t(x)", dialect="trino"
+    )
+    assert _generator_rows(unnest, {}, frozenset(), [0]) == _MAX_COUNTED_ROWS
+
+
+def test_a_long_spine_against_a_table_is_priced_not_refused() -> None:
+    # The flat 1000-row cap survived in _is_bounded_input, so it refused the
+    # very shapes ADR 0006 says to price: seven years of days against a
+    # 25-row table is 63,950 rows, and a year of hourly buckets is ordinary
+    # reporting. Joined to a table the size is a multiplier the budget
+    # applies to a real cardinality.
+    spine = (
+        "SELECT n.n_name, t.d FROM tpch.sf1.nation n CROSS JOIN "
+        "UNNEST(sequence(date '2020-01-01', date '2026-12-31', "
+        "interval '1' day)) AS t(d)"
+    )
+    assert not unpriceable(spine)
+    assert fanout(spine) == 2557
+
+    hours = (
+        "SELECT n.n_name, t.n FROM tpch.sf1.nation n "
+        "CROSS JOIN UNNEST(sequence(1, 8760)) AS t(n)"
+    )
+    assert not unpriceable(hours)
+    assert fanout(hours) == 8760
+
+    # With no table to price it against, the inline cap still binds: nothing
+    # downstream would carry the multiplier.
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 1001)) AS t(n)")
+    assert unpriceable("SELECT n FROM UNNEST(sequence(1, 8760)) AS t(n)")
+    # And a spine past what counting will follow is still refused outright.
+    assert unpriceable(
+        "SELECT n.n_name, t.n FROM tpch.sf1.nation n "
+        "CROSS JOIN UNNEST(sequence(1, 100000000)) AS t(n)"
+    )
