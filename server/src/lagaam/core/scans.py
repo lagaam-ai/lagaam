@@ -466,15 +466,23 @@ def _narrows_its_rows(select: exp.Select) -> bool:
     """
     grouped = select.args.get("group")
     if grouped is not None:
-        # ROLLUP, CUBE and GROUPING SETS emit the subtotal rows on top of the
-        # groups, so they are the one grouping shape that can ADD rows. They
-        # also keep their keys in their own args, leaving group.expressions
-        # empty — which the identity test below would have read as "no keys".
+        # ROLLUP, CUBE, GROUPING SETS and WITH TOTALS emit subtotal rows on
+        # top of the groups, so they are the grouping shapes that can ADD
+        # rows. They also keep their keys in their own args, leaving
+        # group.expressions empty — which the identity test below would have
+        # read as "no keys" and called a reduction.
         if any(
             grouped.args.get(shape)
             for shape in ("rollup", "cube", "grouping_sets", "totals")
         ):
             return False
+        # GROUP BY ALL groups by every non-aggregate projection and leaves
+        # the key list empty too. Over a lone spine that is the identity, so
+        # it is read as the keys it stands for rather than as none.
+        if grouped.args.get("all") and not grouped.expressions:
+            return not _groups_by_what_the_generators_make(
+                select, grouped, keys=_non_aggregate_projections(select)
+            )
         # Whether a GROUP BY reduces anything is a cardinality question, and
         # ADR 0004 keeps those with the plan. The one case SQL settles on its
         # own is a key list that names exactly the columns the generators in
@@ -492,13 +500,31 @@ def _narrows_its_rows(select: exp.Select) -> bool:
     )
 
 
+def _non_aggregate_projections(select: exp.Select) -> list[exp.Expr]:
+    """What GROUP BY ALL stands for: every projection that is not an
+    aggregate, unwrapped from any alias."""
+    standing: list[exp.Expr] = []
+    for projection in select.expressions:
+        value = projection.this if isinstance(projection, exp.Alias) else projection
+        if any(
+            _is_in_this_select(aggregate, select)
+            for aggregate in value.find_all(exp.AggFunc)
+        ):
+            continue
+        standing.append(value)
+    return standing
+
+
 def _groups_by_what_the_generators_make(
-    select: exp.Select, grouped: exp.Group
+    select: exp.Select,
+    grouped: exp.Group,
+    keys: list[exp.Expr] | None = None,
 ) -> bool:
     """True if the group keys are exactly the columns this select's
     generators enumerate, so grouping returns one row per row they made."""
-    keys = [key for key in grouped.expressions if isinstance(key, exp.Column)]
-    if len(keys) != len(grouped.expressions) or not keys:
+    stated: list[exp.Expr] = grouped.expressions if keys is None else keys
+    columns = [key for key in stated if isinstance(key, exp.Column)]
+    if len(columns) != len(stated) or not columns:
         return False
     # Keyed by the relation that supplies each column, not by name alone: a
     # qualifier is what distinguishes one relation's "x" from another's, and
@@ -533,7 +559,7 @@ def _groups_by_what_the_generators_make(
     for source_name, column in produced:
         by_name.setdefault(column, []).append(source_name)
     named: set[tuple[str, str]] = set()
-    for key in keys:
+    for key in columns:
         column = key.name.lower()
         qualifier = str(key.table or "").lower()
         if not qualifier:

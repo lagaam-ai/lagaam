@@ -1596,3 +1596,29 @@ def test_deep_set_operation_nesting_refuses_rather_than_raising() -> None:
     )
     assert unpriceable(deep)
     assert fanout(deep) == 1
+
+
+def test_group_by_all_is_read_as_the_grouping_it_is() -> None:
+    # GROUP BY ALL groups by every non-aggregate projection, which over a
+    # lone spine is the identity — but it leaves group.expressions empty, so
+    # the identity test read it as "no keys" and excused the multiplier.
+    outer = "SELECT n.n_name, s.v FROM tpch.tiny.nation n CROSS JOIN ({body}) s"
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "GROUP BY ALL"
+            )
+        )
+        == 10_000
+    )
+    # GROUP BY () is the empty grouping: one row, a real collapse.
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT count(*) AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "GROUP BY ()"
+            )
+        )
+        == 1
+    )
