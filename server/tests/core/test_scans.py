@@ -1561,10 +1561,13 @@ def test_an_ordinality_counter_counts_as_a_column_the_generator_makes() -> None:
         "SELECT t.x AS v FROM UNNEST(sequence(1, 10000)) "
         "WITH ORDINALITY AS t(x, ord) GROUP BY {keys}"
     )
+    # The counter numbers the rows, so it and the value each identify a row
+    # on their own: all three keyings are one group per row produced.
     assert fanout(outer.format(body=spine.format(keys="t.x, t.ord"))) == 10_000
-    # A subset of what it produces is a reduction the SQL cannot size.
-    assert fanout(outer.format(body=spine.format(keys="t.x"))) == 1
-    assert fanout(outer.format(body=spine.format(keys="t.ord"))) == 1
+    assert fanout(outer.format(body=spine.format(keys="t.x"))) == 10_000
+    assert fanout(outer.format(body=spine.format(keys="t.ord"))) == 10_000
+    # A key over an expression can still merge rows, counter or not.
+    assert fanout(outer.format(body=spine.format(keys="t.ord % 7"))) == 1
 
 
 def test_a_doubling_chain_of_generator_ctes_stays_under_a_second() -> None:
@@ -1622,3 +1625,71 @@ def test_group_by_all_is_read_as_the_grouping_it_is() -> None:
         )
         == 1
     )
+
+
+def test_an_identity_key_is_read_by_what_it_names_not_how_it_is_spelled() -> None:
+    # The identity test required each key to be a bare Column node, which is
+    # the key's syntax rather than the partition it makes: GROUP BY 1 and
+    # GROUP BY (x) group by the same column and were excused anyway. And a
+    # counter is a bijection of the row it counts, so grouping by either
+    # half of an ORDINALITY pair is still one group per row produced.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    spine = "UNNEST(sequence(1, 10000))"
+    numbered = f"{spine} WITH ORDINALITY AS t(x, n)"
+    for body in (
+        f"SELECT x AS v FROM {spine} AS t(x) GROUP BY x",
+        f"SELECT x AS v FROM {spine} AS t(x) GROUP BY 1",
+        f"SELECT x AS v FROM {spine} AS t(x) GROUP BY (x)",
+        f"SELECT x AS v FROM {numbered} GROUP BY x",
+        f"SELECT n AS v FROM {numbered} GROUP BY n",
+    ):
+        assert fanout(outer.format(body=body)) == 10_000, body
+    # An ordinal past the projection list names nothing, and a key over an
+    # expression really can merge rows: both stay charged as reductions.
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT count(*) AS v FROM UNNEST(sequence(1, 10000)) AS t(x) "
+                "GROUP BY x % 7"
+            )
+        )
+        == 1
+    )
+
+
+def test_a_table_a_join_predicate_hides_does_not_raise_the_spine_cap() -> None:
+    # Keeping the whole `joins` argument kept the tables inside a JOIN's ON
+    # clause too, so the very predicate the gate refuses in WHERE admitted a
+    # 5,000,000-row invented spine when written in ON instead.
+    spine = (
+        "SELECT a.x, b.y FROM UNNEST(sequence(1, 10000)) AS a(x) "
+        "CROSS JOIN UNNEST(sequence(1, 500)) AS b(y) "
+        "JOIN (VALUES (1)) AS v(k) ON {predicate}"
+    )
+    for predicate in (
+        "EXISTS (SELECT 1 FROM tpch.sf1.orders)",
+        "v.k IN (SELECT orderkey FROM tpch.sf1.orders)",
+        "v.k = (SELECT count(*) FROM tpch.sf1.orders)",
+    ):
+        assert unpriceable(spine.format(predicate=predicate)), predicate
+    # Control: a table the JOIN really pairs with still prices the spine.
+    joined = (
+        "SELECT o.orderkey, t.n FROM tpch.sf1.orders o "
+        "JOIN UNNEST(sequence(1, 5000000)) AS t(n) ON t.n = o.orderkey"
+    )
+    assert not unpriceable(joined)
+    assert fanout(joined) == 5_000_000
+
+
+def test_counting_reads_refuses_rather_than_raising_on_deep_nesting() -> None:
+    # The read walk recurses once per CTE reference and only the parse was
+    # guarded, so a chain of a thousand links raised out of both counting
+    # entry points — and engine.py treats neither as an engine failure, so
+    # the quote crashed instead of being withheld.
+    parts = ["a0 AS (SELECT orderkey FROM tpch.tiny.orders)"]
+    for i in range(1, 1200):
+        parts.append(f"a{i} AS (SELECT orderkey FROM a{i - 1})")
+    chain = "WITH " + ", ".join(parts) + " SELECT orderkey FROM a1199"
+
+    assert table_scan_counts(chain, "trino") == {}
+    assert scan_counts_saturated(chain, "trino")

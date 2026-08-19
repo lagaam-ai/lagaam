@@ -281,12 +281,25 @@ def _without_unmet_relations(node: exp.Expr) -> exp.Expr:
         for key, value in list(select.args.items()):
             if key in {"from", "from_", "joins", "with", "with_"}:
                 continue
-            for item in value if isinstance(value, list) else [value]:
-                if not isinstance(item, exp.Expr):
-                    continue
-                for relation in list(item.find_all(exp.Table)):
-                    relation.pop()
+            _detach_relations(value)
+    # A JOIN is a relation position, but its ON is a predicate like any
+    # other: the same EXISTS the gate refuses in WHERE was admitting an
+    # invented spine when written in ON instead.
+    for join in list(copy.find_all(exp.Join)):
+        for key, value in list(join.args.items()):
+            if key == "this":
+                continue
+            _detach_relations(value)
     return copy
+
+
+def _detach_relations(value: object) -> None:
+    """Remove every table under this argument, whatever shape it holds."""
+    for item in value if isinstance(value, list) else [value]:
+        if not isinstance(item, exp.Expr):
+            continue
+        for relation in list(item.find_all(exp.Table)):
+            relation.pop()
 
 
 def _reads_a_table(
@@ -515,6 +528,32 @@ def _non_aggregate_projections(select: exp.Select) -> list[exp.Expr]:
     return standing
 
 
+def _group_key_column(key: exp.Expr, select: exp.Select) -> exp.Column | None:
+    """The column a group key names, or None if it names something else.
+
+    A key is read by what it partitions on, not by how it is spelled:
+    parentheses wrap the same column, and a positional ordinal points at a
+    projection which may itself be one. An expression over a column names no
+    column — grouping by it can merge rows, so it is not an identity.
+    """
+    while isinstance(key, exp.Paren):
+        key = key.this
+    if isinstance(key, exp.Column):
+        return key
+    if isinstance(key, exp.Literal) and not key.is_string:
+        try:
+            position = int(key.name)
+        except ValueError:
+            return None
+        if not 1 <= position <= len(select.expressions):
+            return None
+        projected = select.expressions[position - 1]
+        if isinstance(projected, exp.Alias):
+            projected = projected.this
+        return _group_key_column(projected, select)
+    return None
+
+
 def _groups_by_what_the_generators_make(
     select: exp.Select,
     grouped: exp.Group,
@@ -523,7 +562,11 @@ def _groups_by_what_the_generators_make(
     """True if the group keys are exactly the columns this select's
     generators enumerate, so grouping returns one row per row they made."""
     stated: list[exp.Expr] = grouped.expressions if keys is None else keys
-    columns = [key for key in stated if isinstance(key, exp.Column)]
+    # Read what each key NAMES, not how it is written: GROUP BY 1 and
+    # GROUP BY (x) partition exactly as GROUP BY x does, and requiring a
+    # bare Column node excused both.
+    resolved = [_group_key_column(key, select) for key in stated]
+    columns = [key for key in resolved if key is not None]
     if len(columns) != len(stated) or not columns:
         return False
     # Keyed by the relation that supplies each column, not by name alone: a
@@ -531,6 +574,7 @@ def _groups_by_what_the_generators_make(
     # dropping it let a key that names a different relation read as the
     # spine's own.
     produced: set[tuple[str, str]] = set()
+    counters: set[tuple[str, str]] = set()
     relations = 0
     generators = 0
     for source in select.find_all(exp.Table, exp.Unnest, bfs=False):
@@ -542,11 +586,13 @@ def _groups_by_what_the_generators_make(
         source_name = getattr(alias, "name", "").lower()
         for column in getattr(alias, "columns", []) or []:
             produced.add((source_name, column.name.lower()))
-        # WITH ORDINALITY names its counter outside the alias list, and a
-        # key list that includes it is still one row per row produced.
+        # WITH ORDINALITY numbers the rows it produces, so the counter and
+        # the value each identify a row on their own: grouping by either is
+        # still one group per row. It is recorded as an alternative to the
+        # value columns rather than as another required key.
         ordinality = source.args.get("offset")
         if isinstance(ordinality, exp.Identifier):
-            produced.add((source_name, ordinality.name.lower()))
+            counters.add((source_name, ordinality.name.lower()))
     # Every relation in the FROM must be one of those generators: a joined
     # table brings rows the keys do not identify, and how many is the plan's
     # answer, not the SQL's.
@@ -556,7 +602,7 @@ def _groups_by_what_the_generators_make(
     # unambiguous exactly when one does; a name two of them share says
     # nothing, and a qualified key must match the relation it names.
     by_name: dict[str, list[str]] = {}
-    for source_name, column in produced:
+    for source_name, column in produced | counters:
         by_name.setdefault(column, []).append(source_name)
     named: set[tuple[str, str]] = set()
     for key in columns:
@@ -568,7 +614,17 @@ def _groups_by_what_the_generators_make(
                 return False
             qualifier = suppliers[0]
         named.add((qualifier, column))
-    return named == produced
+    if named == produced:
+        return True
+    # A counter stands in for the value columns of the generator that made
+    # it: one relation numbered per row means grouping by the number is the
+    # same partition as grouping by the row.
+    substituted = set(named)
+    for source_name, column in counters:
+        if (source_name, column) in substituted:
+            substituted.discard((source_name, column))
+            substituted |= {pair for pair in produced if pair[0] == source_name}
+    return substituted == produced
 
 
 def _is_in_this_select(node: exp.Expr, select: exp.Select) -> bool:
@@ -1166,12 +1222,20 @@ def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
 
 def _walk_scans(sql: str, dialect: str) -> tuple[dict[str, int], bool]:
     """The read counts, and whether the walk budget ran out reaching them."""
+    # The read walk recurses once per reference too, so the guard covers the
+    # whole count, not just the parse: nesting past the interpreter's stack
+    # raises RecursionError rather than a parser error, and engine.py treats
+    # neither as an engine failure. A count nobody finished is saturated,
+    # which denies — the same answer the shape check gives such SQL.
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
-    # Nesting past the interpreter's stack raises RecursionError, not a
-    # parser error; either way the shape check has already refused this SQL.
+        return _counted_reads(tree)
     except (sqlglot.errors.SqlglotError, RecursionError):
-        return {}, False
+        return {}, True
+
+
+def _counted_reads(tree: exp.Expr) -> tuple[dict[str, int], bool]:
+    """How many times the SQL reads each table, and whether counting ran out."""
 
     bodies = _cte_bodies(tree)
     counts: dict[str, int] = {}
