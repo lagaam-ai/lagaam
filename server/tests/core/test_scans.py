@@ -1851,3 +1851,48 @@ def test_a_correlated_subquery_key_is_not_one_valued() -> None:
     # And on a lone spine the same uncorrelated key leaves the identity.
     lone = "SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY {keys}"
     assert fanout(outer.format(body=lone.format(keys="x, (SELECT 1)"))) == 10_000
+
+
+def test_an_unqualified_outer_column_still_correlates() -> None:
+    # Correlation was read by qualifier alone, so an unqualified reference to
+    # an outer column passed as uncorrelated whenever the subquery had any
+    # relation of its own to have meant. Measured on Trino, two 100x100
+    # spines grouped by t.x with such a key give 10,000 groups where t.x
+    # alone gives 100 — the key partitions per row, and dropping it as a
+    # constant priced a 3000x3000 pair a hundred-fold low.
+    outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    two = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 3000)) AS t(x) "
+        "CROSS JOIN UNNEST(sequence(1, 3000)) AS s(y) GROUP BY {keys}"
+    )
+    reaching_out = "t.x, (SELECT max(y) FROM UNNEST(ARRAY[1]) AS q(z))"
+    assert fanout(outer.format(body=two.format(keys=reaching_out))) == 9_000_000
+    # A name the subquery's own relation supplies is not correlated, and
+    # neither is one an inner alias shadows.
+    shadowed = "t.x, (SELECT max(z) FROM UNNEST(ARRAY[1]) AS s(z))"
+    assert fanout(outer.format(body=two.format(keys=shadowed))) == 1
+    assert fanout(outer.format(body=two.format(keys="t.x, (SELECT 1)"))) == 1
+
+
+def test_a_table_named_outside_the_from_is_not_the_scope_s_own() -> None:
+    # Whether a narrowing scope builds relations of its own was read from
+    # every table named anywhere in it, so a scalar subquery among the group
+    # keys or in a WHERE made an ordinary aggregate look like a join and
+    # kept a multiplier it should have excused.
+    assert (
+        fanout(
+            "SELECT 1 FROM tpch.sf1.orders o CROSS JOIN "
+            "(SELECT count(*) AS n FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            "WHERE (SELECT count(*) FROM tpch.sf1.nation) > 0) g"
+        )
+        == 1
+    )
+    # The guard it exists for still holds: a generator already crossed with
+    # a table in the scope's own FROM keeps its multiplier.
+    assert (
+        fanout(
+            "SELECT * FROM (SELECT count(*) AS c FROM tpch.sf1.lineitem l "
+            "CROSS JOIN UNNEST(sequence(1, 1000)) AS t(n)) big"
+        )
+        == 1000
+    )

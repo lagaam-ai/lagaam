@@ -483,8 +483,13 @@ def _remembered(
 
 
 def _scans_a_table(select: exp.Select) -> bool:
-    """True if this select reads a relation of its own, generators aside."""
-    for table in select.find_all(exp.Table):
+    """True if this select's own FROM or JOIN reads a table, generators aside.
+
+    A table named anywhere else — in a scalar subquery among the group keys,
+    in a WHERE predicate — brings no rows this select's rows pair with, and
+    counting it said the scope builds relations of its own when it does not.
+    """
+    for table in _without_unmet_relations(select).find_all(exp.Table):
         if any(table.find_all(exp.GenerateSeries, *_GENERATORS)):
             continue
         return True
@@ -667,17 +672,29 @@ def _reads_an_outer_column(subquery: exp.Subquery) -> bool:
     the subquery does not itself introduce, or left bare where the subquery
     has no relation of its own to have meant.
     """
-    supplied = set()
+    relations: set[str] = set()
+    columns: set[str] = set()
     for relation in subquery.find_all(exp.Table, exp.Unnest):
         alias = relation.args.get("alias")
         name = getattr(alias, "name", "") or getattr(relation, "alias_or_name", "")
         if name:
-            supplied.add(name.lower())
+            relations.add(name.lower())
+        for column in getattr(alias, "columns", []) or []:
+            columns.add(column.name.lower())
+        ordinality = relation.args.get("offset")
+        if isinstance(ordinality, exp.Identifier):
+            columns.add(ordinality.name.lower())
     for column in subquery.find_all(exp.Column):
         qualifier = str(column.table or "").lower()
-        if qualifier and qualifier not in supplied:
-            return True
-        if not qualifier and not supplied:
+        if qualifier:
+            if qualifier not in relations:
+                return True
+            continue
+        # Unqualified, it belongs to whichever of the subquery's own
+        # relations names it. Reading "the subquery has some relation" as
+        # "the name must be its own" let a reference to the outer row pass
+        # as uncorrelated whenever any relation was in scope.
+        if column.name.lower() not in columns:
             return True
     return False
 
