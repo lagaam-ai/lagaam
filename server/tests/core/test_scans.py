@@ -1465,3 +1465,134 @@ def test_a_rollup_over_a_spine_still_pays_for_it() -> None:
             body=f"SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) {grouping}"
         )
         assert fanout(sql) == 10_000, grouping
+
+
+def test_a_group_key_is_read_with_its_qualifier() -> None:
+    # The identity test compared key names to generator column names with
+    # the qualifier dropped, so a key naming a different relation's "x" read
+    # as the spine's own. A qualifier is exactly what tells them apart.
+    outer = "SELECT l.orderkey, s.v FROM tpch.sf1.lineitem l CROSS JOIN ({body}) s"
+    two = (
+        "SELECT a.x AS v FROM UNNEST(sequence(1, 1000)) AS a(x) "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS b(y) GROUP BY {keys}"
+    )
+    # Both generators' columns, each qualified: the identity.
+    assert fanout(outer.format(body=two.format(keys="a.x, b.y"))) == 1_000_000
+    # A qualifier naming a relation that does not supply the column is a
+    # shape this cannot read, so the multiplier stands.
+    assert fanout(outer.format(body=two.format(keys="a.x, a.y"))) == 1
+    # Unqualified keys name whichever generator supplies them, which is
+    # unambiguous exactly when one does.
+    assert fanout(outer.format(body=two.format(keys="x, y"))) == 1_000_000
+    assert (
+        fanout(
+            outer.format(
+                body="SELECT x AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY x"
+            )
+        )
+        == 10_000
+    )
+    # A name two generators share says nothing about which one a bare key
+    # reads, so the multiplier stands rather than being guessed away.
+    shared = (
+        "SELECT a.x AS v FROM UNNEST(sequence(1, 1000)) AS a(x) "
+        "CROSS JOIN UNNEST(sequence(1, 1000)) AS b(x) GROUP BY x"
+    )
+    assert fanout(outer.format(body=shared)) == 1
+
+
+def test_a_values_arm_binds_like_a_select_arm() -> None:
+    # VALUES is a set-operation arm that projects without a Select node, so
+    # walking arms and asking each for its Select skipped it entirely and the
+    # array it spelled out never bound to the name.
+    assert unpriceable(
+        "WITH v(arr) AS (SELECT ARRAY[1] UNION ALL VALUES (repeat(1, 1000000))) "
+        "SELECT o.orderkey, x FROM tpch.sf1.orders o CROSS JOIN v "
+        "CROSS JOIN UNNEST(v.arr) AS t(x)"
+    )
+    assert unpriceable(
+        "SELECT o.orderkey, x FROM tpch.sf1.orders o CROSS JOIN "
+        "(SELECT ARRAY[1] UNION ALL VALUES (repeat(1, 1000000))) AS v(arr) "
+        "CROSS JOIN UNNEST(v.arr) AS t(x)"
+    )
+    # Control: bounded arms stay priceable, widest size carried.
+    bounded = (
+        "WITH v(arr) AS (SELECT ARRAY[1] UNION ALL VALUES (ARRAY[1, 2, 3])) "
+        "SELECT o.orderkey, x FROM tpch.sf1.orders o CROSS JOIN v "
+        "CROSS JOIN UNNEST(v.arr) AS t(x)"
+    )
+    assert not unpriceable(bounded)
+    assert fanout(bounded) == 3
+
+
+def test_a_table_a_subquery_hides_does_not_raise_the_spine_cap() -> None:
+    # Detaching relations under EXISTS and IN was not enough: a scalar or
+    # quantified subquery in WHERE, HAVING or ORDER BY carries a table the
+    # generator never meets just the same, and it unlocked the 10,000,000
+    # cap for a spine that runs alone.
+    for clause in (
+        "WHERE n = (SELECT count(*) FROM tpch.sf1.orders)",
+        "WHERE n = ANY (SELECT orderkey FROM tpch.sf1.orders)",
+        "WHERE n > ALL (SELECT orderkey FROM tpch.sf1.orders)",
+        "WHERE n < (SELECT max(orderkey) FROM tpch.sf1.orders)",
+        "GROUP BY n HAVING count(*) > (SELECT count(*) FROM tpch.sf1.orders)",
+        "ORDER BY (SELECT count(*) FROM tpch.sf1.orders)",
+    ):
+        assert unpriceable(
+            f"SELECT n FROM UNNEST(sequence(1, 5000000)) AS t(n) {clause}"
+        ), clause
+    # Control: a table the spine really is crossed with still prices it,
+    # even with one of those subqueries alongside.
+    joined = (
+        "SELECT o.orderkey, t.n FROM tpch.sf1.orders o "
+        "CROSS JOIN UNNEST(sequence(1, 5000000)) AS t(n) "
+        "WHERE o.orderkey < (SELECT max(nationkey) FROM tpch.sf1.nation)"
+    )
+    assert not unpriceable(joined)
+    assert fanout(joined) == 5_000_000
+
+
+def test_an_ordinality_counter_counts_as_a_column_the_generator_makes() -> None:
+    # WITH ORDINALITY names its counter outside the alias list, so a key list
+    # naming both it and the value read as a mismatch and excused the
+    # multiplier — the identity case the rule exists to protect, priced at 1.
+    outer = "SELECT n.n_name, s.v FROM tpch.tiny.nation n CROSS JOIN ({body}) s"
+    spine = (
+        "SELECT t.x AS v FROM UNNEST(sequence(1, 10000)) "
+        "WITH ORDINALITY AS t(x, ord) GROUP BY {keys}"
+    )
+    assert fanout(outer.format(body=spine.format(keys="t.x, t.ord"))) == 10_000
+    # A subset of what it produces is a reduction the SQL cannot size.
+    assert fanout(outer.format(body=spine.format(keys="t.x"))) == 1
+    assert fanout(outer.format(body=spine.format(keys="t.ord"))) == 1
+
+
+def test_a_doubling_chain_of_generator_ctes_stays_under_a_second() -> None:
+    # _reads_a_table follows CTE references with no budget, so a chain each
+    # link of which reads the previous one twice doubled its work per level:
+    # measured, 1,072 characters cost 90 seconds before Trino was contacted.
+    import time
+
+    parts = ["c0 AS (SELECT x FROM UNNEST(sequence(1, 10)) AS t(x))"]
+    for i in range(1, 22):
+        parts.append(f"c{i} AS (SELECT a.x FROM c{i - 1} a CROSS JOIN c{i - 1} b)")
+    chain = "WITH " + ", ".join(parts) + " SELECT x FROM c21"
+
+    start = time.perf_counter()
+    unpriceable(chain)
+    fanout(chain)
+    assert time.perf_counter() - start < 1.0
+
+
+def test_deep_set_operation_nesting_refuses_rather_than_raising() -> None:
+    # Walking a set operation's arms recurses once per arm, so a long chain
+    # of UNIONs exhausted the interpreter's stack AFTER the parse — where
+    # neither entry point was catching it — and _estimate_cost saw an
+    # exception instead of the "no quote" this module promises.
+    deep = (
+        "WITH v(arr) AS ("
+        + " UNION ALL ".join(["SELECT ARRAY[1]"] * 1500)
+        + ") SELECT x FROM v CROSS JOIN UNNEST(v.arr) AS t(x)"
+    )
+    assert unpriceable(deep)
+    assert fanout(deep) == 1

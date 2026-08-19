@@ -195,6 +195,22 @@ def _union_branches(node: exp.Expr) -> list[exp.Expr]:
     return [node]
 
 
+def _arm_projections(arm: exp.Expr) -> list[list[exp.Expr]]:
+    """Each row of values this arm puts under the alias list's names.
+
+    A SELECT arm projects one row shape; a VALUES arm projects one per row it
+    spells out, and it carries no Select at all — asking every arm for its
+    Select skipped VALUES entirely, and the array it spelled out never bound.
+    """
+    if isinstance(arm, exp.Values):
+        return [
+            row.expressions if isinstance(row, exp.Tuple) else [row]
+            for row in arm.expressions
+        ]
+    select = arm.find(exp.Select)
+    return [select.expressions] if select is not None else []
+
+
 def _projecting_arms(node: exp.Expr) -> list[exp.Expr]:
     """Every arm of a set operation that can put a value under a name.
 
@@ -227,50 +243,71 @@ def generator_fanout(sql: str, dialect: str) -> int:
     1 for SQL with no generator, and for one the shape check has already
     refused — a query with no quote needs no multiplier.
     """
+    # Anything this cannot read leaves the multiplier at 1, which is only
+    # safe because has_unpriceable_shape has already refused the same SQL —
+    # it walks the same tree and answers the same exceptions.
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
+        bodies = _cte_bodies(tree)
+        budget = [_MAX_SCAN_COUNT]
+        projections = _projected_expressions(tree)
+        widest = 1
+        for branch in _union_branches(_without_cte_bodies(tree)):
+            if not _reads_a_table(branch, bodies, frozenset()):
+                continue
+            product = _generator_product(
+                branch, bodies, frozenset(), budget, projections, for_pricing=True
+            )
+            if product is None:
+                return 1
+            widest = max(widest, product)
+        return widest
     except (sqlglot.errors.SqlglotError, RecursionError):
         return 1
-    bodies = _cte_bodies(tree)
-    budget = [_MAX_SCAN_COUNT]
-    projections = _projected_expressions(tree)
-    widest = 1
-    for branch in _union_branches(_without_cte_bodies(tree)):
-        if not _reads_a_table(branch, bodies, frozenset()):
-            continue
-        product = _generator_product(
-            branch, bodies, frozenset(), budget, projections, for_pricing=True
-        )
-        if product is None:
-            return 1
-        widest = max(widest, product)
-    return widest
 
 
 def _without_unmet_relations(node: exp.Expr) -> exp.Expr:
-    """The subtree with the relations nothing joins to detached.
+    """The subtree with everything but its own relations detached.
 
-    A table under EXISTS or an IN predicate answers a question about each
-    row; one in a scalar subquery in the SELECT list contributes a value to
-    it. Neither pairs its rows with the branch's, so neither is a table a
-    generator's rows can be a multiplier on.
+    A table a generator's rows can multiply is one the FROM or a JOIN puts
+    beside them. A table anywhere else — under EXISTS, an IN, a scalar or
+    quantified comparison in WHERE, a HAVING, an ORDER BY — answers a
+    question about each row instead of pairing with it. Listing the places
+    that do not count meant every clause SQL grows is a new hole, so this
+    keeps the relation positions and drops the rest.
     """
     copy = node.copy()
-    for predicate in list(copy.find_all(exp.Exists, exp.In)):
-        for relation in list(predicate.find_all(exp.Table)):
-            relation.pop()
     for select in list(copy.find_all(exp.Select)):
-        for projection in select.expressions:
-            for subquery in list(projection.find_all(exp.Subquery)):
-                for relation in list(subquery.find_all(exp.Table)):
+        for key, value in list(select.args.items()):
+            if key in {"from", "from_", "joins", "with", "with_"}:
+                continue
+            for item in value if isinstance(value, list) else [value]:
+                if not isinstance(item, exp.Expr):
+                    continue
+                for relation in list(item.find_all(exp.Table)):
                     relation.pop()
     return copy
 
 
 def _reads_a_table(
-    node: exp.Expr, bodies: Mapping[str, list[exp.Expr]], pending: frozenset[str]
+    node: exp.Expr,
+    bodies: Mapping[str, list[exp.Expr]],
+    pending: frozenset[str],
+    answered: dict[tuple[int, frozenset[str]], bool] | None = None,
 ) -> bool:
-    """True if this subtree scans a table, following CTE references into it."""
+    """True if this subtree scans a table, following CTE references into it.
+
+    Answers are kept per body and scope: a chain whose every link reads the
+    previous one twice re-asked the same question 2^n times, and 1,072
+    characters of it cost 90 seconds before any engine was contacted.
+    """
+    answered = answered if answered is not None else {}
+    key = (id(node), pending)
+    remembered = answered.get(key)
+    if remembered is not None:
+        return remembered
+    # Recorded before recursing so a cycle answers itself rather than looping.
+    answered[key] = False
     for table in node.find_all(exp.Table):
         # A table expression is not always a table: TABLE(sequence(...)) wraps
         # a generator in a node named for the keyword, and reading that as a
@@ -280,12 +317,15 @@ def _reads_a_table(
         parts = [part.name for part in table.parts]
         name = parts[0].lower()
         if len(parts) > 1 or name not in bodies:
+            answered[key] = True
             return True
         if name in pending:
             continue
         if any(
-            _reads_a_table(body, bodies, pending | {name}) for body in bodies[name]
+            _reads_a_table(body, bodies, pending | {name}, answered)
+            for body in bodies[name]
         ):
+            answered[key] = True
             return True
     return False
 
@@ -460,21 +500,49 @@ def _groups_by_what_the_generators_make(
     keys = [key for key in grouped.expressions if isinstance(key, exp.Column)]
     if len(keys) != len(grouped.expressions) or not keys:
         return False
-    produced: set[str] = set()
+    # Keyed by the relation that supplies each column, not by name alone: a
+    # qualifier is what distinguishes one relation's "x" from another's, and
+    # dropping it let a key that names a different relation read as the
+    # spine's own.
+    produced: set[tuple[str, str]] = set()
     relations = 0
+    generators = 0
     for source in select.find_all(exp.Table, exp.Unnest, bfs=False):
         relations += 1
         if not isinstance(source, exp.Unnest):
             continue
+        generators += 1
         alias = source.args.get("alias")
+        source_name = getattr(alias, "name", "").lower()
         for column in getattr(alias, "columns", []) or []:
-            produced.add(column.name.lower())
+            produced.add((source_name, column.name.lower()))
+        # WITH ORDINALITY names its counter outside the alias list, and a
+        # key list that includes it is still one row per row produced.
+        ordinality = source.args.get("offset")
+        if isinstance(ordinality, exp.Identifier):
+            produced.add((source_name, ordinality.name.lower()))
     # Every relation in the FROM must be one of those generators: a joined
     # table brings rows the keys do not identify, and how many is the plan's
     # answer, not the SQL's.
-    if relations != len(list(select.find_all(exp.Unnest, bfs=False))):
+    if relations != generators or not produced:
         return False
-    return bool(produced) and {key.name.lower() for key in keys} == produced
+    # An unqualified key names whichever generator supplies it, which is
+    # unambiguous exactly when one does; a name two of them share says
+    # nothing, and a qualified key must match the relation it names.
+    by_name: dict[str, list[str]] = {}
+    for source_name, column in produced:
+        by_name.setdefault(column, []).append(source_name)
+    named: set[tuple[str, str]] = set()
+    for key in keys:
+        column = key.name.lower()
+        qualifier = str(key.table or "").lower()
+        if not qualifier:
+            suppliers = by_name.get(column, [])
+            if len(suppliers) != 1:
+                return False
+            qualifier = suppliers[0]
+        named.add((qualifier, column))
+    return named == produced
 
 
 def _is_in_this_select(node: exp.Expr, select: exp.Select) -> bool:
@@ -616,13 +684,11 @@ def _projected_expressions(tree: exp.Expr) -> dict[str, list[exp.Expr]]:
         # leading Select let a later arm's manufactured array pass as a
         # scanned column.
         for branch in _projecting_arms(body):
-            select = branch.find(exp.Select)
-            if select is None:
-                continue
-            for column, projection in zip(
-                alias.columns, select.expressions, strict=False
-            ):
-                bind(source, column.name, projection)
+            for projected in _arm_projections(branch):
+                for column, projection in zip(
+                    alias.columns, projected, strict=False
+                ):
+                    bind(source, column.name, projection)
 
     for cte in tree.find_all(exp.CTE):
         bind_alias_list(cte.args.get("alias"), cte.this)
@@ -1045,11 +1111,14 @@ def has_unpriceable_shape(sql: str, dialect: str) -> bool:
     vouched for. validate_query's depth cap stops such SQL earlier; this
     keeps the module's own contract if it is ever called without it.
     """
+    # The walk recurses too — a long chain of set operations exhausts the
+    # stack after the parse, and an exception escaping here would crash the
+    # quote instead of withholding it.
     try:
         tree = sqlglot.parse_one(sql, dialect=dialect)
+        return _generates_rows(tree)
     except (sqlglot.errors.SqlglotError, RecursionError):
         return True
-    return _generates_rows(tree)
 
 
 def table_scan_counts(sql: str, dialect: str) -> dict[str, int]:
