@@ -394,11 +394,18 @@ def _generator_product(
             # wide statement writes, and the resolvers were the one path
             # nothing charged. 71 KB of CTEs and unnests cost a minute of CPU
             # before Trino was contacted.
+            # Whether the table prices THIS generator's rows, not whether it
+            # prices some generator in the branch: a spine a nested scope
+            # collapses never meets the table, so nothing downstream carries
+            # its rows and the lone-spine cap is the one that binds. Reading
+            # the branch-wide answer let a 10,000,000-row spine through any
+            # scope that collapsed it — every spelling but the CTE one.
+            meets = _multiplies_its_branch(child, node, landing)
             if not _expands_a_bounded_value(
-                child, projections, budget=budget, priced_by_a_table=priced
+                child, projections, budget=budget, priced_by_a_table=priced and meets
             ):
                 return None
-            if for_pricing and not _multiplies_its_branch(child, node, landing):
+            if for_pricing and not meets:
                 continue
             product *= _generator_rows(child, projections, budget=budget)
             if product > _MAX_COUNTED_ROWS:
@@ -416,10 +423,15 @@ def _generator_product(
     for series in loose:
         if id(series) in wrapped:
             continue
-        if for_pricing and not _multiplies_its_branch(series, node, landing):
+        meets = _multiplies_its_branch(series, node, landing)
+        if for_pricing and not meets:
             continue
         length = _sequence_length(series)
-        if length is None or length > _MAX_COUNTED_ROWS:
+        if length is None:
+            return None
+        # A series in a table position is capped the same way a wrapped one
+        # is: unmet by the branch's table, it is a lone spine.
+        if length > (_MAX_COUNTED_ROWS if priced and meets else _MAX_INLINE_ROWS):
             return None
         product *= length
         if product > _MAX_COUNTED_ROWS:

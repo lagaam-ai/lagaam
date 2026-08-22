@@ -2043,3 +2043,40 @@ def test_a_repeated_zip_column_is_refused_rather_than_priced() -> None:
     # ARRAY[1, 2] is not a sequence, so it does not stand in: charged as a
     # reduction, the fail-safe direction for a multiplier.
     assert fanout(outer.format(body=padded)) == 1
+
+
+def test_a_spine_a_nested_scope_collapses_is_capped_as_a_lone_spine() -> None:
+    # The branch's table decides how large a spelled-out spine may be, but
+    # that answer was computed once for the whole branch and handed to every
+    # generator in it. A spine inside a scope that collapses its rows never
+    # meets that table — nothing downstream prices those rows — yet it drew
+    # the 10,000,000 allowance instead of 1,000. Identical real work, so the
+    # CTE spelling and every other spelling must agree.
+    table = "tpch.sf1.orders o"
+    spine = "UNNEST(sequence(1, 10000000)) AS a(x)"
+    collapsed = [
+        f"SELECT 1 FROM {table} CROSS JOIN (SELECT count(*) AS c FROM {spine}) g",
+        f"SELECT 1 FROM {table} CROSS JOIN (SELECT max(a.x) AS c FROM {spine}) g",
+        f"SELECT 1 FROM {table} LEFT JOIN (SELECT count(*) AS c FROM {spine}) g ON TRUE",
+        f"SELECT 1 FROM {table} WHERE EXISTS (SELECT 1 FROM {spine})",
+        f"SELECT 1 FROM {table} WHERE o.orderkey IN (SELECT a.x FROM {spine})",
+        f"SELECT (SELECT count(*) FROM {spine}) AS c FROM {table}",
+        f"WITH g AS (SELECT count(*) AS c FROM {spine}) "
+        f"SELECT 1 FROM {table} CROSS JOIN g",
+    ]
+    for query in collapsed:
+        assert unpriceable(query), query
+    # Control: a spine the table really is crossed with is a multiplier the
+    # budget applies to a real cardinality, and stays priced.
+    joined = f"SELECT o.orderkey, t.n FROM {table} CROSS JOIN UNNEST(sequence(1, 10000)) AS t(n)"
+    assert not unpriceable(joined)
+    assert fanout(joined) == 10_000
+
+
+def test_a_collapsed_spine_within_the_lone_cap_is_still_priced() -> None:
+    # The cap moves, it does not refuse the shape: a spine a nested scope
+    # collapses is ordinary at 1,000 rows, and only the size it could not
+    # have alone is refused.
+    table = "tpch.sf1.orders o"
+    small = "SELECT 1 FROM {t} CROSS JOIN (SELECT count(*) AS c FROM UNNEST(sequence(1, 1000)) AS a(x)) g"
+    assert not unpriceable(small.format(t=table))
