@@ -350,6 +350,7 @@ def _generator_product(
     budget: list[int],
     projections: Mapping[str, list[exp.Expr]],
     for_pricing: bool = False,
+    under_a_table: bool = False,
 ) -> int | None:
     """Rows this subtree's generators multiply out to, or None past the cap.
 
@@ -372,7 +373,9 @@ def _generator_product(
     # It has to be a table the generator actually MEETS — one inside EXISTS,
     # an IN predicate or an uncorrelated scalar subquery carries nothing, and
     # counting it let a 10,000,000-row spine through where 1000 is the limit.
-    priced = _reads_a_table(_without_unmet_relations(node), bodies, pending)
+    priced = under_a_table or _reads_a_table(
+        _without_unmet_relations(node), bodies, pending
+    )
     # One answer per select for "does this scope narrow" and "does it scan":
     # both are about the select alone, and asking per generator made the walk
     # quadratic in generator count.
@@ -395,14 +398,16 @@ def _generator_product(
             # nothing charged. 71 KB of CTEs and unnests cost a minute of CPU
             # before Trino was contacted.
             # Whether the table prices THIS generator's rows, not whether it
-            # prices some generator in the branch: a spine a nested scope
-            # collapses never meets the table, so nothing downstream carries
-            # its rows and the lone-spine cap is the one that binds. Reading
-            # the branch-wide answer let a 10,000,000-row spine through any
-            # scope that collapsed it — every spelling but the CTE one.
+            # prices some generator in the branch: reading the branch-wide
+            # answer let a 10,000,000-row spine through any scope that
+            # collapsed it — every spelling but the CTE one.
             meets = _multiplies_its_branch(child, node, landing)
             if not _expands_a_bounded_value(
-                child, projections, budget=budget, priced_by_a_table=priced and meets
+                child,
+                projections,
+                budget=budget,
+                priced_by_a_table=priced and meets,
+                builds_alone=priced and not meets,
             ):
                 return None
             if for_pricing and not meets:
@@ -430,8 +435,11 @@ def _generator_product(
         if length is None:
             return None
         # A series in a table position is capped the same way a wrapped one
-        # is: unmet by the branch's table, it is a lone spine.
-        if length > (_MAX_COUNTED_ROWS if priced and meets else _MAX_INLINE_ROWS):
+        # is: priced where the branch's table carries its rows, held to what
+        # a query may invent alone where a scope collapses them, and to the
+        # inline cap where there is no table to have met.
+        cap = _MAX_COUNTED_ROWS if priced else _MAX_INLINE_ROWS
+        if length > cap:
             return None
         product *= length
         if product > _MAX_COUNTED_ROWS:
@@ -449,7 +457,13 @@ def _generator_product(
             widest = 1
             for body in bodies[name]:
                 nested = _generator_product(
-                    body, bodies, pending | {name}, budget, projections, for_pricing
+                    body,
+                    bodies,
+                    pending | {name},
+                    budget,
+                    projections,
+                    for_pricing,
+                    under_a_table=priced,
                 )
                 if nested is None:
                     return None
@@ -997,6 +1011,7 @@ def _expands_a_bounded_value(
     seen: frozenset[str] = frozenset(),
     budget: list[int] | None = None,
     priced_by_a_table: bool = False,
+    builds_alone: bool = False,
 ) -> bool:
     """True if the generator's input is bounded by something already priced.
 
@@ -1012,7 +1027,9 @@ def _expands_a_bounded_value(
     if not inputs:
         return False
     return all(
-        _is_bounded_input(value, projections, seen, budget, priced_by_a_table)
+        _is_bounded_input(
+            value, projections, seen, budget, priced_by_a_table, builds_alone
+        )
         for value in inputs
     )
 
@@ -1281,6 +1298,7 @@ def _is_bounded_input(
     seen: frozenset[str] = frozenset(),
     budget: list[int] | None = None,
     priced_by_a_table: bool = False,
+    builds_alone: bool = False,
 ) -> bool:
     """True if this generator argument yields a length something else fixes.
 
@@ -1328,7 +1346,8 @@ def _is_bounded_input(
             return all(isinstance(bound, exp.Column) for bound in bindings)
         return all(
             _is_bounded_input(
-                bound, projections, seen | {key}, budget, priced_by_a_table
+                bound, projections, seen | {key}, budget, priced_by_a_table,
+                builds_alone,
             )
             for bound in bindings
         )
@@ -1346,6 +1365,13 @@ def _is_bounded_input(
         # hand — a seven-year daily spine against a 25-row table is 63,950
         # rows, and refusing it sight-unseen is the flat cap ADR 0006 dropped.
         if priced_by_a_table:
+            return length <= _MAX_COUNTED_ROWS
+        # A spine a scope collapses is neither: nothing downstream multiplies
+        # its rows, but the scope really does build them, so what binds is
+        # what a query may invent on its own. Refusing it at the inline cap
+        # denied an hourly year inside EXISTS while the same spine CROSS
+        # JOINed — which produces 8,760 times more rows — was admitted.
+        if builds_alone:
             return length <= _MAX_COUNTED_ROWS
         return length <= _MAX_INLINE_ROWS
     if isinstance(value, exp.Func):

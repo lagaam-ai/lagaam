@@ -2043,34 +2043,42 @@ def test_a_repeated_zip_column_is_refused_rather_than_priced() -> None:
     # ARRAY[1, 2] is not a sequence, so it does not stand in: charged as a
     # reduction, the fail-safe direction for a multiplier.
     assert fanout(outer.format(body=padded)) == 1
-
-
-def test_a_spine_a_nested_scope_collapses_is_capped_as_a_lone_spine() -> None:
-    # The branch's table decides how large a spelled-out spine may be, but
-    # that answer was computed once for the whole branch and handed to every
-    # generator in it. A spine inside a scope that collapses its rows never
-    # meets that table — nothing downstream prices those rows — yet it drew
-    # the 10,000,000 allowance instead of 1,000. Identical real work, so the
-    # CTE spelling and every other spelling must agree.
+def test_a_collapsed_spine_is_bounded_by_what_a_query_invents_alone() -> None:
+    # A spine a scope collapses is neither a multiplier nor a lone spine:
+    # nothing downstream multiplies its rows, but the scope really does build
+    # them. So what binds is what a query may invent on its own, and every
+    # spelling of the same work must agree — the branch-wide `priced` answer
+    # let a 10,000,000-row spine through some spellings and refused others.
     table = "tpch.sf1.orders o"
-    spine = "UNNEST(sequence(1, 10000000)) AS a(x)"
-    collapsed = [
-        f"SELECT 1 FROM {table} CROSS JOIN (SELECT count(*) AS c FROM {spine}) g",
-        f"SELECT 1 FROM {table} CROSS JOIN (SELECT max(a.x) AS c FROM {spine}) g",
-        f"SELECT 1 FROM {table} LEFT JOIN (SELECT count(*) AS c FROM {spine}) g ON TRUE",
-        f"SELECT 1 FROM {table} WHERE EXISTS (SELECT 1 FROM {spine})",
-        f"SELECT 1 FROM {table} WHERE o.orderkey IN (SELECT a.x FROM {spine})",
-        f"SELECT (SELECT count(*) FROM {spine}) AS c FROM {table}",
-        f"WITH g AS (SELECT count(*) AS c FROM {spine}) "
-        f"SELECT 1 FROM {table} CROSS JOIN g",
-    ]
-    for query in collapsed:
+
+    def spellings(rows: int) -> list[str]:
+        spine = f"UNNEST(sequence(1, {rows})) AS a(x)"
+        return [
+            f"WITH g AS (SELECT count(*) AS c FROM {spine}) "
+            f"SELECT 1 FROM {table} CROSS JOIN g",
+            f"SELECT 1 FROM {table} CROSS JOIN (SELECT count(*) AS c FROM {spine}) g",
+            f"SELECT 1 FROM {table} WHERE EXISTS (SELECT 1 FROM {spine})",
+            f"SELECT (SELECT count(*) FROM {spine}) AS c FROM {table}",
+            f"SELECT 1 FROM {table} WHERE o.orderkey IN (SELECT a.x FROM {spine})",
+        ]
+
+    # An hourly year inside a collapsing scope is ordinary analytics: refusing
+    # it denied the shape while the same spine CROSS JOINed — which produces
+    # 8,760 times more rows — was admitted.
+    for query in spellings(8_760):
+        assert not unpriceable(query), query
+        assert fanout(query) == 1, query
+    # Past what a table-less query may invent, every spelling refuses.
+    for query in spellings(10_000_001):
         assert unpriceable(query), query
-    # Control: a spine the table really is crossed with is a multiplier the
-    # budget applies to a real cardinality, and stays priced.
-    joined = f"SELECT o.orderkey, t.n FROM {table} CROSS JOIN UNNEST(sequence(1, 10000)) AS t(n)"
-    assert not unpriceable(joined)
-    assert fanout(joined) == 10_000
+    # A spine that really does multiply the table keeps its multiplier, so the
+    # budget decides on the real number rather than the scan alone.
+    joined = f"SELECT o.orderkey, a.x FROM {table} CROSS JOIN UNNEST(sequence(1, 10000000)) AS a(x)"
+    assert fanout(joined) == 10_000_000
+    # A lone spine has no table to have built under, so the inline cap binds.
+    assert unpriceable("SELECT count(*) FROM UNNEST(sequence(1, 8760)) AS a(x)")
+
+
 
 
 def test_a_collapsed_spine_within_the_lone_cap_is_still_priced() -> None:
