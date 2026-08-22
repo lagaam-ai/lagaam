@@ -1752,8 +1752,10 @@ def test_an_ordinal_that_points_at_itself_terminates() -> None:
     # projections that name each other's position are a cycle: it exhausted
     # the stack, and the RecursionError was swallowed into "no multiplier".
     outer = "SELECT o.orderkey, g.v FROM tpch.sf1.orders o CROSS JOIN ({body}) g"
+    # The spine stays within the lone-spine cap: this scope collapses its
+    # rows, so the branch's table does not price them and 1,000 is the limit.
     cyclic = (
-        "SELECT x AS v, 3 AS a, 2 AS c FROM UNNEST(sequence(1, 10000)) AS t(x) "
+        "SELECT x AS v, 3 AS a, 2 AS c FROM UNNEST(sequence(1, 1000)) AS t(x) "
         "GROUP BY 1, 2, 3"
     )
     # Keys 2 and 3 name each other, so they name no column: a reduction the
@@ -1761,7 +1763,7 @@ def test_an_ordinal_that_points_at_itself_terminates() -> None:
     assert fanout(outer.format(body=cyclic)) == 1
     assert not unpriceable(outer.format(body=cyclic))
     self_pointing = (
-        "SELECT 1 AS v FROM UNNEST(sequence(1, 10000)) AS t(x) GROUP BY 1"
+        "SELECT 1 AS v FROM UNNEST(sequence(1, 1000)) AS t(x) GROUP BY 1"
     )
     assert fanout(outer.format(body=self_pointing)) == 1
 
@@ -1991,3 +1993,53 @@ def test_only_a_relation_supplies_a_name_to_the_correlation_check() -> None:
         "t.x, (SELECT y FROM (VALUES 1) AS q(y))",
     ):
         assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
+
+
+def test_a_zipped_unnest_column_identifies_the_row_it_made() -> None:
+    # Multi-argument UNNEST zips: one row per index, pairing element i of
+    # each array. So a key naming one sequence-backed column is already one
+    # group per row produced, exactly as an ordinality counter is — but the
+    # identity test required the key list to name EVERY column in the alias
+    # list, so a second, redundant array excused the multiplier: 5,000,000
+    # priced as 1 by one extra argument.
+    outer = "SELECT n.n_name, s.v FROM tpch.tiny.nation n CROSS JOIN ({body}) s"
+    zipped = (
+        "SELECT count(*) AS v FROM "
+        "UNNEST(sequence(1, 10000), sequence(1, 10000)) AS t(a, b) "
+        "GROUP BY {keys}"
+    )
+    # Each zipped sequence numbers the rows, so either alone is the identity.
+    assert fanout(outer.format(body=zipped.format(keys="t.a, t.b"))) == 10_000
+    assert fanout(outer.format(body=zipped.format(keys="t.a"))) == 10_000
+    assert fanout(outer.format(body=zipped.format(keys="t.b"))) == 10_000
+    # A padding array costs one character of SQL and must not excuse it.
+    padded = (
+        "SELECT count(*) AS v FROM "
+        "UNNEST(sequence(1, 10000), ARRAY[1]) AS t(a, b) GROUP BY t.a"
+    )
+    assert fanout(outer.format(body=padded)) == 10_000
+    # An expression over a zipped column can still merge rows.
+    assert fanout(outer.format(body=zipped.format(keys="t.a % 7"))) == 1
+
+
+def test_a_repeated_zip_column_is_refused_rather_than_priced() -> None:
+    # Only an array whose elements are distinct numbers its rows, so repeat()
+    # must not stand in for the rest. It never reaches that question: repeat
+    # is not on the row-preserving allowlist, so the shape is refused outright
+    # and no quote is offered — the fail-closed direction.
+    outer = "SELECT n.n_name, s.v FROM tpch.tiny.nation n CROSS JOIN ({body}) s"
+    body = (
+        "SELECT count(*) AS v FROM "
+        "UNNEST(sequence(1, 10000), repeat(n.n_name, 10000)) AS t(a, b) "
+        "GROUP BY t.a"
+    )
+    assert unpriceable(outer.format(body=body))
+    # A bounded literal array alongside the sequence is priceable, and the
+    # sequence still identifies each row it made.
+    padded = (
+        "SELECT count(*) AS v FROM "
+        "UNNEST(sequence(1, 10000), ARRAY[1, 2]) AS t(a, b) GROUP BY t.b"
+    )
+    # ARRAY[1, 2] is not a sequence, so it does not stand in: charged as a
+    # reduction, the fail-safe direction for a multiplier.
+    assert fanout(outer.format(body=padded)) == 1

@@ -659,7 +659,7 @@ def _group_key_column(
     # into one), and that this cannot follow.
     if key.find(exp.Column, exp.Star) is None:
         return _ONLY_SPLITS_FURTHER
-    
+
     # A correlated subquery adds the row's own value to the partition rather
     # than replacing a key with a reshaping of it: measured on Trino, two
     # 100x100 spines grouped by `t.x, (SELECT s.y)` give 10,000 groups where
@@ -771,7 +771,7 @@ def _partitions_nothing(key: exp.Expr) -> bool:
     # the row outside, and then it varies per row like any column.
     if isinstance(key, exp.Subquery):
         return not _reads_an_outer_column(key)
-    
+
     if isinstance(key, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
         return _partitions_nothing(key.this)
     if isinstance(key, exp.Binary):
@@ -784,6 +784,20 @@ def _partitions_nothing(key: exp.Expr) -> bool:
             for argument in _func_arguments(key)
             if not isinstance(argument, exp.DataType)
         )
+    return False
+
+
+def _runs_distinct(array: exp.Expr) -> bool:
+    """True if this array's elements are provably all different.
+
+    Only such an array numbers the rows a zip makes, so only such a column
+    stands in for the rest. An allowlist is the sound direction: the failure
+    mode is a multiplier silently dropped, and anything unrecognised —
+    repeat(), a scanned column, a map's values — may hold one value twice.
+    """
+    if isinstance(array, exp.GenerateSeries):
+        step = _literal_int(array.args.get("step")) if array.args.get("step") else 1
+        return step is not None and step != 0
     return False
 
 
@@ -827,8 +841,21 @@ def _groups_by_what_the_generators_make(
         generators += 1
         alias = source.args.get("alias")
         source_name = getattr(alias, "name", "").lower()
-        for column in getattr(alias, "columns", []) or []:
+        names = list(getattr(alias, "columns", []) or [])
+        for column in names:
             produced.add((source_name, column.name.lower()))
+        # Multi-argument UNNEST zips rather than crosses: it yields one row
+        # per index, pairing element i of each array. A column whose own
+        # array runs distinct — a sequence — therefore numbers those rows
+        # exactly as a counter does, and requiring the key list to name
+        # every column let one redundant array excuse the multiplier.
+        # Only that column's own array vouches for it: repeat(k, n) is the
+        # same value n times, and grouping by it really does collapse.
+        arrays = source.args.get("expressions") or []
+        if len(arrays) > 1:
+            for column, array in zip(names, arrays, strict=False):
+                if _runs_distinct(array):
+                    counters.add((source_name, column.name.lower()))
         # WITH ORDINALITY numbers the rows it produces, so the counter and
         # the value each identify a row on their own: grouping by either is
         # still one group per row. It is recorded as an alternative to the
