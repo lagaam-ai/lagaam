@@ -407,7 +407,7 @@ def _generator_product(
                 projections,
                 budget=budget,
                 priced_by_a_table=priced and meets,
-                builds_alone=priced and not meets,
+                builds_alone=priced and _lands_in_one_row(child, node),
             ):
                 return None
             if for_pricing and not meets:
@@ -463,7 +463,9 @@ def _generator_product(
                     budget,
                     projections,
                     for_pricing,
-                    under_a_table=priced,
+                    under_a_table=priced
+                    and _yields_exactly_one_row(body)
+                    and not _reads_a_table(body, bodies, pending | {name}),
                 )
                 if nested is None:
                     return None
@@ -942,6 +944,31 @@ def _collapses_on_the_way_out(body: exp.Expr) -> bool:
     return _narrows_its_rows(select)
 
 
+def _yields_exactly_one_row(node: exp.Expr) -> bool:
+    """True if this scope provably emits a single row, whatever it read.
+
+    A narrower question than _narrows_its_rows, and it has to be. That one
+    answers "charge a multiplier?", where reading an unreadable GROUP BY key
+    as a reduction is fail-safe. Here the answer decides how large a spine
+    may be, and there the same reading is fail-OPEN: `GROUP BY a.x + 1` over
+    a 10,000,000-row spine reduces nothing, and calling it a collapse let it
+    through the counting cap while quoting the scan alone.
+
+    So only a bare aggregate counts. A GROUP BY yields one row per distinct
+    key, and how many that is belongs to the plan (ADR 0004), not to SQL.
+    """
+    select = node if isinstance(node, exp.Select) else node.find(exp.Select)
+    if select is None:
+        return False
+    if select.args.get("group") is not None:
+        return False
+    return any(
+        aggregate.find_ancestor(exp.Window) is None
+        for aggregate in select.find_all(exp.AggFunc, bfs=False)
+        if _is_in_this_select(aggregate, select)
+    )
+
+
 def _multiplies_its_branch(
     generator: exp.Expr,
     root: exp.Expr,
@@ -986,6 +1013,28 @@ def _multiplies_its_branch(
             return False
         node = parent
     return True
+
+
+def _lands_in_one_row(generator: exp.Expr, root: exp.Expr) -> bool:
+    """True if a scope between this generator and the branch emits one row.
+
+    What _multiplies_its_branch answers is "charge a multiplier?", and it
+    says no for a GROUP BY it cannot read — the fail-safe direction there.
+    Reused to decide how large a spine may be, that same no is fail-open, so
+    this asks the stricter question separately: a bare aggregate, or a
+    predicate subquery, which yields a truth value rather than rows.
+    """
+    branch_select = root if isinstance(root, exp.Select) else root.find(exp.Select)
+    node: exp.Expr | None = generator
+    while node is not None and node is not root:
+        parent = node.parent
+        if isinstance(parent, exp.Select) and parent is not branch_select:
+            if _yields_exactly_one_row(parent) and not _scans_a_table(parent):
+                return True
+        if isinstance(parent, exp.Exists | exp.In):
+            return True
+        node = parent
+    return False
 
 
 def _cte_bodies(tree: exp.Expr) -> dict[str, list[exp.Expr]]:

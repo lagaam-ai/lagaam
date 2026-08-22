@@ -2088,3 +2088,39 @@ def test_a_collapsed_spine_within_the_lone_cap_is_still_priced() -> None:
     table = "tpch.sf1.orders o"
     small = "SELECT 1 FROM {t} CROSS JOIN (SELECT count(*) AS c FROM UNNEST(sequence(1, 1000)) AS a(x)) g"
     assert not unpriceable(small.format(t=table))
+
+
+def test_a_group_key_the_gate_cannot_read_does_not_widen_the_cap() -> None:
+    # Two questions, and they need different answers. "Charge a multiplier?"
+    # reads an unreadable GROUP BY key as a reduction, which is fail-safe.
+    # "How large may this spine be?" cannot: `GROUP BY a.x + 1` reduces
+    # nothing, so reading it as a collapse let a 10,000,000-row spine through
+    # the counting cap while the quote reported the scan alone.
+    table = "tpch.sf1.orders o"
+    spine = "UNNEST(sequence(1, 10000000)) AS a(x)"
+    for key in ("a.x + 1", "abs(a.x)", "-a.x", "CAST(a.x AS bigint)", "coalesce(a.x, 0)"):
+        derived = (
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM {spine} GROUP BY {key}) d"
+        )
+        cte = (
+            f"WITH d AS (SELECT {key} AS k FROM {spine} GROUP BY {key}) "
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN d"
+        )
+        assert unpriceable(derived), derived
+        assert unpriceable(cte), cte
+    # A bare aggregate really does emit one row, so it keeps the allowance.
+    for body in (
+        "SELECT count(*) AS c FROM UNNEST(sequence(1, 8760)) AS h(x)",
+        "SELECT max(h.x) AS c FROM UNNEST(sequence(1, 8760)) AS h(x)",
+    ):
+        assert not unpriceable(f"SELECT 1 FROM {table} CROSS JOIN ({body}) g"), body
+        assert not unpriceable(
+            f"WITH g AS ({body}) SELECT 1 FROM {table} CROSS JOIN g"
+        ), body
+    # And a key that names the spine itself is the identity, priced in full.
+    identity = (
+        f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+        f"(SELECT a.x AS k FROM {spine} GROUP BY a.x) d"
+    )
+    assert fanout(identity) == 10_000_000
