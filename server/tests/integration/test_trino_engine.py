@@ -367,8 +367,14 @@ _EXPLOSIONS = [
     ("constant key aliased as a column", "SELECT a.orderkey FROM (SELECT orderkey, 1 AS k FROM tpch.tiny.lineitem) a JOIN (SELECT orderkey, 1 AS k FROM tpch.tiny.orders) b ON a.k=b.k"),
 ]
 
-_GENERATORS = [
+# Sized from the plan and denied on the number: measured here, the plan calls
+# this 60,175 rows and the fanout carries it to 601,750,000.
+_GENERATORS_PRICED = [
     ("unnest a sequence", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(sequence(1, 10000)) AS u(n)"),
+]
+
+# No size to read at all, so there is no quote to deny on.
+_GENERATORS_REFUSED = [
     ("unnest a repeat", "SELECT l.orderkey FROM tpch.tiny.lineitem l CROSS JOIN UNNEST(repeat(l.linestatus, 10000)) AS u(n)"),
 ]
 
@@ -396,13 +402,35 @@ async def test_row_explosions_are_denied(label: str, sql: str, engine: TrinoEngi
         enforce_budget(estimate, budget)
 
 
-@pytest.mark.parametrize("label,sql", _GENERATORS, ids=[t[0] for t in _GENERATORS])
-async def test_row_generators_are_denied_by_the_shape_check(
+@pytest.mark.parametrize(
+    "label,sql", _GENERATORS_REFUSED, ids=[t[0] for t in _GENERATORS_REFUSED]
+)
+async def test_unsizeable_row_generators_get_no_quote(
     label: str, sql: str, engine: TrinoEngine
 ) -> None:
     # The planner cannot see these, so scans.py must still refuse them.
     estimate = await engine.estimate_cost(sql)
     assert estimate.confidence == "low"
+
+
+@pytest.mark.parametrize(
+    "label,sql", _GENERATORS_PRICED, ids=[t[0] for t in _GENERATORS_PRICED]
+)
+async def test_sized_row_generators_are_denied_on_their_real_size(
+    label: str, sql: str, engine: TrinoEngine
+) -> None:
+    # A spine whose length is spelled out is carried as a multiplier on the
+    # plan's own estimate rather than refused, so the query is denied on the
+    # number it would really build — which is also what the caller is told.
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == 601_750_000
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)
 
 
 @pytest.mark.parametrize(
