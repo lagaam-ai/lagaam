@@ -25,6 +25,7 @@ from lagaam.core.errors import (
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 from lagaam.core.identifiers import quote_identifier
 from lagaam.core.scans import (
+    generator_fanout,
     has_unpriceable_shape,
     scan_counts_saturated,
     table_scan_counts,
@@ -321,6 +322,10 @@ class TrinoEngine:
         widest = self._widest_rows(sql)
         if widest is None:
             return estimate
+        # The plan sizes a generator join as the table alone — measured on
+        # Trino 476, 1.5M rows for 1.5 billion produced — so the rows it
+        # cannot see are carried as a multiplier on the ones it can.
+        widest *= generator_fanout(sql, dialect)
         return estimate.model_copy(update={"max_intermediate_rows": round(widest)})
 
     def _widest_rows(self, sql: str) -> float | None:

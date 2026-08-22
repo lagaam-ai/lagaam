@@ -437,6 +437,45 @@ def test_estimate_cost_carries_the_widest_row_count(monkeypatch: pytest.MonkeyPa
     assert estimate.max_intermediate_rows == 902_625_000
 
 
+def test_a_generators_fanout_multiplies_the_plans_row_count() -> None:
+    """The plan sizes a generator join as the table alone; the quote carries
+    the multiplier the planner cannot see."""
+    io_json = json.dumps(
+        {
+            "inputTableColumnInfos": [
+                {
+                    "table": {
+                        "catalog": "tpch",
+                        "schemaTable": {"schema": "tiny", "table": "orders"},
+                    },
+                    "estimate": {
+                        "outputRowCount": 15000.0,
+                        "outputSizeInBytes": 135000.0,
+                    },
+                }
+            ]
+        }
+    )
+    plan_json = json.dumps(
+        {
+            "name": "Output",
+            "estimates": [{"outputRowCount": 15000.0}],
+            "children": [],
+        }
+    )
+    engine = _engine_answering({"TYPE IO": io_json, "TYPE LOGICAL": plan_json})
+    estimate = engine._estimate_cost(
+        "SELECT o.a, t.n FROM tpch.tiny.orders o "
+        "CROSS JOIN UNNEST(sequence(1, 744)) AS t(n)"
+    )
+    assert estimate.max_intermediate_rows == 15_000 * 744
+    # A query with no generator is quoted at the plan's own number.
+    plain = _engine_answering(
+        {"TYPE IO": io_json, "TYPE LOGICAL": plan_json}
+    )._estimate_cost("SELECT a FROM tpch.tiny.orders")
+    assert plain.max_intermediate_rows == 15_000
+
+
 def test_a_failed_plan_call_still_returns_the_byte_quote() -> None:
     """A plan we cannot read is an unknown row count, not a lost quote."""
     io_json = json.dumps(
