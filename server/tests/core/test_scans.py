@@ -1737,9 +1737,11 @@ def test_a_constant_group_key_adds_no_partition_and_hides_nothing() -> None:
         "x, -1",
     ):
         assert fanout(outer.format(body=spine.format(keys=keys))) == 10_000, keys
-    # A call over the column is not a constant, whatever it is called.
+    # A call over the column is not a constant, whatever it is called — but
+    # one that cannot merge two values alongside the column it wraps leaves
+    # the partition exactly where the column put it.
     for keys in ("x, abs(x)", "x, x + 1", "x, cast(x AS varchar)"):
-        assert fanout(outer.format(body=spine.format(keys=keys))) == 1, keys
+        assert fanout(outer.format(body=spine.format(keys=keys))) == 10_000, keys
     # A constant alone partitions everything into one group, which is a real
     # collapse, and an expression over a column still merges rows.
     assert fanout(outer.format(body=spine.format(keys="TRUE"))) == 1
@@ -1844,9 +1846,11 @@ def test_a_correlated_subquery_key_is_not_one_valued() -> None:
         "t.x, coalesce((SELECT s.y), 0)",
     ):
         assert fanout(outer.format(body=two.format(keys=keys))) == 9_000_000, keys
-    # A column read directly IS the reshaping, and still collapses.
-    for keys in ("t.x, s.y % 7", "t.x, abs(s.y)"):
-        assert fanout(outer.format(body=two.format(keys=keys))) == 1, keys
+    # A column read directly IS the reshaping, and still collapses — where
+    # the reshaping can actually merge two values into one.
+    assert fanout(outer.format(body=two.format(keys="t.x, s.y % 7"))) == 1
+    # One that cannot merge names its own column, so both spines are keyed.
+    assert fanout(outer.format(body=two.format(keys="t.x, abs(s.y)"))) == 9_000_000
     # An uncorrelated one really is the same value for every row, so it is
     # dropped and the keys that remain decide: here a subset, which reduces.
     assert fanout(outer.format(body=two.format(keys="t.x, (SELECT 1)"))) == 1
@@ -2098,17 +2102,29 @@ def test_a_group_key_the_gate_cannot_read_does_not_widen_the_cap() -> None:
     # the counting cap while the quote reported the scan alone.
     table = "tpch.sf1.orders o"
     spine = "UNNEST(sequence(1, 10000000)) AS a(x)"
-    for key in ("a.x + 1", "abs(a.x)", "-a.x", "CAST(a.x AS bigint)", "coalesce(a.x, 0)"):
+    # A key that cannot merge two values names the column it wraps, so the
+    # partition is the identity and the spine is charged in full — the budget
+    # then denies it on the real number rather than on a refusal.
+    for key in ("a.x + 1", "abs(a.x)", "-a.x", "CAST(a.x AS varchar)"):
         derived = (
             f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
             f"(SELECT {key} AS k FROM {spine} GROUP BY {key}) d"
         )
+        assert fanout(derived) == 10_000_000, derived
+        # The CTE spelling reaches the counting cap while sizing the body and
+        # refuses rather than quoting — the safe side of the same answer.
         cte = (
             f"WITH d AS (SELECT {key} AS k FROM {spine} GROUP BY {key}) "
             f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN d"
         )
-        assert unpriceable(derived), derived
         assert unpriceable(cte), cte
+    # One the gate cannot follow stays a reduction, and the wide cap with it.
+    for key in ("a.x % 7", "a.x / 7", "CAST(a.x AS bigint)"):
+        derived = (
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM {spine} GROUP BY {key}) d"
+        )
+        assert unpriceable(derived), derived
     # A bare aggregate really does emit one row, so it keeps the allowance.
     for body in (
         "SELECT count(*) AS c FROM UNNEST(sequence(1, 8760)) AS h(x)",
@@ -2124,3 +2140,73 @@ def test_a_group_key_the_gate_cannot_read_does_not_widen_the_cap() -> None:
         f"(SELECT a.x AS k FROM {spine} GROUP BY a.x) d"
     )
     assert fanout(identity) == 10_000_000
+
+
+def test_an_injective_group_key_does_not_excuse_the_multiplier() -> None:
+    # A key the gate cannot size is charged as a reduction, which is the
+    # fail-safe direction only when that answer KEEPS a multiplier. Here it
+    # deletes one: x + 0 merges nothing, so the scope emits every row the
+    # generator made, and reading it as a collapse dropped the fanout.
+    table = "tpch.sf1.orders o"
+
+    def scope(index: int, key: str, rows: int = 1000) -> str:
+        return (
+            f"(SELECT {key} AS y{index} FROM UNNEST(sequence(1, {rows})) "
+            f"t{index}(x{index}) GROUP BY {key}) d{index}"
+        )
+
+    for shape in ("x0 + 0", "x0 * 1000", "-x0", "abs(x0)", "CAST(x0 AS varchar)"):
+        one = f"SELECT * FROM {table} CROSS JOIN {scope(0, shape)}"
+        assert fanout(one) == 1000, shape
+    # Two such scopes multiply, and the pair quoted 1 against a real 1e6.
+    both = (
+        f"SELECT * FROM {table} CROSS JOIN {scope(0, 'x0 + 0')} "
+        f"CROSS JOIN {scope(1, 'x1 + 0')}"
+    )
+    assert fanout(both) == 1_000_000
+    # A real spine alongside them made the quote look plausible rather than
+    # bare: 10 where the truth was 10,000,000.
+    masked = (
+        f"SELECT * FROM {table} CROSS JOIN UNNEST(sequence(1, 10)) g(z) "
+        f"CROSS JOIN {scope(0, 'x0 + 0')} CROSS JOIN {scope(1, 'x1 + 0')}"
+    )
+    assert fanout(masked) == 10_000_000
+
+
+def test_every_spelling_of_multiplying_by_zero_reads_as_a_reduction() -> None:
+    # Multiplying by zero puts every value in one group. The guard read the
+    # bare integer literal — the property adjacent to the exploitable one —
+    # so `x * 0` was charged while `x * 0.0`, `x * (0)` and `x * (1 - 1)`
+    # passed as keys that merge nothing.
+    table = "tpch.sf1.orders o"
+    for zero in ("0", "0.0", "(0)", "0e0", "CAST(0 AS bigint)", "(1 - 1)", "-0"):
+        key = f"a.x * {zero}"
+        query = (
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+        assert fanout(query) == 1, key
+    # A constant that is not zero still shifts every value apart.
+    for factor in ("2", "2.5", "(3)", "-1"):
+        key = f"a.x * {factor}"
+        query = (
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+        assert fanout(query) == 1000, key
+
+
+def test_a_key_that_can_merge_rows_still_reads_as_a_reduction() -> None:
+    # The other direction has to keep working: x % 7 really does merge seven
+    # rows into one, and the gate cannot count the groups, so it stays a
+    # reduction rather than being charged the generator's full size.
+    table = "tpch.sf1.orders o"
+    for shape in ("x0 % 7", "x0 / 7", "length(CAST(x0 AS varchar))"):
+        query = (
+            f"SELECT * FROM {table} CROSS JOIN "
+            f"(SELECT {shape} AS y0 FROM UNNEST(sequence(1, 1000)) t0(x0) "
+            f"GROUP BY {shape}) d0"
+        )
+        assert fanout(query) == 1, shape
