@@ -696,7 +696,114 @@ def _group_key_column(
     # take the partition under one group per row the generators produced.
     if _every_column_is_inside_a_subquery(key):
         return _ONLY_SPLITS_FURTHER
+    # A wrapper that cannot map two values onto one partitions exactly as the
+    # column it wraps does. Reading it as a reduction is fail-safe only where
+    # that answer keeps a multiplier; here it deletes one, and `x + 0` over a
+    # 1000-row spine quoted 1 against a real 1000.
+    injective = _injective_over(key)
+    if injective is not None:
+        return injective
     return _NAMES_NO_COLUMN
+
+
+# Operators that cannot merge two values into one group, so grouping by the
+# result partitions exactly as grouping by the input does. Division, modulo
+# and the like are absent on purpose: x % 7 merges seven rows into one.
+_ORDER_PRESERVING = (exp.Neg, exp.Paren)
+_INJECTIVE_FUNCS = {"abs", "reverse"}
+
+# A cast that cannot map two values onto one. Anything narrower — boolean
+# folds every non-zero together, an integer type truncates — merges rows,
+# so the target type is read rather than trusting the cast itself.
+_WIDENING_CAST_TYPES = {
+    exp.DataType.Type.CHAR,
+    exp.DataType.Type.NCHAR,
+    exp.DataType.Type.NVARCHAR,
+    exp.DataType.Type.TEXT,
+    exp.DataType.Type.VARCHAR,
+}
+
+
+def _is_certainly_nonzero(value: exp.Expr) -> bool:
+    """True only where this constant provably is not zero.
+
+    Unknown answers False: a multiplier deleted is the failure this guards,
+    so a spelling nobody folded stays a reduction rather than being vouched
+    for. Reading only a bare integer let every other spelling of zero pass.
+    """
+    while isinstance(value, exp.Paren | exp.Cast | exp.TryCast):
+        value = value.this
+    if isinstance(value, exp.Neg):
+        return _is_certainly_nonzero(value.this)
+    if not isinstance(value, exp.Literal) or value.is_string:
+        return False
+    try:
+        return float(value.name) != 0.0
+    except ValueError:
+        return False
+
+
+def _injective_over(key: exp.Expr) -> exp.Column | None:
+    """The single column this key reshapes without ever merging two values.
+
+    An allowlist, and it has to be: the failure here is a multiplier deleted,
+    so a shape nobody vouched for must stay a reduction. `abs` is included
+    although it folds -n onto n — a generator's own spine runs one sign, and
+    where it does not the pairing only splits the partition further.
+    """
+    columns = list(key.find_all(exp.Column))
+    if len(columns) != 1 or key.find(exp.Star, exp.Subquery) is not None:
+        return None
+    column = columns[0]
+    node = key
+    while node is not column:
+        if isinstance(node, _ORDER_PRESERVING):
+            node = node.this
+            continue
+        if isinstance(node, exp.Cast | exp.TryCast):
+            target = node.args.get("to")
+            if not isinstance(target, exp.DataType):
+                return None
+            if target.this not in _WIDENING_CAST_TYPES:
+                return None
+            # A length-bounded target truncates, and truncation merges:
+            # CAST(x AS VARCHAR(1)) puts a thousand values in ten groups.
+            if target.expressions:
+                return None
+            node = node.this
+            continue
+        if isinstance(node, exp.Binary):
+            # One side must be a constant, and the operation one that shifts
+            # every value alike: adding or multiplying by a fixed number maps
+            # distinct inputs to distinct outputs. Multiplying by zero does
+            # not, and neither does an operator this cannot reason about.
+            if not isinstance(node, exp.Add | exp.Sub | exp.Mul):
+                return None
+            this, other = node.this, node.expression
+            if not _partitions_nothing(other):
+                this, other = other, this
+            if not _partitions_nothing(other) or _partitions_nothing(this):
+                return None
+            # Multiplying by zero maps every value onto one, and the guard
+            # has to read what the side EVALUATES to, not how it is spelled:
+            # `x * 0` was refused while `x * 0.0`, `x * (0)` and `x * (1-1)`
+            # went through as injective.
+            if isinstance(node, exp.Mul) and not _is_certainly_nonzero(other):
+                return None
+            node = this
+            continue
+        if isinstance(node, exp.Func) and _func_name(node) in _INJECTIVE_FUNCS:
+            arguments = [
+                argument
+                for argument in _func_arguments(node)
+                if not isinstance(argument, exp.DataType)
+            ]
+            if len(arguments) != 1:
+                return None
+            node = arguments[0]
+            continue
+        return None
+    return column
 
 
 def _relations_of(select: exp.Select) -> list[exp.Expr]:
