@@ -1130,16 +1130,23 @@ def _lands_in_one_row(generator: exp.Expr, root: exp.Expr) -> bool:
     Reused to decide how large a spine may be, that same no is fail-open, so
     this asks the stricter question separately: a bare aggregate, or a
     predicate subquery, which yields a truth value rather than rows.
+
+    Either way only where the scope builds nothing of its own. A predicate
+    subquery that reads a table crosses it with the spine before it can
+    answer, and neither the plan nor the outer quote carries those rows: the
+    same asymmetry the aggregate path already guards against.
     """
     branch_select = root if isinstance(root, exp.Select) else root.find(exp.Select)
     node: exp.Expr | None = generator
+    scope: exp.Select | None = None
     while node is not None and node is not root:
         parent = node.parent
         if isinstance(parent, exp.Select) and parent is not branch_select:
             if _yields_exactly_one_row(parent) and not _scans_a_table(parent):
                 return True
+            scope = scope if scope is not None else parent
         if isinstance(parent, exp.Exists | exp.In):
-            return True
+            return scope is None or not _scans_a_table(scope)
         node = parent
     return False
 
