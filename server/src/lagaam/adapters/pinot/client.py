@@ -39,13 +39,12 @@ class PinotClient:
         user: str | None = None,
         password: str | None = None,
         timeout_seconds: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._controller_url = controller_url.rstrip("/")
         self._broker_url = broker_url.rstrip("/")
-        # Kept separately, not baked into self._http: tests swap self._http
-        # for one wired to a MockTransport, and auth must survive that.
-        self._auth = (user, password) if user is not None and password is not None else None
-        self._http = httpx.AsyncClient(auth=self._auth, timeout=timeout_seconds)
+        auth = (user, password) if user is not None and password is not None else None
+        self._http = httpx.AsyncClient(auth=auth, timeout=timeout_seconds, transport=transport)
 
     @staticmethod
     def path_part(part: str) -> str:
@@ -76,7 +75,6 @@ class PinotClient:
                 f"{self._controller_url}{path}",
                 params=params,
                 headers=headers,
-                auth=self._auth,
             )
         except httpx.HTTPError as exc:
             raise PinotTransportError(f"controller GET {path} failed") from exc
@@ -101,8 +99,6 @@ class PinotClient:
                 f"{self._broker_url}/query/sql",
                 json={"sql": sql, "queryOptions": options},
                 timeout=timeout_seconds if timeout_seconds is not None else httpx.USE_CLIENT_DEFAULT,
-                # post()'s auth type omits None, unlike get()'s; USE_CLIENT_DEFAULT stands in for "no auth" here.
-                auth=self._auth if self._auth is not None else httpx.USE_CLIENT_DEFAULT,
             )
         except httpx.HTTPError as exc:
             raise PinotTransportError("broker query failed") from exc

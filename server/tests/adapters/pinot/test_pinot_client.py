@@ -17,14 +17,13 @@ from lagaam.adapters.pinot.client import PinotClient, PinotTransportError
 def make_client(
     handler: Any, user: str | None = None, password: str | None = None
 ) -> PinotClient:
-    client = PinotClient(
+    return PinotClient(
         controller_url="http://controller:9000",
         broker_url="http://broker:8000",
         user=user,
         password=password,
+        transport=httpx.MockTransport(handler),
     )
-    client._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    return client
 
 
 async def test_controller_get_returns_parsed_json() -> None:
