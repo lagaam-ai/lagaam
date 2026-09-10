@@ -62,14 +62,18 @@ among them is refused rather than followed.
   `LAGAAM_MAX_INTERMEDIATE_ROWS` is the lever for a wider spine.
 - The row-preserving allowlist must track Trino's array functions; an
   unknown-but-harmless function is over-blocked — the fail-safe direction.
-- Dropping the multiplier never drops the sizing. A predicate subquery that
-  crosses a spine with a table it reads is held to the flat cap: it really
-  builds `|table| x |spine|` rows, and neither the plan nor the outer quote
-  carries them, so `EXISTS (SELECT 1 FROM part CROSS JOIN
+- Dropping the multiplier never drops the sizing. A spine is held to the
+  flat cap wherever any scope between it and the predicate reads a table —
+  the predicate's own select, or a derived table one or more levels up. It
+  really builds `|table| x |spine|` rows, and neither the plan nor the outer
+  quote carries them, so `EXISTS (SELECT 1 FROM part CROSS JOIN
   UNNEST(sequence(1, 10000000)))` is refused rather than quoted as the outer
-  scan. A predicate subquery over a spine alone builds only what a query may
+  scan, and so is the same spine wrapped in `(SELECT x FROM ...)` first.
+  With no table anywhere on that path the spine builds only what a query may
   invent and keeps the wider cap — an hourly year inside `EXISTS` stays
-  ordinary analytics.
+  ordinary analytics. An aggregate is the exception, and only from below:
+  one that counts the spine before it reaches the table costs `|spine|` plus
+  the scan rather than their product, which is the spine standing alone.
 - A GROUP BY over a generator's own columns returns one row per row it
   made, so the multiplier survives it. Whether any *other* key reduces that
   partition is a cardinality question, and this ADR's own rule keeps those
