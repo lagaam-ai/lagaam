@@ -2210,3 +2210,42 @@ def test_a_key_that_can_merge_rows_still_reads_as_a_reduction() -> None:
             f"GROUP BY {shape}) d0"
         )
         assert fanout(query) == 1, shape
+
+
+def test_a_cast_that_floors_a_fraction_to_zero_reads_as_a_reduction() -> None:
+    # The zero guard stripped the cast without reading its target, so it saw
+    # the inner 0.4 and vouched for it. `CAST(0.4 AS bigint)` is 0, and a key
+    # multiplied by it puts a 1000-row spine in one group while the gate
+    # quoted the full 1000.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for zero in (
+        "CAST(0.4 AS bigint)",
+        "CAST(0.49 AS int)",
+        "TRY_CAST(0.4 AS bigint)",
+        "-CAST(0.4 AS bigint)",
+        "CAST(0.4 AS decimal(10,0))",
+        "CAST(0.4 AS decimal)",
+        "CAST(CAST(0.4 AS bigint) AS double)",
+    ):
+        assert key_fanout(f"a.x * {zero}") == 1, zero
+    # Trino rounds half away from zero rather than truncating, so 0.5 reaches
+    # 1 and still shifts every value apart — as do a whole number under an
+    # integral target and any literal under a fractional one.
+    for nonzero in (
+        "CAST(2 AS bigint)",
+        "CAST(1.4 AS bigint)",
+        "CAST(0.5 AS int)",
+        "CAST(-0.6 AS bigint)",
+        "CAST(2.5 AS double)",
+        "CAST(0.4 AS decimal(10,1))",
+        "CAST(-2.5 AS double)",
+    ):
+        assert key_fanout(f"a.x * {nonzero}") == 1000, nonzero

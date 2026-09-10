@@ -723,24 +723,69 @@ _WIDENING_CAST_TYPES = {
     exp.DataType.Type.VARCHAR,
 }
 
+# Fixed-point targets, whose scale says how much of a fraction survives.
+_DECIMAL_CAST_TYPES = {
+    exp.DataType.Type.BIGDECIMAL,
+    exp.DataType.Type.DECIMAL,
+    exp.DataType.Type.UDECIMAL,
+}
+
+
+def _rounds_to_whole(target: exp.DataType) -> bool | None:
+    """True if a cast to this type drops the fraction, None if unreadable.
+
+    Trino rounds decimal-to-integer half away from zero, so anything under
+    half in magnitude lands on 0. A DECIMAL of unstated scale is DECIMAL(38,0)
+    there, which rounds the same way; a stated non-zero scale keeps enough of
+    the value that a non-zero literal stays non-zero.
+    """
+    if target.this in exp.DataType.INTEGER_TYPES:
+        return True
+    if target.this in _DECIMAL_CAST_TYPES:
+        scale = target.expressions[1] if len(target.expressions) > 1 else None
+        if scale is None:
+            return True
+        literal = scale.find(exp.Literal)
+        if literal is None or literal.is_string:
+            return None
+        try:
+            return int(literal.name) == 0
+        except ValueError:
+            return None
+    if target.this in exp.DataType.FLOAT_TYPES:
+        return False
+    return None
+
 
 def _is_certainly_nonzero(value: exp.Expr) -> bool:
     """True only where this constant provably is not zero.
 
     Unknown answers False: a multiplier deleted is the failure this guards,
     so a spelling nobody folded stays a reduction rather than being vouched
-    for. Reading only a bare integer let every other spelling of zero pass.
+    for. Reading only a bare integer let every other spelling of zero pass,
+    and stripping a cast without reading its target let CAST(0.4 AS bigint)
+    — which is 0 — vouch for the 0.4 underneath it.
     """
-    while isinstance(value, exp.Paren | exp.Cast | exp.TryCast):
+    whole = False
+    while isinstance(value, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
+        if isinstance(value, exp.Cast | exp.TryCast):
+            target = value.args.get("to")
+            if not isinstance(target, exp.DataType):
+                return False
+            rounds = _rounds_to_whole(target)
+            if rounds is None:
+                return False
+            whole = whole or rounds
         value = value.this
-    if isinstance(value, exp.Neg):
-        return _is_certainly_nonzero(value.this)
     if not isinstance(value, exp.Literal) or value.is_string:
         return False
     try:
-        return float(value.name) != 0.0
+        magnitude = abs(float(value.name))
     except ValueError:
         return False
+    # Rounding has already happened by the time an outer cast widens it, so
+    # one rounding target anywhere in the chain sets the bound.
+    return magnitude >= 0.5 if whole else magnitude != 0.0
 
 
 def _injective_over(key: exp.Expr) -> exp.Column | None:
