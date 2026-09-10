@@ -55,7 +55,7 @@
 | Path | Change |
 |---|---|
 | `server/pyproject.toml` | `httpx` becomes a runtime dependency; `lagaam.adapters.pinot` joins the mypy package list. |
-| `server/src/lagaam/core/query_errors.py` | Two new engine-agnostic hint codes: `EXCEEDED_ROW_LIMIT`, `RESPONSE_TOO_LARGE`. |
+| `server/src/lagaam/core/query_errors.py` | Three new engine-agnostic hint codes: `EXCEEDED_ROW_LIMIT`, `RESPONSE_TOO_LARGE`, `INCOMPLETE_RESULT`. |
 | `server/src/lagaam/__main__.py` | `LAGAAM_ENGINE` selects the adapter (`trino` default, or `pinot`). |
 | `examples/docker-compose.yml` | A `pinot` profile. |
 | `server/tests/integration/conftest.py` | A `pinot_ready` fixture. |
@@ -1072,13 +1072,13 @@ does not exist, decided before any request is made."
 - Create: `server/tests/adapters/pinot/fixtures/query-options-matrix.json` (copy of `04-query-options-matrix.json`)
 - Create: `server/src/lagaam/adapters/pinot/errors.py`
 - Create: `server/tests/adapters/pinot/test_pinot_errors.py`
-- Modify: `server/src/lagaam/core/query_errors.py` (add two entries to `_HINTS`, after the `OPTIMIZER_TIMEOUT` entry ending line 54)
+- Modify: `server/src/lagaam/core/query_errors.py` (add three entries to `_HINTS`, after the `OPTIMIZER_TIMEOUT` entry ending line 54)
 
 **Interfaces:**
 - Consumes: `lagaam.core.query_errors.hint_for_engine_error`
 - Produces:
   - `lagaam.adapters.pinot.errors.classify(error_code: int, message: str) -> str`
-  - core hint codes `EXCEEDED_ROW_LIMIT` and `RESPONSE_TOO_LARGE`
+  - core hint codes `EXCEEDED_ROW_LIMIT`, `RESPONSE_TOO_LARGE` and `INCOMPLETE_RESULT`
 
 **Steps:**
 
@@ -1186,6 +1186,9 @@ def test_the_new_core_codes_carry_agent_facing_hints() -> None:
     too_large = hint_for_engine_error("RESPONSE_TOO_LARGE")
     assert "LIMIT" in too_large
     assert is_self_correctable("RESPONSE_TOO_LARGE")
+    incomplete = hint_for_engine_error("INCOMPLETE_RESULT")
+    assert "incomplete" in incomplete
+    assert is_self_correctable("INCOMPLETE_RESULT")
 
 
 def test_a_broker_message_never_becomes_the_agent_facing_text() -> None:
@@ -1205,7 +1208,7 @@ cd server && uv run pytest -q tests/adapters/pinot/test_pinot_errors.py
 
 Expected: `ModuleNotFoundError: No module named 'lagaam.adapters.pinot.errors'`.
 
-- [ ] 4. Add the two engine-agnostic hint codes to core. In `server/src/lagaam/core/query_errors.py`, insert these two entries into `_HINTS` immediately after the `"OPTIMIZER_TIMEOUT"` entry (before the closing `}` on line 55).
+- [ ] 4. Add the three engine-agnostic hint codes to core. In `server/src/lagaam/core/query_errors.py`, insert these three entries into `_HINTS` immediately after the `"OPTIMIZER_TIMEOUT"` entry (before the closing `}` on line 55).
 
 ```python
     # A hard backstop, not a truncation: the engine refused rather than
@@ -1218,6 +1221,14 @@ Expected: `ModuleNotFoundError: No module named 'lagaam.adapters.pinot.errors'`.
     "RESPONSE_TOO_LARGE": (
         "The result was too large to send back. Return fewer columns, lower "
         "the LIMIT, or aggregate instead of returning raw rows, then retry."
+    ),
+    # The engine answered, but trimmed groups or servers on the way: the
+    # numbers look complete and are not, so they are refused, not returned.
+    "INCOMPLETE_RESULT": (
+        "The engine returned an incomplete result — some groups or servers "
+        "were dropped, so the numbers cannot be trusted. Add a WHERE filter "
+        "to read less, or group by a column with fewer distinct values, then "
+        "retry."
     ),
 ```
 
@@ -1489,9 +1500,7 @@ from typing import Any
 from lagaam.adapters.pinot.errors import classify
 from lagaam.core.models import QueryResult
 
-# Core has no code for "the answer is silently wrong"; the memory-limit hint is
-# the closest honest next action — read less, aggregate differently.
-INCOMPLETE_RESULT = "EXCEEDED_GLOBAL_MEMORY_LIMIT"
+INCOMPLETE_RESULT = "INCOMPLETE_RESULT"
 
 # Not a hint code core knows, so it reads as an engine fault, not the query's.
 ENGINE_FAULT = "PINOT_ENGINE_FAULT"

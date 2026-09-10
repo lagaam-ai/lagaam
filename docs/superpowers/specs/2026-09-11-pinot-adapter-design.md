@@ -205,12 +205,13 @@ for, never admissions.
 |---|---|---|
 | 150 `SQLParsingError` | `SYNTAX_ERROR` | `QueryFailedError` |
 | 190 `TableDoesNotExistError` | `TABLE_NOT_FOUND` | `QueryFailedError` |
-| 710, or 700 `UnknownColumnError` | `COLUMN_NOT_FOUND` | `QueryFailedError` |
+| 710 `UnknownColumnError` (single-stage), or 700 whose message says a column `depends on itself` (the multi-stage spelling of an unknown column) | `COLUMN_NOT_FOUND` | `QueryFailedError` |
 | 700 `Unsupported function`, `No match found for function` | `FUNCTION_NOT_FOUND` | `QueryFailedError` |
 | 700 other `QueryValidationError` | `NOT_SUPPORTED` | `QueryFailedError` |
 | 245 join/window row limit | `EXCEEDED_ROW_LIMIT` (new, engine-agnostic) | `QueryFailedError` |
 | 400 `BrokerTimeoutError`, 427 servers not responded | `EXCEEDED_TIME_LIMIT` | `QueryFailedError` |
 | 503 response size | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
+| HTTP 200 with `partialResult`, `numGroupsLimitReached` or `groupsTrimmed` true | `INCOMPLETE_RESULT` (new) | `QueryFailedError` |
 | anything else, transport, non-JSON body | — | `EngineError("the query engine is not reachable right now")` |
 
 The hint is core's text; the broker message is discarded. The code and
