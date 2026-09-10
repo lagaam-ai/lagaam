@@ -2345,3 +2345,71 @@ def test_a_predicate_subquery_prices_no_route_around_the_cap() -> None:
     )
     assert not unpriceable(priced)
     assert fanout(priced) == 10_000_000
+
+
+def test_a_derived_table_does_not_hide_the_spine_from_its_own_table() -> None:
+    # Reading only the innermost scope was one level too shallow: wrapping
+    # the spine in a derived table and crossing it with the table one scope
+    # up builds the same |part| x 10,000,000 rows, and the innermost scope
+    # reads no table so it answered "collapse" and took the counting cap.
+    spine = "UNNEST(sequence(1, 10000000)) AS t(x)"
+    derived = f"(SELECT x FROM {spine}) d"
+    for label, sql in (
+        (
+            "cross join",
+            "SELECT * FROM tpch.sf1.orders o WHERE EXISTS (SELECT 1 FROM "
+            f"tpch.sf1.part p CROSS JOIN {derived})",
+        ),
+        (
+            "comma join",
+            "SELECT * FROM tpch.sf1.orders o WHERE EXISTS (SELECT 1 FROM "
+            f"tpch.sf1.part p, {derived})",
+        ),
+        (
+            "two derived levels",
+            "SELECT * FROM tpch.sf1.orders o WHERE o.orderkey IN (SELECT "
+            "p.partkey FROM tpch.sf1.part p JOIN (SELECT y FROM "
+            f"(SELECT x AS y FROM {spine}) i) d ON true)",
+        ),
+        (
+            "aggregate above the table",
+            "SELECT * FROM tpch.sf1.orders o WHERE EXISTS (SELECT count(*) "
+            f"FROM tpch.sf1.part p CROSS JOIN {derived})",
+        ),
+    ):
+        assert unpriceable(sql), label
+
+
+def test_an_aggregate_below_the_table_still_collapses_the_spine() -> None:
+    # The mirror image, and it is genuinely fine: the aggregate runs inside
+    # the derived table, so the spine is counted into one row BEFORE it ever
+    # meets the table. That is 10,000,000 + |part| rows, not the product —
+    # the same work as a spine standing alone, which keeps the wider cap.
+    collapsed = (
+        "SELECT * FROM tpch.sf1.orders o WHERE EXISTS (SELECT 1 FROM "
+        "tpch.sf1.part p CROSS JOIN (SELECT count(*) AS c FROM "
+        "UNNEST(sequence(1, 10000000)) AS t(x)) d)"
+    )
+    assert not unpriceable(collapsed)
+    assert fanout(collapsed) == 1
+    # Unwrapped, the same aggregate-below-a-table shape reads the same way,
+    # which is what says the predicate is not doing the work here.
+    outside = (
+        "SELECT o.orderkey FROM tpch.sf1.orders o CROSS JOIN (SELECT count(*) "
+        "AS c FROM UNNEST(sequence(1, 10000000)) AS t(x)) d"
+    )
+    assert not unpriceable(outside)
+    assert fanout(outside) == 1
+
+
+def test_a_derived_spine_with_no_table_beside_it_stays_admitted() -> None:
+    # A derived table is not itself the problem — a table on the path is.
+    # With none anywhere inside the predicate the spine builds only what a
+    # query may invent alone, which is the bound the issue accepts.
+    for length in (744, 10_000_000):
+        sql = (
+            "SELECT * FROM tpch.sf1.orders o WHERE EXISTS (SELECT 1 FROM "
+            f"(SELECT x FROM UNNEST(sequence(1, {length})) AS t(x)) d)"
+        )
+        assert not unpriceable(sql), length
+        assert fanout(sql) == 1, length

@@ -407,7 +407,7 @@ def _generator_product(
                 projections,
                 budget=budget,
                 priced_by_a_table=priced and meets,
-                builds_alone=priced and _lands_in_one_row(child, node),
+                builds_alone=priced and _lands_in_one_row(child, node, landing),
             ):
                 return None
             if for_pricing and not meets:
@@ -1122,7 +1122,11 @@ def _multiplies_its_branch(
     return True
 
 
-def _lands_in_one_row(generator: exp.Expr, root: exp.Expr) -> bool:
+def _lands_in_one_row(
+    generator: exp.Expr,
+    root: exp.Expr,
+    answered: dict[tuple[str, int], bool] | None = None,
+) -> bool:
     """True if a scope between this generator and the branch emits one row.
 
     What _multiplies_its_branch answers is "charge a multiplier?", and it
@@ -1135,18 +1139,31 @@ def _lands_in_one_row(generator: exp.Expr, root: exp.Expr) -> bool:
     subquery that reads a table crosses it with the spine before it can
     answer, and neither the plan nor the outer quote carries those rows: the
     same asymmetry the aggregate path already guards against.
+
+    Which is a question about the whole path, not the innermost scope. A
+    table read at ANY level between the generator and the predicate is
+    crossed with the spine before the predicate can answer, so wrapping the
+    spine in a derived table and joining the table one scope up builds the
+    same product. An aggregate is the one thing that ends the walk early,
+    and only from below: it counts the spine into one row before that row
+    ever reaches the table, which is the spine standing alone.
     """
     branch_select = root if isinstance(root, exp.Select) else root.find(exp.Select)
     node: exp.Expr | None = generator
-    scope: exp.Select | None = None
+    met_a_table = False
     while node is not None and node is not root:
         parent = node.parent
         if isinstance(parent, exp.Select) and parent is not branch_select:
-            if _yields_exactly_one_row(parent) and not _scans_a_table(parent):
+            # Asking every scope walks its subtree, so both questions share
+            # the caller's memo: unmemoized this was quadratic in generators.
+            scans = _remembered("scans", parent, _scans_a_table, answered)
+            if not scans and _remembered(
+                "one row", parent, _yields_exactly_one_row, answered
+            ):
                 return True
-            scope = scope if scope is not None else parent
+            met_a_table = met_a_table or scans
         if isinstance(parent, exp.Exists | exp.In):
-            return scope is None or not _scans_a_table(scope)
+            return not met_a_table
         node = parent
     return False
 
