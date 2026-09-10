@@ -714,10 +714,10 @@ _INJECTIVE_FUNCS = {"abs", "reverse"}
 
 # A cast that cannot map two values onto one. Anything narrower — boolean
 # folds every non-zero together, an integer type truncates — merges rows,
-# so the target type is read rather than trusting the cast itself.
+# so the target type is read rather than trusting the cast itself. CHAR is
+# absent at every width: it is a fixed width in Trino and truncates anything
+# wider, and a bare CHAR is the narrowest of all at CHAR(1).
 _WIDENING_CAST_TYPES = {
-    exp.DataType.Type.CHAR,
-    exp.DataType.Type.NCHAR,
     exp.DataType.Type.NVARCHAR,
     exp.DataType.Type.TEXT,
     exp.DataType.Type.VARCHAR,

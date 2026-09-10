@@ -2249,3 +2249,46 @@ def test_a_cast_that_floors_a_fraction_to_zero_reads_as_a_reduction() -> None:
         "CAST(-2.5 AS double)",
     ):
         assert key_fanout(f"a.x * {nonzero}") == 1000, nonzero
+
+
+def test_a_char_cast_reads_as_a_reduction_at_every_width() -> None:
+    # CHAR is a fixed width in Trino: a value wider than it is truncated, and
+    # the guard cannot know how wide a spine's values run. The length guard
+    # only read `target.expressions`, which a bare CAST(x AS char) — CHAR(1)
+    # in Trino, and 9 groups over 8,760 rows — leaves empty, so the gate
+    # quoted the whole 8,760.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 8760)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for key in (
+        "CAST(a.x AS char)",
+        "CAST(a.x AS char(1))",
+        "CAST(a.x AS char(20))",
+        "CAST(a.x AS nchar)",
+        "CAST(a.x AS nchar(20))",
+        "TRY_CAST(a.x AS char)",
+    ):
+        assert key_fanout(key) == 1, key
+    # An unbounded VARCHAR has no width to truncate at, so it still holds
+    # every value apart and the spine it keys keeps its multiplier.
+    assert key_fanout("CAST(a.x AS varchar)") == 8760
+
+    def refused(key: str) -> bool:
+        return unpriceable(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 8760)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    # Charging no multiplier holds the spine to what a collapsing scope may
+    # invent, so the bare spelling is refused exactly where CAST(x AS char(1))
+    # already was — the same query, and it had been quoted at 8,760.
+    assert refused("CAST(a.x AS char)")
+    assert refused("CAST(a.x AS char(1))")
+    assert not refused("CAST(a.x AS varchar)")
