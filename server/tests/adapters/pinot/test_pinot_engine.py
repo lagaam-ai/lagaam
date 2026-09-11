@@ -1,5 +1,6 @@
 """PinotEngine grounding over httpx.MockTransport, routing the real fixtures."""
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -266,14 +267,25 @@ async def test_the_interim_estimate_is_denied_by_the_default_budget() -> None:
         enforce_budget(estimate, QueryBudget.from_env())
 
 
-def test_from_env_reads_the_pinot_variables(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_from_env_reads_the_pinot_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("PINOT_CONTROLLER_URL", "http://c:19000")
     monkeypatch.setenv("PINOT_BROKER_URL", "http://b:18000")
     monkeypatch.setenv("PINOT_USER", "lagaam")
     monkeypatch.setenv("PINOT_PASSWORD", "secret")
-    engine = PinotEngine.from_env()
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization"))
+        return controller_handler(request)
+
+    engine = PinotEngine.from_env(transport=httpx.MockTransport(handler))
     assert engine._controller_url == "http://c:19000"
     assert engine._broker_url == "http://b:18000"
+    await engine.list_catalogs()
+    expected = "Basic " + base64.b64encode(b"lagaam:secret").decode()
+    assert seen and set(seen) == {expected}
 
 
 def test_from_env_defaults_to_the_quickstart_ports(
