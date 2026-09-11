@@ -1,0 +1,122 @@
+"""Broker JSON to a QueryResult, or the failure it carries.
+
+Every fixture here is a real HTTP 200 from Pinot 1.5.1 — including the
+failures, because every Pinot query error is an HTTP 200. An incomplete
+result is a failure and not a warning: a trimmed GROUP BY returns plausible
+wrong numbers, measured as 22 groups presented as complete.
+"""
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from lagaam.adapters.pinot.response import (
+    ENGINE_FAULT,
+    INCOMPLETE_RESULT,
+    parse_query_result,
+    result_failure,
+)
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def load(name: str) -> Any:
+    return json.loads((FIXTURES / name).read_text())
+
+
+def test_a_clean_aggregation_carries_no_failure() -> None:
+    assert result_failure(load("agg-groupby.json")) is None
+
+
+def test_a_clean_aggregation_parses_into_rows_and_columns() -> None:
+    result = parse_query_result(load("agg-groupby.json"), max_rows=10)
+    assert result.columns == ["Carrier", "n"]
+    assert result.rows[0] == ["WN", 2008]
+    assert result.row_count == 5
+    assert result.truncated is False
+    assert result.warnings == []
+
+
+def test_rows_are_capped_and_truncation_is_flagged() -> None:
+    # The server asks for max_rows + 1, so more rows than the cap means more exist.
+    result = parse_query_result(load("agg-groupby.json"), max_rows=3)
+    assert result.row_count == 3
+    assert result.truncated is True
+    assert result.rows[-1] == ["OO", 1159]
+
+
+def test_a_trimmed_group_by_is_a_failure_not_a_warning() -> None:
+    # Measured: numGroupsLimit=2 returned 22 groups with HTTP 200, partialResult
+    # true and numGroupsLimitReached true — plausible numbers that are wrong.
+    body = load("numgroupslimit2.json")
+    assert body["numGroupsLimitReached"] is True
+    assert result_failure(body) == INCOMPLETE_RESULT
+
+
+def test_a_timeout_is_classified_from_its_exception() -> None:
+    assert result_failure(load("timeout1-mse.json")) == "EXCEEDED_TIME_LIMIT"
+
+
+def test_an_exception_outranks_the_partial_flag() -> None:
+    # The timeout body sets partialResult too; the named cause is the better hint.
+    assert load("timeout1-mse.json")["partialResult"] is True
+    assert result_failure(load("timeout1-mse.json")) != INCOMPLETE_RESULT
+
+
+def test_an_ingestion_shaped_response_is_an_engine_fault() -> None:
+    # Measured: INSERT INTO ... FROM FILE returns HTTP 200 with empty
+    # exceptions[], a null requestId and an ingestion task schema. Core's AST
+    # allowlist already denies INSERT, so this can only mean the broker
+    # answered something that is not a query result.
+    body = load("insert-from-file-mse.json")
+    assert body["exceptions"] == []
+    assert body["requestId"] is None
+    assert result_failure(body) == ENGINE_FAULT
+
+
+def test_a_real_result_with_a_request_id_is_not_an_engine_fault() -> None:
+    assert load("agg-groupby.json")["requestId"]
+    assert result_failure(load("agg-groupby.json")) is None
+
+
+def test_the_group_warning_limit_becomes_a_warning_on_the_result() -> None:
+    body = load("agg-groupby.json")
+    body["numGroupsWarningLimitReached"] = True
+    assert result_failure(body) is None
+    result = parse_query_result(body, max_rows=10)
+    assert len(result.warnings) == 1
+    assert "group" in result.warnings[0].lower()
+
+
+def test_an_unlimited_multistage_selection_parses_and_caps() -> None:
+    # Measured: the multi-stage engine returned all 9,746 rows for a query
+    # with no LIMIT. The adapter caps what it hands back either way.
+    result = parse_query_result(load("nolimit-mse.json"), max_rows=5)
+    assert result.row_count == 5
+    assert result.truncated is True
+
+
+@pytest.mark.parametrize("body", [None, "junk", [], 7])
+def test_a_body_that_is_not_an_object_is_an_engine_fault(body: Any) -> None:
+    assert result_failure(body) == ENGINE_FAULT
+
+
+def test_a_missing_result_table_parses_as_no_rows() -> None:
+    result = parse_query_result({"resultTable": None}, max_rows=10)
+    assert result.columns == []
+    assert result.rows == []
+    assert result.row_count == 0
+    assert result.truncated is False
+
+
+def test_a_malformed_row_does_not_crash_the_parse() -> None:
+    body = {
+        "resultTable": {
+            "dataSchema": {"columnNames": ["a"]},
+            "rows": [["ok"], "not a row", ["fine"]],
+        }
+    }
+    result = parse_query_result(body, max_rows=10)
+    assert result.rows == [["ok"], ["fine"]]
