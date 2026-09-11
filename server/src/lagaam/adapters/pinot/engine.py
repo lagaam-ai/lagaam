@@ -59,7 +59,9 @@ class PinotEngine:
         )
 
     @classmethod
-    def from_env(cls) -> "PinotEngine":
+    def from_env(
+        cls, transport: httpx.AsyncBaseTransport | None = None
+    ) -> "PinotEngine":
         rows = os.environ.get("LAGAAM_MAX_INTERMEDIATE_ROWS")
         return cls(
             controller_url=os.environ.get(
@@ -69,26 +71,42 @@ class PinotEngine:
             user=os.environ.get("PINOT_USER"),
             password=os.environ.get("PINOT_PASSWORD"),
             max_intermediate_rows=int(rows) if rows else None,
+            transport=transport,
         )
 
     def dialect(self) -> DialectCard:
         return PINOT_DIALECT_CARD
 
     async def list_catalogs(self) -> CatalogMetadata:
-        schemas: list[SchemaInfo] = []
-        truncated = False
         try:
-            for database in await self._databases():
-                body = await self._client.controller_get("/tables", database=database)
-                if body is PinotClient.NotFound:
-                    continue
-                names = table_names(body)
-                if len(names) > self._max_tables:
-                    truncated = True
-                    names = names[: self._max_tables]
-                schemas.append(SchemaInfo(name=database, tables=names))
+            databases = await self._databases()
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc
+        schemas: list[SchemaInfo] = []
+        truncated = False
+        attempted = 0
+        for database in databases:
+            try:
+                PinotClient.path_part(database)
+            except ValueError:
+                # Non-ASCII cannot be granted either — see core.normalize_grant.
+                continue
+            attempted += 1
+            try:
+                body = await self._client.controller_get("/tables", database=database)
+            except PinotTransportError:
+                # One broken database must not cost the grounding for healthy ones.
+                continue
+            if body is PinotClient.NotFound:
+                continue
+            names = table_names(body)
+            budget = self._max_tables - sum(len(s.tables) for s in schemas)
+            if len(names) > budget:
+                truncated = True
+                names = names[:budget]
+            schemas.append(SchemaInfo(name=database, tables=names))
+        if attempted and not schemas:
+            raise EngineError(_UNREACHABLE)
         return CatalogMetadata(
             catalogs=[
                 CatalogInfo(name=self.CATALOG, schemas=schemas, truncated=truncated)
@@ -102,6 +120,7 @@ class PinotEngine:
             raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
         try:
             part = PinotClient.path_part(table)
+            PinotClient.path_part(schema)
         except ValueError as exc:
             raise TableNotFoundError(
                 catalog=catalog, schema=schema, table=table

@@ -34,12 +34,35 @@ def controller_handler(request: httpx.Request) -> httpx.Response:
     return httpx.Response(200, json=load(name))
 
 
-def make_engine(handler: Any = controller_handler) -> PinotEngine:
+def make_engine(handler: Any = controller_handler, **kwargs: Any) -> PinotEngine:
     return PinotEngine(
         controller_url="http://controller:9000",
         broker_url="http://broker:8000",
         transport=httpx.MockTransport(handler),
+        **kwargs,
     )
+
+
+def two_database_handler(
+    databases: list[str], tables: dict[str, httpx.Response]
+) -> Any:
+    """Serve /databases, then route /tables by the `database` header."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/databases":
+            return httpx.Response(200, json=databases)
+        if request.url.path == "/tables":
+            database = request.headers.get("database", "default")
+            return tables.get(
+                database, httpx.Response(404, json={"code": 404, "error": "no"})
+            )
+        return controller_handler(request)
+
+    return handler
+
+
+def tables_response(*names: str) -> httpx.Response:
+    return httpx.Response(200, json={"tables": list(names)})
 
 
 def test_pinot_engine_offers_the_grounding_half_of_the_port() -> None:
@@ -80,6 +103,71 @@ async def test_the_table_listing_is_capped_and_flagged() -> None:
     catalog = (await engine.list_catalogs()).catalogs[0]
     assert len(catalog.schemas[0].tables) == 3
     assert catalog.truncated is True
+
+
+async def test_the_cap_is_one_budget_across_every_database() -> None:
+    handler = two_database_handler(
+        ["default", "analytics"],
+        {
+            "default": tables_response("a1", "a2", "a3", "a4"),
+            "analytics": tables_response("b1", "b2", "b3", "b4"),
+        },
+    )
+    catalog = (
+        await make_engine(handler, max_tables_per_catalog=5).list_catalogs()
+    ).catalogs[0]
+    assert sum(len(s.tables) for s in catalog.schemas) == 5
+    assert catalog.truncated is True
+
+
+async def test_a_database_that_exactly_fills_the_budget_is_not_truncated() -> None:
+    handler = two_database_handler(
+        ["default", "analytics"],
+        {
+            "default": tables_response("a1", "a2"),
+            "analytics": tables_response("b1", "b2"),
+        },
+    )
+    catalog = (
+        await make_engine(handler, max_tables_per_catalog=4).list_catalogs()
+    ).catalogs[0]
+    assert sum(len(s.tables) for s in catalog.schemas) == 4
+    assert catalog.truncated is False
+
+
+async def test_one_broken_database_does_not_cost_the_healthy_one() -> None:
+    handler = two_database_handler(
+        ["broken", "default"],
+        {
+            "broken": httpx.Response(500, text="controller:9000 internal failure"),
+            "default": tables_response("airlineStats"),
+        },
+    )
+    catalog = (await make_engine(handler).list_catalogs()).catalogs[0]
+    assert [s.name for s in catalog.schemas] == ["default"]
+    assert catalog.schemas[0].tables == ["airlineStats"]
+
+
+async def test_a_non_ascii_database_is_skipped_rather_than_crashing() -> None:
+    handler = two_database_handler(
+        ["default", "ventas_españa"], {"default": tables_response("airlineStats")}
+    )
+    catalog = (await make_engine(handler).list_catalogs()).catalogs[0]
+    assert [s.name for s in catalog.schemas] == ["default"]
+
+
+async def test_every_database_failing_is_an_engine_error_not_an_empty_catalog() -> None:
+    handler = two_database_handler(["default", "analytics"], {})
+    with pytest.raises(EngineError, match="not reachable"):
+        await make_engine(handler).list_catalogs()
+
+
+async def test_a_database_with_no_tables_is_an_honestly_empty_catalog() -> None:
+    handler = two_database_handler(["default"], {"default": tables_response()})
+    catalog = (await make_engine(handler).list_catalogs()).catalogs[0]
+    assert [s.name for s in catalog.schemas] == ["default"]
+    assert catalog.schemas[0].tables == []
+    assert catalog.truncated is False
 
 
 async def test_a_missing_databases_endpoint_falls_back_to_default() -> None:
@@ -137,6 +225,11 @@ async def test_a_controller_404_is_a_missing_table() -> None:
 async def test_a_name_that_cannot_be_a_url_part_is_a_missing_table() -> None:
     with pytest.raises(TableNotFoundError):
         await make_engine().describe_table("pinot", "default", "../secrets")
+
+
+async def test_a_schema_that_cannot_be_a_url_part_is_a_missing_table() -> None:
+    with pytest.raises(TableNotFoundError):
+        await make_engine().describe_table("pinot", "españa", "airlineStats")
 
 
 async def test_describe_table_sends_the_database_as_the_header() -> None:
