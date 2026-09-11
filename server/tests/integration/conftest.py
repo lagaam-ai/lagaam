@@ -33,3 +33,54 @@ def trino_ready() -> None:
             if time.monotonic() > deadline:
                 pytest.skip("Trino never became queryable within 30s")
             time.sleep(1)
+
+
+_PINOT_TABLES = ("airlineStats", "baseballStats")
+
+
+@pytest.fixture
+def pinot_ready() -> None:
+    """Skip (don't fail) when Pinot isn't up, or hasn't loaded what we query.
+
+    The quickstart answers its first query at ~42s but keeps bootstrapping
+    tables for ~20 minutes, so a controller that is merely healthy can still
+    show a partial catalog. Waiting on the two tables the tests actually
+    query is the only honest readiness signal.
+    """
+    try:
+        httpx.get("http://localhost:9000/health", timeout=2.0).raise_for_status()
+    except httpx.HTTPError:
+        pytest.skip("Pinot not reachable — docker compose --profile pinot up -d")
+
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            answered = all(_pinot_answers(table) for table in _PINOT_TABLES)
+        except httpx.HTTPError:
+            answered = False
+        if answered:
+            return
+        if time.monotonic() > deadline:
+            pytest.skip(
+                "Pinot never had airlineStats and baseballStats queryable "
+                "within 300s — the quickstart loads tables for ~20 minutes"
+            )
+        time.sleep(2)
+
+
+def _pinot_answers(table: str) -> bool:
+    """Is this table queryable through the broker right now?"""
+    response = httpx.post(
+        "http://localhost:8000/query/sql",
+        json={
+            "sql": f"SELECT count(*) AS n FROM {table} LIMIT 1",
+            "queryOptions": "useMultistageEngine=true",
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    body = response.json()
+    # Every Pinot query error is an HTTP 200, so the body is the only signal.
+    return not body.get("exceptions") and bool(
+        (body.get("resultTable") or {}).get("rows")
+    )

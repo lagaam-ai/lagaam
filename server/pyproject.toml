@@ -34,7 +34,7 @@ module-name = "lagaam"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
-    "integration: needs a running engine (docker compose --profile trino up)",
+    "integration: needs a running engine (docker compose --profile trino|pinot up)",
 ]
 # The suite runs in under a second; a test past this is hung, not slow. The
 # guards here bound work sqlglot does not, so a regression means an infinite
