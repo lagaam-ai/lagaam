@@ -354,6 +354,26 @@ async def test_execute_pins_the_multistage_engine_and_the_response_cap() -> None
     assert "maxQueryResponseSizeBytes=67108864" in options
 
 
+async def test_the_client_read_timeout_outlives_the_brokers_own_deadline() -> None:
+    # Equal deadlines let httpx give up before the broker's own timeout body
+    # arrives, turning a teachable EXCEEDED_TIME_LIMIT into a bare EngineError.
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        seen["extensions"] = dict(request.extensions)
+        return httpx.Response(200, json=load("agg-groupby.json"))
+
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5",
+        max_rows=10,
+        timeout_seconds=2.0,
+    )
+    options = seen["body"]["queryOptions"].split(";")
+    assert "timeoutMs=2000" in options
+    assert seen["extensions"]["timeout"]["read"] == 7.0
+
+
 async def test_a_sub_millisecond_timeout_rounds_up_rather_than_to_zero() -> None:
     # timeoutMs=0 would be no cap at all, which is the opposite of a budget.
     handler = replying(load("agg-groupby.json"))

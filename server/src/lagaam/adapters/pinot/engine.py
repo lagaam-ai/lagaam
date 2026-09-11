@@ -43,6 +43,9 @@ _OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
 _OPT_MAX_ROWS_IN_WINDOW = "maxRowsInWindow"
 _OPT_MAX_RESPONSE_BYTES = "maxQueryResponseSizeBytes"
 
+# Backstop only: the broker must hit its own timeoutMs and answer first.
+_TIMEOUT_GRACE_SECONDS = 5.0
+
 
 class PinotEngine:
     CATALOG = "pinot"
@@ -180,9 +183,14 @@ class PinotEngine:
     ) -> QueryResult:
         two_part = two_part_sql(sql, self.CATALOG)
         options = self._query_options(timeout_seconds)
+        client_timeout = (
+            None
+            if timeout_seconds is None
+            else timeout_seconds + _TIMEOUT_GRACE_SECONDS
+        )
         try:
             body = await self._client.broker_query(
-                two_part, options, timeout_seconds=timeout_seconds
+                two_part, options, timeout_seconds=client_timeout
             )
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc
