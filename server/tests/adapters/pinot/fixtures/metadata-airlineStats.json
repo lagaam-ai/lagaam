@@ -1,0 +1,11 @@
+{
+  "tableName" : "airlineStats_OFFLINE",
+  "diskSizeInBytes" : 4861355,
+  "numSegments" : 31,
+  "numRows" : 9746,
+  "columnLengthMap" : { },
+  "columnCardinalityMap" : { },
+  "maxNumMultiValuesMap" : { },
+  "columnIndexSizeMap" : { },
+  "upsertPartitionToServerPrimaryKeyCountMap" : { }
+}

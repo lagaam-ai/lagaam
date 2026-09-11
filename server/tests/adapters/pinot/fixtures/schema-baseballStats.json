@@ -1,0 +1,106 @@
+{
+  "schemaName" : "baseballStats",
+  "enableColumnBasedNullHandling" : false,
+  "dimensionFieldSpecs" : [ {
+    "name" : "playerID",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "yearID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "teamID",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "league",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "playerName",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  } ],
+  "metricFieldSpecs" : [ {
+    "name" : "playerStint",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "numberOfGames",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "numberOfGamesAsBatter",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "AtBatting",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "runs",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "hits",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "doules",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "tripples",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "homeRuns",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "runsBattedIn",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "stolenBases",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "caughtStealing",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "baseOnBalls",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "strikeouts",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "intentionalWalks",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "hitsByPitch",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "sacrificeHits",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "sacrificeFlies",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "groundedIntoDoublePlays",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  }, {
+    "name" : "G_old",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  } ]
+}

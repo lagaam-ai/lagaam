@@ -1,0 +1,11 @@
+{
+  "tableName" : "baseballStats_OFFLINE",
+  "diskSizeInBytes" : 3342450,
+  "numSegments" : 1,
+  "numRows" : 97889,
+  "columnLengthMap" : { },
+  "columnCardinalityMap" : { },
+  "maxNumMultiValuesMap" : { },
+  "columnIndexSizeMap" : { },
+  "upsertPartitionToServerPrimaryKeyCountMap" : { }
+}
