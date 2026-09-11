@@ -137,6 +137,14 @@ def test_path_part_rejects_anything_that_could_reshape_the_url(part: str) -> Non
         PinotClient.path_part(part)
 
 
+@pytest.mark.parametrize("part", ["汉", "españa", "naïve"])
+def test_path_part_rejects_a_non_ascii_name(part: str) -> None:
+    # httpx encodes headers as ASCII, so a non-ASCII name raises
+    # UnicodeEncodeError mid-request — neither an HTTPError nor ours.
+    with pytest.raises(ValueError):
+        PinotClient.path_part(part)
+
+
 def test_path_part_percent_encodes_a_legal_name() -> None:
     assert PinotClient.path_part("airlineStats") == "airlineStats"
     assert PinotClient.path_part("weird$name") == "weird%24name"

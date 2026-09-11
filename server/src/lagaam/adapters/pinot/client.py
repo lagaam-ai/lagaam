@@ -56,6 +56,9 @@ class PinotClient:
         """
         if not part or part.strip() != part:
             raise ValueError(f"not a usable Pinot name: {part!r}")
+        # Non-ASCII would raise UnicodeEncodeError inside httpx's header encoding.
+        if not part.isascii():
+            raise ValueError(f"not a usable Pinot name: {part!r}")
         if any(char in _ILLEGAL_PART_CHARS for char in part):
             raise ValueError(f"not a usable Pinot name: {part!r}")
         if any(char.isspace() for char in part):
