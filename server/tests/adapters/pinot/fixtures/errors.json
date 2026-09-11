@@ -1,0 +1,74 @@
+{
+ "v1:bad column": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "UnknownColumnError: Unknown columnName 'nosuchcolumn' found in the query",
+    "errorCode": 710
+   }
+  ]
+ },
+ "v1:unknown table": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "TableDoesNotExistError",
+    "errorCode": 190
+   }
+  ]
+ },
+ "v1:syntax error": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "SQLParsingError: Caught exception while parsing query: SELECT FROM WHERE airlineStats: Encountered \"\" at line 1, column 8.\nWas expecting one of:\n    ",
+    "errorCode": 150
+   }
+  ]
+ },
+ "v1:unknown function": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "Unsupported function: nosuchfunc",
+    "errorCode": 700
+   }
+  ]
+ },
+ "MSE:bad column": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "QueryValidationError: From line 1, column 8 to line 1, column 19: The definition of column 'nosuchcolumn' depends on itself through the following columns: 'nosuchcolumn'. From line 1, column 8 to line 1, column 19: The definition of column 'nosuchcolumn' depends on itself through the following columns: 'nosuchcolumn'. The definition of column 'nosuchcolumn' depends on itself through the following columns: 'nosuchcolumn'",
+    "errorCode": 700
+   }
+  ]
+ },
+ "MSE:unknown table": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "TableDoesNotExistError: From line 1, column 15 to line 1, column 25: Object 'nosuchtable' not found. From line 1, column 15 to line 1, column 25: Object 'nosuchtable' not found. Object 'nosuchtable' not found",
+    "errorCode": 190
+   }
+  ]
+ },
+ "MSE:syntax error": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "SQLParsingError: Caught exception while parsing query: SELECT FROM WHERE airlineStats: Encountered \"\" at line 1, column 8.\nWas expecting one of:\n    ",
+    "errorCode": 150
+   }
+  ]
+ },
+ "MSE:unknown function": {
+  "http": 200,
+  "exceptions": [
+   {
+    "message": "QueryValidationError: From line 1, column 8 to line 1, column 26: No match found for function signature nosuchfunc(<CHARACTER>). From line 1, column 8 to line 1, column 26: No match found for function signature nosuchfunc(<CHARACTER>). No match found for function signature nosuchfunc(<CHARACTER>)",
+    "errorCode": 700
+   }
+  ]
+ }
+}
