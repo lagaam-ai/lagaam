@@ -7,6 +7,7 @@ and two-part to Pinot. Every failure leaves this module as a LagaamError —
 httpx exceptions and broker messages never escape.
 """
 
+import math
 import os
 
 import httpx
@@ -14,15 +15,19 @@ import httpx
 from lagaam.adapters.pinot.client import PinotClient, PinotTransportError
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import table_names, table_schema
-from lagaam.core.errors import EngineError, TableNotFoundError
+from lagaam.adapters.pinot.names import two_part_sql
+from lagaam.adapters.pinot.response import parse_query_result, result_failure
+from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
 from lagaam.core.models import (
     CatalogInfo,
     CatalogMetadata,
     CostEstimate,
     DialectCard,
+    QueryResult,
     SchemaInfo,
     TableSchema,
 )
+from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 
 _UNREACHABLE = "the query engine is not reachable right now"
 
@@ -30,9 +35,21 @@ _UNREACHABLE = "the query engine is not reachable right now"
 # expose GET /databases, but an older controller answering 404 still grounds.
 _DEFAULT_DATABASE = "default"
 
+# Pinot silently ignores an option name it does not know, so a typo here would
+# disable a cap with no signal at all; the integration tests trip each one.
+_OPT_MULTISTAGE = "useMultistageEngine"
+_OPT_TIMEOUT_MS = "timeoutMs"
+_OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
+_OPT_MAX_ROWS_IN_WINDOW = "maxRowsInWindow"
+_OPT_MAX_RESPONSE_BYTES = "maxQueryResponseSizeBytes"
+
 
 class PinotEngine:
     CATALOG = "pinot"
+
+    # A fixed ceiling on what one answer may weigh; the only byte-denominated
+    # control Pinot offers, and the agent's row cap is not one.
+    MAX_QUERY_RESPONSE_BYTES = 64 * 1024 * 1024
 
     def __init__(
         self,
@@ -157,6 +174,39 @@ class PinotEngine:
         the gate exists to stop.
         """
         return CostEstimate(confidence="low")
+
+    async def execute(
+        self, sql: str, max_rows: int, timeout_seconds: float | None = None
+    ) -> QueryResult:
+        two_part = two_part_sql(sql, self.CATALOG)
+        options = self._query_options(timeout_seconds)
+        try:
+            body = await self._client.broker_query(
+                two_part, options, timeout_seconds=timeout_seconds
+            )
+        except PinotTransportError as exc:
+            raise EngineError(_UNREACHABLE) from exc
+
+        failure = result_failure(body)
+        if failure is not None:
+            if is_self_correctable(failure):
+                raise QueryFailedError(hint_for_engine_error(failure))
+            raise EngineError(_UNREACHABLE)
+        return parse_query_result(body, max_rows)
+
+    def _query_options(self, timeout_seconds: float | None) -> str:
+        """The reins, as Pinot's semicolon-separated option string."""
+        options = [f"{_OPT_MULTISTAGE}=true"]
+        if timeout_seconds is not None:
+            # Round up: a sub-millisecond budget must never render as 0, which
+            # Pinot reads as no cap rather than as no time.
+            milliseconds = max(1, math.ceil(timeout_seconds * 1000))
+            options.append(f"{_OPT_TIMEOUT_MS}={milliseconds}")
+        if self._max_intermediate_rows is not None:
+            options.append(f"{_OPT_MAX_ROWS_IN_JOIN}={self._max_intermediate_rows}")
+            options.append(f"{_OPT_MAX_ROWS_IN_WINDOW}={self._max_intermediate_rows}")
+        options.append(f"{_OPT_MAX_RESPONSE_BYTES}={self.MAX_QUERY_RESPONSE_BYTES}")
+        return ";".join(options)
 
     async def _databases(self) -> list[str]:
         """Pinot databases, or just `default` on a controller without the endpoint."""

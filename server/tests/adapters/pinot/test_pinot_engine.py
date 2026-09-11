@@ -10,7 +10,8 @@ import httpx
 import pytest
 
 from lagaam.adapters.pinot.engine import PinotEngine
-from lagaam.core.errors import EngineError, TableNotFoundError
+from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
+from lagaam.core.ports import QueryEngine
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -66,12 +67,8 @@ def tables_response(*names: str) -> httpx.Response:
     return httpx.Response(200, json={"tables": list(names)})
 
 
-def test_pinot_engine_offers_the_grounding_half_of_the_port() -> None:
-    # execute() lands with the broker in task 8; until then the isinstance
-    # check against the whole QueryEngine protocol cannot pass.
-    engine = make_engine()
-    for name in ("list_catalogs", "describe_table", "dialect", "estimate_cost"):
-        assert callable(getattr(engine, name))
+def test_pinot_engine_satisfies_the_port() -> None:
+    assert isinstance(make_engine(), QueryEngine)
 
 
 def test_the_dialect_is_the_pinot_card() -> None:
@@ -312,3 +309,183 @@ def test_from_env_takes_the_intermediate_row_budget(
     # budget at construction and spends it on the broker's own row limits.
     monkeypatch.setenv("LAGAAM_MAX_INTERMEDIATE_ROWS", "1234")
     assert PinotEngine.from_env()._max_intermediate_rows == 1234
+
+
+def broker_engine(handler: Any, max_intermediate_rows: int | None = None) -> PinotEngine:
+    return make_engine(handler, max_intermediate_rows=max_intermediate_rows)
+
+
+def replying(body: Any) -> Any:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json=body)
+
+    handler.seen = seen  # type: ignore[attr-defined]
+    return handler
+
+
+async def test_execute_sends_two_part_sql_to_the_broker() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 5",
+        max_rows=10,
+    )
+    assert handler.seen["url"] == "http://broker:8000/query/sql"
+    assert handler.seen["body"]["sql"] == (
+        "SELECT Carrier, COUNT(*) AS n FROM default.airlineStats "
+        "GROUP BY Carrier LIMIT 5"
+    )
+
+
+async def test_execute_pins_the_multistage_engine_and_the_response_cap() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5",
+        max_rows=10,
+        timeout_seconds=30.0,
+    )
+    options = handler.seen["body"]["queryOptions"].split(";")
+    assert "useMultistageEngine=true" in options
+    assert "timeoutMs=30000" in options
+    assert "maxQueryResponseSizeBytes=67108864" in options
+
+
+async def test_a_sub_millisecond_timeout_rounds_up_rather_than_to_zero() -> None:
+    # timeoutMs=0 would be no cap at all, which is the opposite of a budget.
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5",
+        max_rows=10,
+        timeout_seconds=0.0004,
+    )
+    assert "timeoutMs=1" in handler.seen["body"]["queryOptions"].split(";")
+
+
+async def test_no_timeout_means_no_timeout_option() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+    )
+    assert "timeoutMs" not in handler.seen["body"]["queryOptions"]
+
+
+async def test_the_row_budget_becomes_the_engines_own_row_limits() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler, max_intermediate_rows=50_000).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+    )
+    options = handler.seen["body"]["queryOptions"].split(";")
+    assert "maxRowsInJoin=50000" in options
+    assert "maxRowsInWindow=50000" in options
+
+
+async def test_no_row_budget_omits_the_row_limits() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+    )
+    options = handler.seen["body"]["queryOptions"]
+    assert "maxRowsInJoin" not in options
+    assert "maxRowsInWindow" not in options
+
+
+async def test_the_adapter_neither_adds_nor_removes_a_limit() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await broker_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats", max_rows=10
+    )
+    assert "LIMIT" not in handler.seen["body"]["sql"].upper()
+
+
+async def test_execute_returns_capped_rows() -> None:
+    result = await broker_engine(replying(load("agg-groupby.json"))).execute(
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 5",
+        max_rows=3,
+    )
+    assert result.row_count == 3
+    assert result.truncated is True
+    assert result.columns == ["Carrier", "n"]
+
+
+async def test_a_row_limit_failure_becomes_a_teachable_error() -> None:
+    body = dict(load("agg-groupby.json"))
+    body["exceptions"] = [
+        {"message": "Cannot build in memory hash table for join operator", "errorCode": 245}
+    ]
+    with pytest.raises(QueryFailedError, match="distinct values"):
+        await broker_engine(replying(body)).execute(
+            "SELECT a.Carrier FROM pinot.default.airlineStats AS a "
+            "JOIN pinot.default.baseballStats AS b ON a.Carrier = b.playerName LIMIT 5",
+            max_rows=10,
+        )
+
+
+async def test_a_timeout_becomes_a_teachable_error() -> None:
+    with pytest.raises(QueryFailedError, match="took too long"):
+        await broker_engine(replying(load("timeout1-mse.json"))).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
+async def test_a_trimmed_group_by_is_refused_rather_than_returned() -> None:
+    with pytest.raises(QueryFailedError):
+        await broker_engine(replying(load("numgroupslimit2.json"))).execute(
+            "SELECT Origin, count(*) AS n FROM pinot.default.airlineStats "
+            "GROUP BY Origin LIMIT 100",
+            max_rows=100,
+        )
+
+
+async def test_a_broker_message_never_reaches_the_agent() -> None:
+    body = dict(load("agg-groupby.json"))
+    body["exceptions"] = [
+        {
+            "message": "Serialized query response size 5190 exceeds threshold 100 "
+            "for requestId 786551596000000039 from broker Broker_172.17.0.2_8000",
+            "errorCode": 503,
+        }
+    ]
+    with pytest.raises(QueryFailedError) as caught:
+        await broker_engine(replying(body)).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+    assert "172.17.0.2" not in str(caught.value)
+    assert "786551596000000039" not in str(caught.value)
+
+
+async def test_an_unmapped_failure_is_the_engines_fault_not_the_querys() -> None:
+    body = dict(load("agg-groupby.json"))
+    body["exceptions"] = [{"message": "who knows", "errorCode": 999}]
+    with pytest.raises(EngineError):
+        await broker_engine(replying(body)).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
+async def test_an_unreachable_broker_is_an_engine_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    with pytest.raises(EngineError):
+        await broker_engine(handler).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
+async def test_another_catalog_is_refused_before_the_broker_is_called() -> None:
+    called: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json=load("agg-groupby.json"))
+
+    with pytest.raises(TableNotFoundError):
+        await broker_engine(handler).execute(
+            "SELECT a FROM hive.default.airlineStats LIMIT 5", max_rows=10
+        )
+    assert called == []
