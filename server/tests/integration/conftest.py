@@ -80,7 +80,13 @@ def _pinot_answers(table: str) -> bool:
     )
     response.raise_for_status()
     body = response.json()
-    # Every Pinot query error is an HTTP 200, so the body is the only signal.
-    return not body.get("exceptions") and bool(
-        (body.get("resultTable") or {}).get("rows")
-    )
+    if body.get("exceptions"):
+        return False
+    rows = (body.get("resultTable") or {}).get("rows") or []
+    # A registered-but-loading table answers [[0]] with no exception, not an absent row.
+    if not rows or not isinstance(rows[0], list) or not rows[0]:
+        return False
+    count = rows[0][0]
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    return count > 0
