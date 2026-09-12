@@ -127,6 +127,9 @@ class PinotClient:
                     )
                 self._check_declared_size(response)
                 body = await self._read_capped(response)
+        except PinotResponseTooLarge:
+            # Must not be caught by the httpx.HTTPError handler below.
+            raise
         except httpx.HTTPError as exc:
             raise PinotTransportError("broker query failed") from exc
         try:
