@@ -12,7 +12,11 @@ import os
 
 import httpx
 
-from lagaam.adapters.pinot.client import PinotClient, PinotTransportError
+from lagaam.adapters.pinot.client import (
+    PinotClient,
+    PinotResponseTooLarge,
+    PinotTransportError,
+)
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import table_names, table_schema
 from lagaam.adapters.pinot.names import two_part_sql
@@ -37,6 +41,8 @@ _DEFAULT_DATABASE = "default"
 
 # Pinot silently ignores an option name it does not know, so a typo here would
 # disable a cap with no signal at all; the integration tests trip each one.
+# _OPT_MAX_RESPONSE_BYTES is the exception: measured on 1.5.1, the multi-stage
+# engine accepts the name and enforces nothing, so the client holds that ceiling.
 _OPT_MULTISTAGE = "useMultistageEngine"
 _OPT_TIMEOUT_MS = "timeoutMs"
 _OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
@@ -50,8 +56,8 @@ _TIMEOUT_GRACE_SECONDS = 5.0
 class PinotEngine:
     CATALOG = "pinot"
 
-    # A fixed ceiling on what one answer may weigh; the only byte-denominated
-    # control Pinot offers, and the agent's row cap is not one.
+    # The default ceiling on what one answer may weigh; the client holds it,
+    # and the same number is sent as the option so the two never disagree.
     MAX_QUERY_RESPONSE_BYTES = 64 * 1024 * 1024
 
     def __init__(
@@ -62,11 +68,13 @@ class PinotEngine:
         password: str | None = None,
         max_tables_per_catalog: int = 1000,
         max_intermediate_rows: int | None = None,
+        max_response_bytes: int = MAX_QUERY_RESPONSE_BYTES,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._controller_url = controller_url
         self._broker_url = broker_url
         self._max_tables = max_tables_per_catalog
+        self._max_response_bytes = max_response_bytes
         # The port's execute() carries no row budget, so the engine is told
         # once and spends it on the broker's own maxRowsInJoin/InWindow caps.
         self._max_intermediate_rows = max_intermediate_rows
@@ -75,6 +83,7 @@ class PinotEngine:
             broker_url=broker_url,
             user=user,
             password=password,
+            max_response_bytes=max_response_bytes,
             transport=transport,
         )
 
@@ -192,6 +201,10 @@ class PinotEngine:
             body = await self._client.broker_query(
                 two_part, options, timeout_seconds=client_timeout
             )
+        except PinotResponseTooLarge as exc:
+            raise QueryFailedError(
+                hint_for_engine_error("RESPONSE_TOO_LARGE")
+            ) from exc
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc
 
@@ -213,7 +226,7 @@ class PinotEngine:
         if self._max_intermediate_rows is not None:
             options.append(f"{_OPT_MAX_ROWS_IN_JOIN}={self._max_intermediate_rows}")
             options.append(f"{_OPT_MAX_ROWS_IN_WINDOW}={self._max_intermediate_rows}")
-        options.append(f"{_OPT_MAX_RESPONSE_BYTES}={self.MAX_QUERY_RESPONSE_BYTES}")
+        options.append(f"{_OPT_MAX_RESPONSE_BYTES}={self._max_response_bytes}")
         return ";".join(options)
 
     async def _databases(self) -> list[str]:

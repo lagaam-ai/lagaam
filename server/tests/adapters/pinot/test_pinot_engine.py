@@ -354,6 +354,41 @@ async def test_execute_pins_the_multistage_engine_and_the_response_cap() -> None
     assert "maxQueryResponseSizeBytes=67108864" in options
 
 
+async def test_the_option_carries_the_configured_ceiling_not_a_separate_literal() -> None:
+    handler = replying(load("agg-groupby.json"))
+    await make_engine(handler, max_response_bytes=4096).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+    )
+    options = handler.seen["body"]["queryOptions"].split(";")
+    assert "maxQueryResponseSizeBytes=4096" in options
+
+
+async def test_a_response_over_the_ceiling_becomes_a_teachable_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=load("agg-groupby.json"))
+
+    with pytest.raises(QueryFailedError, match="too large to send back"):
+        await make_engine(handler, max_response_bytes=64).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
+async def test_a_response_under_the_ceiling_is_returned() -> None:
+    result = await make_engine(
+        replying(load("agg-groupby.json")), max_response_bytes=1024 * 1024
+    ).execute(
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 5",
+        max_rows=3,
+    )
+    assert result.row_count == 3
+
+
+def test_the_default_ceiling_is_the_specs_fixed_constant() -> None:
+    handler = replying(load("agg-groupby.json"))
+    assert make_engine(handler)._max_response_bytes == PinotEngine.MAX_QUERY_RESPONSE_BYTES
+
+
 async def test_the_client_read_timeout_outlives_the_brokers_own_deadline() -> None:
     # Equal deadlines let httpx give up before the broker's own timeout body
     # arrives, turning a teachable EXCEEDED_TIME_LIMIT into a bare EngineError.

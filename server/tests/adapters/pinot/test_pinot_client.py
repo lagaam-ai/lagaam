@@ -11,17 +11,25 @@ from typing import Any
 import httpx
 import pytest
 
-from lagaam.adapters.pinot.client import PinotClient, PinotTransportError
+from lagaam.adapters.pinot.client import (
+    PinotClient,
+    PinotResponseTooLarge,
+    PinotTransportError,
+)
 
 
 def make_client(
-    handler: Any, user: str | None = None, password: str | None = None
+    handler: Any,
+    user: str | None = None,
+    password: str | None = None,
+    max_response_bytes: int = 64 * 1024 * 1024,
 ) -> PinotClient:
     return PinotClient(
         controller_url="http://controller:9000",
         broker_url="http://broker:8000",
         user=user,
         password=password,
+        max_response_bytes=max_response_bytes,
         transport=httpx.MockTransport(handler),
     )
 
@@ -127,6 +135,50 @@ async def test_a_connect_failure_is_a_transport_error() -> None:
 
     with pytest.raises(PinotTransportError):
         await make_client(handler).controller_get("/tables")
+
+
+async def test_a_body_over_the_ceiling_is_refused() -> None:
+    # Measured on 1.5.1: the multi-stage engine ignores maxQueryResponseSizeBytes,
+    # so the ceiling only exists if the client stops reading.
+    big = json.dumps({"resultTable": {"rows": [["x" * 5000]]}})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=big)
+
+    with pytest.raises(PinotResponseTooLarge):
+        await make_client(handler, max_response_bytes=1000).broker_query("SELECT 1", "")
+
+
+async def test_a_declared_content_length_over_the_ceiling_is_refused() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-length": "999999999"},
+            json={"resultTable": {"rows": [[1]]}},
+        )
+
+    with pytest.raises(PinotResponseTooLarge):
+        await make_client(handler, max_response_bytes=100).broker_query("SELECT 1", "")
+
+
+async def test_a_body_under_the_ceiling_still_parses() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"resultTable": {"rows": [[1]]}})
+
+    body = await make_client(handler, max_response_bytes=64 * 1024).broker_query(
+        "SELECT 1", ""
+    )
+    assert body == {"resultTable": {"rows": [[1]]}}
+
+
+async def test_a_non_json_body_under_the_ceiling_is_still_a_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="Table name containing more than one '.'")
+
+    with pytest.raises(PinotTransportError):
+        await make_client(handler, max_response_bytes=64 * 1024).broker_query(
+            "SELECT 1", ""
+        )
 
 
 @pytest.mark.parametrize(

@@ -175,12 +175,13 @@ async def test_the_same_window_query_runs_without_the_cap(
     assert result.row_count == 5
 
 
-async def test_the_response_size_option_name_is_honoured(pinot_ready: None) -> None:
-    # The engine's cap is a fixed 64 MiB constant, far past anything the
-    # quickstart can return, so the only way to prove Pinot knows the NAME is
-    # to ask the broker directly with a threshold a real answer must exceed.
-    # Enforced on the single-stage engine only — measured on 1.5.1, the
-    # multi-stage engine accepts the option and returns the rows anyway.
+async def test_the_response_size_option_name_is_honoured_on_the_single_stage_engine(
+    pinot_ready: None,
+) -> None:
+    # Kept because it proves something the client cap cannot: Pinot knows the
+    # option NAME (an unknown one is silently ignored). Enforced on the
+    # single-stage engine only — measured on 1.5.1, the multi-stage engine the
+    # adapter uses accepts the option and returns all 97,889 rows anyway.
     client = PinotClient(
         controller_url="http://localhost:9000", broker_url="http://localhost:8000"
     )
@@ -212,6 +213,39 @@ async def test_the_same_query_answers_when_the_size_cap_is_generous(
     finally:
         await client.aclose()
     assert result_failure(body) is None
+
+
+_SIZE_SQL = (
+    "select playerName, playerID, teamID, league from pinot.default.baseballStats"
+)
+
+
+async def test_the_response_ceiling_is_a_real_backstop_on_the_multistage_engine(
+    pinot_ready: None,
+) -> None:
+    # What the option alone cannot do: the multi-stage engine ignores it, so
+    # the client's own ceiling is the only thing that stops the answer.
+    engine = PinotEngine(
+        controller_url="http://localhost:9000",
+        broker_url="http://localhost:8000",
+        max_response_bytes=10_000,
+    )
+    sql = validate_query(
+        _SIZE_SQL, dialect=engine.dialect().sqlglot_dialect, default_limit=5000
+    )
+    with pytest.raises(QueryFailedError, match="too large to send back"):
+        await engine.execute(sql, max_rows=5000, timeout_seconds=60.0)
+
+
+async def test_the_same_query_returns_its_rows_under_the_default_ceiling(
+    engine: PinotEngine,
+) -> None:
+    # Without this the ceiling test above could pass on a broken query.
+    sql = validate_query(
+        _SIZE_SQL, dialect=engine.dialect().sqlglot_dialect, default_limit=5000
+    )
+    result = await engine.execute(sql, max_rows=5000, timeout_seconds=60.0)
+    assert result.row_count == 5000
 
 
 async def test_a_bad_column_maps_to_its_hint(engine: PinotEngine) -> None:

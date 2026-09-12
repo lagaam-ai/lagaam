@@ -7,6 +7,7 @@ engine turns into an EngineError; a controller 404 is not a failure but a
 "no such thing", returned as the NotFound sentinel so the caller can decide.
 """
 
+import json
 from typing import Any, Final
 from urllib.parse import quote
 
@@ -18,6 +19,16 @@ class PinotTransportError(Exception):
 
     Adapter-private: never raised past engine.py, which translates it into
     core's EngineError so no transport detail reaches an agent.
+    """
+
+
+class PinotResponseTooLarge(Exception):
+    """The broker's answer outgrew the byte ceiling this client will read.
+
+    Adapter-private like PinotTransportError: engine.py turns it into the
+    agent-fixable RESPONSE_TOO_LARGE hint. Measured on 1.5.1, the multi-stage
+    engine accepts maxQueryResponseSizeBytes and ignores it, so this is the
+    only place the ceiling is actually enforced.
     """
 
 
@@ -39,10 +50,13 @@ class PinotClient:
         user: str | None = None,
         password: str | None = None,
         timeout_seconds: float = 30.0,
+        *,
+        max_response_bytes: int = 64 * 1024 * 1024,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._controller_url = controller_url.rstrip("/")
         self._broker_url = broker_url.rstrip("/")
+        self._max_response_bytes = max_response_bytes
         auth = (user, password) if user is not None and password is not None else None
         self._http = httpx.AsyncClient(auth=auth, timeout=timeout_seconds, transport=transport)
 
@@ -95,21 +109,56 @@ class PinotClient:
         """POST one query to the broker. Returns parsed JSON.
 
         Never checks the status code for a query error: every Pinot query
-        error is an HTTP 200 carrying exceptions[].
+        error is an HTTP 200 carrying exceptions[]. The body is streamed and
+        abandoned the moment it passes max_response_bytes, because the broker
+        will not stop on its own — measured, the multi-stage engine returns
+        the whole result however low maxQueryResponseSizeBytes is set.
         """
         try:
-            response = await self._http.post(
+            async with self._http.stream(
+                "POST",
                 f"{self._broker_url}/query/sql",
                 json={"sql": sql, "queryOptions": options},
                 timeout=timeout_seconds if timeout_seconds is not None else httpx.USE_CLIENT_DEFAULT,
-            )
+            ) as response:
+                if response.status_code >= 400:
+                    raise PinotTransportError(
+                        f"broker query returned {response.status_code}"
+                    )
+                self._check_declared_size(response)
+                body = await self._read_capped(response)
         except httpx.HTTPError as exc:
             raise PinotTransportError("broker query failed") from exc
-        if response.status_code >= 400:
-            raise PinotTransportError(
-                f"broker query returned {response.status_code}"
+        try:
+            return json.loads(body)
+        except ValueError as exc:
+            raise PinotTransportError("broker query returned a non-JSON body") from exc
+
+    def _check_declared_size(self, response: httpx.Response) -> None:
+        """Refuse an oversized body before a byte of it is read."""
+        declared = response.headers.get("content-length")
+        if declared is None:
+            return
+        try:
+            length = int(declared)
+        except ValueError:
+            return
+        if length > self._max_response_bytes:
+            raise PinotResponseTooLarge(
+                f"broker declared {length} bytes, over the {self._max_response_bytes} ceiling"
             )
-        return self._json(response, "broker query")
+
+    async def _read_capped(self, response: httpx.Response) -> bytes:
+        chunks: list[bytes] = []
+        total = 0
+        async for chunk in response.aiter_bytes():
+            total += len(chunk)
+            if total > self._max_response_bytes:
+                raise PinotResponseTooLarge(
+                    f"broker response passed the {self._max_response_bytes} byte ceiling"
+                )
+            chunks.append(chunk)
+        return b"".join(chunks)
 
     async def aclose(self) -> None:
         await self._http.aclose()
