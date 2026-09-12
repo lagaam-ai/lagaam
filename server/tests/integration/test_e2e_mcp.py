@@ -4,7 +4,12 @@ import pytest
 
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.adapters.trino.engine import TrinoEngine
-from lagaam.core.budget import QueryBudget
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    QueryBudget,
+)
 from lagaam.core.identity import AgentIdentity
 from tests.helpers import lagaam_client
 
@@ -77,16 +82,23 @@ async def test_the_grant_hides_every_pinot_table_it_does_not_name(
             {"catalog": "pinot", "schema": "default", "table": "baseballStats"},
         )
         assert denied.isError
+        text = " ".join(
+            block.text for block in denied.content if hasattr(block, "text")
+        )
+        assert "is not permitted" in text
 
 
 async def test_query_data_on_pinot_is_denied_until_the_quotation_lands(
     pinot_ready: None,
 ) -> None:
-    # U11 builds the Pinot quotation. Until then estimate_cost cannot price a
-    # query, so the default budget denies it — and the denial says exactly
-    # that, rather than an agent quietly getting rows it was never cleared for.
+    """U11 builds the Pinot quotation; until then the default budget denies query_data."""
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
     async with lagaam_client(
-        _pinot_engine(), budget=QueryBudget.from_env(), identity=_PINOT_GRANT
+        _pinot_engine(), budget=budget, identity=_PINOT_GRANT
     ) as client:
         answer = await client.call_tool(
             "query_data",
