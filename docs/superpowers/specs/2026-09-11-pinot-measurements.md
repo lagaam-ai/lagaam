@@ -388,7 +388,7 @@ Matrix: `04-query-options-matrix.json`.
 | `numGroupsLimit` | yes | **yes** | below |
 | `maxRowsInJoin` (MSE) | yes | **yes** | errorCode 245 |
 | `maxRowsInWindow` (MSE) | yes | **yes** | errorCode 245 |
-| `maxQueryResponseSizeBytes` | yes | **yes** | errorCode 503 |
+| `maxQueryResponseSizeBytes` | yes | **single-stage only** | errorCode 503 on v1; ignored on MSE — see below |
 | `maxServerResponseSizeBytes` | yes | **yes** | errorCode 503 |
 | `minSegmentGroupTrimSize` | yes | no visible effect here | 100 rows, groupsTrimmed:false |
 | `minServerGroupTrimSize` | yes | no visible effect here | 100 rows, groupsTrimmed:false |
@@ -446,7 +446,17 @@ maxRowsInWindow=5 -> 245: "Cannot build in memory window cache for WINDOW operat
 ```
 503: "Serialized query response size 5190 exceeds threshold 100 for requestId ... from broker Broker_172.17.0.2_8000"
 ```
-Both accepted and enforced — the only byte-denominated control Pinot offers.
+Both accepted — the only byte-denominated control Pinot offers.
+
+**Correction (re-measured during Task 10, integration tests): `maxQueryResponseSizeBytes` is
+enforced on the single-stage engine ONLY.** On the multi-stage engine — the only engine the
+adapter executes on — the option is accepted by name and ignored: the same
+`SELECT playerName, playerID, teamID, league FROM baseballStats LIMIT 100000` returned all
+**97,889 rows** with `maxQueryResponseSizeBytes=100` and again with `=1000000`. The 503 above
+was measured on the v1 path. A byte ceiling on MSE therefore cannot be delegated to Pinot:
+`PinotClient.broker_query` streams the body and aborts past its own `max_response_bytes`,
+raising `PinotResponseTooLarge`, which `execute` maps to the `RESPONSE_TOO_LARGE` hint. The
+option is still sent, carrying the same configured value, so the v1 path stays covered.
 
 ## 5. Read-only surface — what the AST allowlist must deny
 
@@ -904,3 +914,10 @@ The only rewrites were cosmetic: `count(*)` → `COUNT(*)`, `a` → `AS a`, `ToD
 `LIMIT 100000` on baseballStats returned all 97,889 rows, 2,404,271 bytes, on both engines —
 there is no default broker response cap. `maxQueryResponseSizeBytes=1000000` refused it with
 errorCode 503 and `partialResult: true`. `numRowsResultSet` is present on every response.
+
+**Correction (Task 10): that 503 was the single-stage engine.** Re-measured on the live 1.5.1,
+the multi-stage engine — the only one the adapter uses — accepts `maxQueryResponseSizeBytes`
+and enforces nothing: the same query returned all **97,889 rows** at both `=100` and
+`=1000000`. The adapter's ceiling is therefore enforced client-side, in
+`PinotClient.broker_query`, which streams the body and aborts once the running total passes
+`max_response_bytes`. See §4's `maxQueryResponseSizeBytes` note.
