@@ -47,10 +47,14 @@ it in the response without scanning a document.
    part is an HTTP 500. Core's grant format, allowlist, cache key and the
    `describe_table` tool are all three-part, so the adapter presents a
    synthetic catalog named `pinot` and strips exactly that catalog part
-   from every table reference before submission. This is the one
-   transformation between the validated SQL and the engine, it is done on
-   the sqlglot AST of already-validated SQL, and a reference whose catalog
-   is not `pinot` is a `TableNotFoundError` before any request is made.
+   from every table and column reference before submission, on the
+   sqlglot AST of already-validated SQL. A three-part reference with the
+   wrong catalog, or a four-part column qualified with the wrong catalog,
+   is `TableNotFoundError` before any request is made. A reference with no
+   catalog at all — reachable only under `LAGAAM_ALLOW_ALL_TABLES`, where
+   the allowlist check returns early — is `SqlValidationError` naming the
+   required `pinot.<database>.<table>` form; unparseable SQL is the same
+   error with core's re-read text.
 5. **sqlglot dialect is the generic one (`""`).** Measured: 15 Pinot
    shapes re-rendered through `validate_query` executed on both engines
    with only cosmetic rewrites; `mysql` produced identical output and
@@ -124,18 +128,23 @@ whitespace before building a URL.
 
 ## Execution: `execute(sql, max_rows, timeout_seconds)`
 
-1. Parse with the generic dialect; for every `exp.Table` whose catalog is
-   `pinot`, drop the catalog; any other catalog → `TableNotFoundError`.
-   Re-render. (Validated SQL already carries a LIMIT; the adapter adds
-   none and removes none.)
+1. Parse with the generic dialect; for every `exp.Table` and qualified
+   `exp.Column` whose catalog is `pinot`, drop the catalog; any other
+   catalog → `TableNotFoundError`; no catalog at all (bare table, only
+   reachable under `LAGAAM_ALLOW_ALL_TABLES`) or unparseable SQL →
+   `SqlValidationError`. Re-render. (Validated SQL already carries a
+   LIMIT; the adapter adds none and removes none.)
 2. `POST {broker}/query/sql` with
    `{"sql": ..., "queryOptions": "useMultistageEngine=true;timeoutMs=...;maxRowsInJoin=...;maxRowsInWindow=...;maxQueryResponseSizeBytes=..."}`.
    `timeoutMs` is the budget's timeout rounded up to whole milliseconds;
-   the two row limits are the budget's `max_intermediate_rows` when set;
-   the response cap is a fixed 64 MiB. Unknown option names are silently
-   ignored by Pinot (measured), so these names are constants pinned by an
-   integration test that sets each low enough to trip and asserts the
-   engine tripped.
+   the two row limits are the budget's `max_intermediate_rows` when set.
+   `maxQueryResponseSizeBytes` is sent at a fixed 64 MiB but, measured on
+   the multi-stage engine the adapter executes on, is accepted by name and
+   enforces nothing (97,889 rows returned under a 100-byte cap — see
+   measurements §4 and §13). The real ceiling is client-side:
+   `PinotClient.broker_query` streams the body and raises
+   `PinotResponseTooLarge` past `max_response_bytes`, which `execute` maps
+   to `RESPONSE_TOO_LARGE`.
 3. `response.py` reads `resultTable.dataSchema.columnNames`,
    `resultTable.rows`, `numRowsResultSet`. Rows are capped at `max_rows`
    with `truncated` from the +1 the server already asked for.
@@ -210,7 +219,8 @@ for, never admissions.
 | 700 other `QueryValidationError` | `NOT_SUPPORTED` | `QueryFailedError` |
 | 245 join/window row limit | `EXCEEDED_ROW_LIMIT` (new, engine-agnostic) | `QueryFailedError` |
 | 400 `BrokerTimeoutError`, 427 servers not responded | `EXCEEDED_TIME_LIMIT` | `QueryFailedError` |
-| 503 response size | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
+| 503 response size (single-stage engine only) | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
+| — client-side ceiling (`PinotResponseTooLarge`, adapter-private): the multi-stage engine does not enforce `maxQueryResponseSizeBytes` | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
 | HTTP 200 with `partialResult`, `numGroupsLimitReached` or `groupsTrimmed` true | `INCOMPLETE_RESULT` (new) | `QueryFailedError` |
 | anything else, transport, non-JSON body | — | `EngineError("the query engine is not reachable right now")` |
 
