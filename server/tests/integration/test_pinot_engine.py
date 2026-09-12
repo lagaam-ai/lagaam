@@ -9,7 +9,13 @@ import pytest
 from lagaam.adapters.pinot.client import PinotClient
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.adapters.pinot.response import result_failure
-from lagaam.core.budget import QueryBudget, enforce_budget
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    QueryBudget,
+    enforce_budget,
+)
 from lagaam.core.errors import (
     BudgetExceededError,
     QueryFailedError,
@@ -310,4 +316,9 @@ async def test_estimate_cost_denies_until_the_quotation_lands(
     )
     assert estimate.confidence == "low"
     with pytest.raises(BudgetExceededError, match="could not be estimated"):
-        enforce_budget(estimate, QueryBudget.from_env())
+        budget = QueryBudget(
+            max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+            max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+            timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        )
+        enforce_budget(estimate, budget)
