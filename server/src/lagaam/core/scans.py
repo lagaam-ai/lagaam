@@ -18,6 +18,7 @@ undercounted even though its rows are not.
 
 from collections.abc import Callable, Mapping
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 import sqlglot
 from sqlglot import exp
@@ -714,33 +715,99 @@ _INJECTIVE_FUNCS = {"abs", "reverse"}
 
 # A cast that cannot map two values onto one. Anything narrower — boolean
 # folds every non-zero together, an integer type truncates — merges rows,
-# so the target type is read rather than trusting the cast itself.
+# so the target type is read rather than trusting the cast itself. CHAR is
+# absent at every width: it is a fixed width in Trino and truncates anything
+# wider, and a bare CHAR is the narrowest of all at CHAR(1).
 _WIDENING_CAST_TYPES = {
-    exp.DataType.Type.CHAR,
-    exp.DataType.Type.NCHAR,
     exp.DataType.Type.NVARCHAR,
     exp.DataType.Type.TEXT,
     exp.DataType.Type.VARCHAR,
 }
 
+# Fixed-point targets, whose scale says how much of a fraction survives.
+_DECIMAL_CAST_TYPES = {
+    exp.DataType.Type.BIGDECIMAL,
+    exp.DataType.Type.DECIMAL,
+    exp.DataType.Type.UDECIMAL,
+}
+
+
+def _rounding_exponent(target: exp.DataType) -> Decimal | None:
+    """What a cast to this type rounds to, or None where that is unreadable.
+
+    Trino rounds half away from zero at every cast to a whole number and at
+    every cast to a fixed point of stated scale, so the exponent is 1 for an
+    integral target and 10**-s for DECIMAL(p,s). A DECIMAL of unstated scale
+    is DECIMAL(38,0) there and rounds like an integer. A float target is
+    Decimal(0), meaning round nothing: a double conversion cannot turn a
+    non-zero decimal literal into zero or a zero into non-zero at the
+    magnitudes a hand-written multiplier is spelled at.
+    """
+    if target.this in exp.DataType.INTEGER_TYPES:
+        return Decimal(1)
+    if target.this in _DECIMAL_CAST_TYPES:
+        scale = target.expressions[1] if len(target.expressions) > 1 else None
+        if scale is None:
+            return Decimal(1)
+        literal = scale.find(exp.Literal)
+        if literal is None or literal.is_string:
+            return None
+        try:
+            places = int(literal.name)
+        except ValueError:
+            return None
+        if places < 0:
+            return None
+        return Decimal(1).scaleb(-places)
+    if target.this in exp.DataType.FLOAT_TYPES:
+        return Decimal(0)
+    return None
+
 
 def _is_certainly_nonzero(value: exp.Expr) -> bool:
     """True only where this constant provably is not zero.
 
-    Unknown answers False: a multiplier deleted is the failure this guards,
-    so a spelling nobody folded stays a reduction rather than being vouched
-    for. Reading only a bare integer let every other spelling of zero pass.
+    The literal is evaluated exactly, innermost wrapper outwards, because
+    each cast rounds at its own scale and the next one rounds what the last
+    already rounded: CAST(CAST(0.45 AS decimal(10,1)) AS bigint) is
+    0.45 -> 0.5 -> 1, not the 0 a single "reaches half" bound read. Unknown
+    answers False — a target this cannot read, a string, an unparseable
+    literal — because a multiplier deleted is the failure this guards, so a
+    spelling nobody folded stays a reduction rather than being vouched for.
     """
-    while isinstance(value, exp.Paren | exp.Cast | exp.TryCast):
+    wrappers: list[exp.Expr] = []
+    while isinstance(value, exp.Paren | exp.Neg | exp.Cast | exp.TryCast):
+        # Bounded so a cast tower cannot spin the evaluator; safety.py caps
+        # bracket nesting at 12, so real casts never reach this.
+        if len(wrappers) >= _MAX_ALIAS_DEPTH:
+            return False
+        wrappers.append(value)
         value = value.this
-    if isinstance(value, exp.Neg):
-        return _is_certainly_nonzero(value.this)
     if not isinstance(value, exp.Literal) or value.is_string:
         return False
     try:
-        return float(value.name) != 0.0
-    except ValueError:
+        evaluated = Decimal(value.name)
+    except InvalidOperation:
         return False
+    for wrapper in reversed(wrappers):
+        if isinstance(wrapper, exp.Neg):
+            evaluated = -evaluated
+            continue
+        if isinstance(wrapper, exp.Paren):
+            continue
+        target = wrapper.args.get("to")
+        if not isinstance(target, exp.DataType):
+            return False
+        exponent = _rounding_exponent(target)
+        if exponent is None:
+            return False
+        if exponent != 0:
+            try:
+                evaluated = evaluated.quantize(exponent, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                # A literal wider than the arithmetic context; unknown.
+                return False
+    return evaluated != 0
 
 
 def _injective_over(key: exp.Expr) -> exp.Column | None:

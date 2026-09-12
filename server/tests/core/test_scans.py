@@ -2413,3 +2413,155 @@ def test_a_derived_spine_with_no_table_beside_it_stays_admitted() -> None:
         )
         assert not unpriceable(sql), length
         assert fanout(sql) == 1, length
+
+def test_a_cast_that_floors_a_fraction_to_zero_reads_as_a_reduction() -> None:
+    # The zero guard stripped the cast without reading its target, so it saw
+    # the inner 0.4 and vouched for it. `CAST(0.4 AS bigint)` is 0, and a key
+    # multiplied by it puts a 1000-row spine in one group while the gate
+    # quoted the full 1000.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for zero in (
+        "CAST(0.4 AS bigint)",
+        "CAST(0.49 AS int)",
+        "TRY_CAST(0.4 AS bigint)",
+        "-CAST(0.4 AS bigint)",
+        "CAST(0.4 AS decimal(10,0))",
+        "CAST(0.4 AS decimal)",
+        "CAST(CAST(0.4 AS bigint) AS double)",
+    ):
+        assert key_fanout(f"a.x * {zero}") == 1, zero
+    # Trino rounds half away from zero rather than truncating, so 0.5 reaches
+    # 1 and still shifts every value apart — as do a whole number under an
+    # integral target and any literal under a fractional one.
+    for nonzero in (
+        "CAST(2 AS bigint)",
+        "CAST(1.4 AS bigint)",
+        "CAST(0.5 AS int)",
+        "CAST(-0.6 AS bigint)",
+        "CAST(2.5 AS double)",
+        "CAST(0.4 AS decimal(10,1))",
+        "CAST(-2.5 AS double)",
+    ):
+        assert key_fanout(f"a.x * {nonzero}") == 1000, nonzero
+
+
+def test_a_char_cast_reads_as_a_reduction_at_every_width() -> None:
+    # CHAR is a fixed width in Trino: a value wider than it is truncated, and
+    # the guard cannot know how wide a spine's values run. The length guard
+    # only read `target.expressions`, which a bare CAST(x AS char) — CHAR(1)
+    # in Trino, and 9 groups over 8,760 rows — leaves empty, so the gate
+    # quoted the whole 8,760.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 8760)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for key in (
+        "CAST(a.x AS char)",
+        "CAST(a.x AS char(1))",
+        "CAST(a.x AS char(20))",
+        "CAST(a.x AS nchar)",
+        "CAST(a.x AS nchar(20))",
+        "TRY_CAST(a.x AS char)",
+    ):
+        assert key_fanout(key) == 1, key
+    # An unbounded VARCHAR has no width to truncate at, so it still holds
+    # every value apart and the spine it keys keeps its multiplier.
+    assert key_fanout("CAST(a.x AS varchar)") == 8760
+
+    def refused(key: str) -> bool:
+        return unpriceable(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 8760)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    # Charging no multiplier holds the spine to what a collapsing scope may
+    # invent, so the bare spelling is refused exactly where CAST(x AS char(1))
+    # already was — the same query, and it had been quoted at 8,760.
+    assert refused("CAST(a.x AS char)")
+    assert refused("CAST(a.x AS char(1))")
+    assert not refused("CAST(a.x AS varchar)")
+
+
+def test_a_chain_of_casts_rounds_at_each_scale_in_turn() -> None:
+    # One flag over the whole chain cannot say what a chain evaluates to:
+    # each cast rounds at its own scale, and the next one rounds the value
+    # the last already rounded. `CAST(CAST(0.45 AS decimal(10,1)) AS bigint)`
+    # is 0.45 -> 0.5 -> 1 on Trino 476, so the key keeps every value apart,
+    # but a chain holding one rounding target read as "under half, therefore
+    # zero" and deleted the multiplier — quoting 1 against a real 1000.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for nonzero in (
+        # Measured on Trino 476: 1, and 1000 distinct products over the spine.
+        "CAST(CAST(0.45 AS decimal(10,1)) AS bigint)",
+        "CAST(CAST(CAST(0.449 AS decimal(10,2)) AS decimal(10,1)) AS bigint)",
+        "CAST(CAST(0.6 AS bigint) AS double)",
+        "CAST(CAST(0.5 AS real) AS bigint)",
+        "CAST(CAST(-0.45 AS decimal(10,1)) AS bigint)",
+        "-CAST(CAST(0.45 AS decimal(10,1)) AS bigint)",
+        "TRY_CAST(CAST(0.45 AS decimal(10,1)) AS bigint)",
+    ):
+        assert key_fanout(f"a.x * {nonzero}") == 1000, nonzero
+    for zero in (
+        # A float stage rounds nothing, so 0.4 is still 0.4 when the bigint
+        # takes it to 0; and a second whole-number stage cannot revive a
+        # value the first one already flattened.
+        "CAST(CAST(0.4 AS double) AS bigint)",
+        "CAST(CAST(0.44 AS decimal(10,1)) AS bigint)",
+        "CAST(CAST(0.4 AS bigint) AS decimal(10,1))",
+        "CAST(CAST(CAST(0.4 AS decimal(10,2)) AS decimal(10,1)) AS bigint)",
+    ):
+        assert key_fanout(f"a.x * {zero}") == 1, zero
+
+
+def test_a_single_cast_rounds_half_away_from_zero() -> None:
+    # Each row pinned against Trino 476: an integer target and a decimal one
+    # with a stated scale both round HALF_UP, a bare DECIMAL is DECIMAL(38,0)
+    # and rounds the same, and a float target leaves the literal alone.
+    table = "tpch.sf1.orders o"
+
+    def key_fanout(key: str) -> int:
+        return fanout(
+            f"SELECT o.orderkey, d.k FROM {table} CROSS JOIN "
+            f"(SELECT {key} AS k FROM UNNEST(sequence(1, 1000)) AS a(x) "
+            f"GROUP BY {key}) d"
+        )
+
+    for spelling, trino in (
+        ("CAST(0.5 AS int)", 1),
+        ("CAST(0.49 AS int)", 0),
+        ("CAST(-0.5 AS bigint)", -1),
+        ("CAST(2.5 AS bigint)", 3),
+        ("CAST(-2.5 AS bigint)", -3),
+        ("CAST(0.4 AS bigint)", 0),
+        ("CAST(0.4 AS decimal)", 0),
+        ("CAST(0.4 AS decimal(10,1))", 0),  # 0.4, which is not zero
+        ("CAST(-0.45 AS decimal(10,1))", 0),  # -0.5, which is not zero
+        ("CAST(0.4 AS double)", 0),  # 0.4, which is not zero
+    ):
+        # Only a multiplier that evaluates to exactly zero merges the spine.
+        zero = spelling in ("CAST(0.49 AS int)", "CAST(0.4 AS bigint)")
+        zero = zero or spelling == "CAST(0.4 AS decimal)"
+        expected = 1 if zero else 1000
+        assert key_fanout(f"a.x * {spelling}") == expected, (spelling, trino)
