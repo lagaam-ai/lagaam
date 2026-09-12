@@ -61,6 +61,11 @@ observation only, unusable pre-execution. This plan reads the pruned counters.
 anyway.** An unfiltered `SELECT ... LIMIT 10` prunes 30 of 31 segments by limit,
 and real execution confirms it (`numSegmentsProcessed: 1`, `numDocsScanned: 10`).
 That is a genuine bound on this query, and charging one segment for it is sound.
+Measured on the engine that actually runs the query, too: the same selection under
+`useMultistageEngine=true` reports `numSegmentsProcessed: 1`,
+`numSegmentsPrunedByLimit: 30`, `numDocsScanned: 10` — the multi-stage engine
+applies the same limit pruning, so the single-stage oracle does not over-prune for it.
+A time-filtered selection under the multi-stage engine likewise processed 3 of 31.
 
 **The largest-k bound is real and tight.** `airlineStats` segment docs sorted
 descending are `[422, 409, 403, ...]`, summing to 9,746 over 31 segments. For the
