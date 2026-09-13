@@ -33,7 +33,7 @@ def check_tables_allowed(
 
     # Declared names per WITH clause, built once: a query can carry thousands
     # of CTEs, and rescanning them for every table reference is quadratic.
-    scopes: dict[int, dict[str, exp.CTE]] = {}
+    scopes: dict[int, dict[str, int]] = {}
     for table in tree.find_all(exp.Table):
         # A bare reference to a CTE is a local alias, not a base table — but
         # only where that CTE is in scope. A tree-wide name set lets a CTE
@@ -57,17 +57,19 @@ def check_tables_allowed(
             )
 
 
-def _cte_in_scope(
-    table: exp.Table, scopes: dict[int, dict[str, exp.CTE]]
-) -> bool:
-    """Is this bare name declared by a WITH clause enclosing it?
+def _cte_in_scope(table: exp.Table, scopes: dict[int, dict[str, int]]) -> bool:
+    """Is this bare name declared by a WITH clause enclosing it, and earlier?
 
     Walks outward from the reference, so a CTE only vouches for names inside
-    the query that declares it. A CTE also cannot vouch for a reference in
-    its own definition, which is where a self-referencing name resolves to
-    the base table instead.
+    the query that declares it. Within one WITH list, declaration order is
+    what binds: an item sees only the items before it, so a bare name in an
+    earlier item that matches a later item's name is the physical table the
+    engine resolves, not the CTE. A CTE binds its own name inside its own
+    body only when the WITH is RECURSIVE.
     """
     name = table.name.lower()
+    below: exp.Expr | None = None
+    prev: exp.Expr | None = None
     node: exp.Expr | None = table
     while node is not None:
         # sqlglot spells the arg "with_" on Query nodes; accept both so a
@@ -77,26 +79,26 @@ def _cte_in_scope(
             declared = scopes.get(id(with_clause))
             if declared is None:
                 declared = {
-                    cte.alias_or_name.lower(): cte
-                    for cte in reversed(with_clause.expressions)
+                    cte.alias_or_name.lower(): index
+                    for index, cte in enumerate(with_clause.expressions)
                 }
                 scopes[id(with_clause)] = declared
-            cte = declared.get(name)
-            if cte is not None:
-                # Only a RECURSIVE CTE binds its own name inside its body.
-                if with_clause.args.get("recursive") or not _within(table, cte):
+            declared_at = declared.get(name)
+            if declared_at is not None:
+                # Reached via the WITH means the reference sits in a sibling
+                # CTE's body; reached any other way it sits in the query body.
+                here = (
+                    below.index
+                    if prev is with_clause and isinstance(below, exp.CTE)
+                    else None
+                )
+                if (
+                    here is None
+                    or declared_at < here
+                    or (declared_at == here and with_clause.args.get("recursive"))
+                ):
                     return True
-        node = node.parent
-    return False
-
-
-def _within(node: exp.Expr, ancestor: exp.Expr) -> bool:
-    """Does ``node`` sit inside ``ancestor``'s subtree?"""
-    walk: exp.Expr | None = node
-    while walk is not None:
-        if walk is ancestor:
-            return True
-        walk = walk.parent
+        below, prev, node = prev, node, node.parent
     return False
 
 
