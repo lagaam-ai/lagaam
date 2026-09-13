@@ -14,6 +14,7 @@ is the whole contract: this module never returns a figure it cannot defend.
 """
 
 from collections.abc import Iterable, Sequence
+from typing import Any
 
 from lagaam.adapters.pinot.metadata import TableFacts
 from lagaam.core.models import CostEstimate
@@ -117,3 +118,44 @@ def _total(values: Iterable[int | None]) -> int | None:
             return None
         total += value
     return total
+
+
+# Every counter Pinot may report a prune under. They are not additive: the
+# server-side total and its by-value / by-limit breakdowns all appear at once.
+_PRUNED_COUNTERS = (
+    "numSegmentsPrunedByBroker",
+    "numSegmentsPrunedByServer",
+    "numSegmentsPrunedByValue",
+    "numSegmentsPrunedByLimit",
+    "numSegmentsPrunedInvalid",
+)
+
+
+def surviving_segments(explain_json: Any) -> int | None:
+    """How many segments survive the predicate, from a single-stage EXPLAIN.
+
+    Measured on 1.5.1, the pruning counters nest rather than add: a time
+    filter reported ByServer 28 with ByValue 28 of 31 segments, so summing
+    would claim 56 pruned and quote a negative scan. The largest single
+    counter is exact where they nest and conservative where they do not.
+
+    None means "no oracle" — the caller then charges every segment.
+    """
+    if not isinstance(explain_json, dict):
+        return None
+    if explain_json.get("exceptions"):
+        return None
+    # EXPLAIN must plan without running; anything scanned means we misread it.
+    scanned = explain_json.get("numDocsScanned")
+    if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned != 0:
+        return None
+    queried = explain_json.get("numSegmentsQueried")
+    if isinstance(queried, bool) or not isinstance(queried, int) or queried <= 0:
+        return None
+    pruned = 0
+    for key in _PRUNED_COUNTERS:
+        value = explain_json.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        pruned = max(pruned, value)
+    return max(1, queried - min(pruned, queried))
