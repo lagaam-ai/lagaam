@@ -31,6 +31,13 @@ def test_card_warns_that_time_filters_are_what_prune_segments() -> None:
     assert any("time column" in rule for rule in PINOT_DIALECT_CARD.rules)
 
 
+def test_card_explains_what_an_array_type_in_a_grounding_card_means() -> None:
+    # describe_table renders a multi-value column as INT[] or STRING[]; the
+    # card is where the agent learns that is not a scalar it can compare to.
+    assert any("[]" in rule for rule in PINOT_DIALECT_CARD.rules)
+    assert any("multi-value" in rule for rule in PINOT_DIALECT_CARD.rules)
+
+
 def test_measured_pinot_aggregation_survives_the_generic_dialect() -> None:
     # Measurements section 12: this exact shape re-rendered and executed on both engines.
     sql = validate_query(

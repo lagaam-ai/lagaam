@@ -17,6 +17,7 @@ PINOT_DIALECT_CARD = DialectCard(
         "Time columns are epoch numbers: convert with DATETIMECONVERT, DATETRUNC or ToDateTime",
         "Always filter on the table's time column — that is what prunes segments",
         "Prefer DISTINCTCOUNTHLL(x) over DISTINCTCOUNT(x) on large tables",
+        "A type ending in [] is a multi-value column: use ARRAYLENGTH/ARRAY functions, not scalar comparisons",
         "Name columns explicitly; SELECT * is rejected",
         "Every query needs a LIMIT; one is added if missing",
         "Joins run on the multi-stage engine and are bounded by a row limit",

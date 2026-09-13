@@ -88,5 +88,17 @@ def _columns(schema_json: Any) -> list[ColumnInfo]:
             name = spec.get("name")
             data_type = spec.get("dataType")
             if isinstance(name, str) and name and isinstance(data_type, str):
-                columns.append(ColumnInfo(name=name, type=data_type))
+                columns.append(ColumnInfo(name=name, type=_column_type(spec, data_type)))
     return columns
+
+
+def _column_type(spec: dict[str, Any], data_type: str) -> str:
+    """`INT[]` for a multi-value column, the bare element type otherwise.
+
+    Measured: a singleValueField=false column comes back as INT_ARRAY with an
+    array cell, so a scalar type here invites a comparison that never matches.
+    """
+    # Only an explicit false is multi-value; an unreadable flag stays scalar.
+    if spec.get("singleValueField") is False:
+        return f"{data_type}[]"
+    return data_type

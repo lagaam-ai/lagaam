@@ -100,6 +100,25 @@ async def test_the_listing_and_the_card_agree_on_the_spelling(
     assert card.table in tables
 
 
+async def test_a_multi_value_column_is_grounded_as_an_array(
+    engine: PinotEngine,
+) -> None:
+    # The broker answers these as INT_ARRAY/STRING_ARRAY with array cells, so
+    # the card must not describe them as scalars the agent can compare.
+    card = await engine.describe_table("pinot", "default", "airlineStats")
+    by_name = {c.name: c.type for c in card.columns}
+    assert by_name["DivAirportIDs"] == "INT[]"
+    assert by_name["DivAirports"] == "STRING[]"
+    assert by_name["Carrier"] == "STRING"
+
+    result = await engine.execute(
+        "SELECT DivAirportIDs FROM pinot.default.airlineStats LIMIT 1",
+        max_rows=1,
+        timeout_seconds=30.0,
+    )
+    assert isinstance(result.rows[0][0], list)
+
+
 async def test_a_table_that_does_not_exist_says_so(engine: PinotEngine) -> None:
     with pytest.raises(TableNotFoundError):
         await engine.describe_table("pinot", "default", "nosuchtable")

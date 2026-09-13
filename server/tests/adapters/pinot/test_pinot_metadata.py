@@ -108,6 +108,87 @@ def test_table_schema_echoes_the_controllers_table_spelling() -> None:
     assert card.row_estimate == 9746
 
 
+# Every singleValueField=false field in the live airlineStats schema.
+_MULTI_VALUE = {
+    "DivAirportIDs": "INT[]",
+    "DivAirportSeqIDs": "INT[]",
+    "DivAirports": "STRING[]",
+    "DivLongestGTimes": "INT[]",
+    "DivTailNums": "STRING[]",
+    "DivTotalGTimes": "LONG[]",
+    "DivWheelsOffs": "INT[]",
+    "DivWheelsOns": "INT[]",
+    "RandomAirports": "STRING[]",
+}
+
+
+def test_a_multi_value_column_is_described_as_an_array() -> None:
+    # Measured: SELECT DivAirportIDs ... LIMIT 1 returns an array cell with
+    # columnDataTypes ["INT_ARRAY"], so describing it as INT invites a scalar
+    # comparison that can never match.
+    card = table_schema(
+        "pinot",
+        "default",
+        "airlineStats",
+        load("schema-airlineStats.json"),
+        load("metadata-airlineStats.json"),
+        load("tableconfig-airlineStats.json"),
+    )
+    by_name = {c.name: c.type for c in card.columns}
+    for name, expected in _MULTI_VALUE.items():
+        assert by_name[name] == expected
+
+
+def test_a_single_value_column_keeps_its_scalar_type() -> None:
+    card = table_schema(
+        "pinot",
+        "default",
+        "airlineStats",
+        load("schema-airlineStats.json"),
+        load("metadata-airlineStats.json"),
+        load("tableconfig-airlineStats.json"),
+    )
+    by_name = {c.name: c.type for c in card.columns}
+    assert by_name["Carrier"] == "STRING"
+    assert by_name["ActualElapsedTime"] == "INT"
+    assert by_name["DaysSinceEpoch"] == "INT"
+    assert not any(
+        t.endswith("[]") for n, t in by_name.items() if n not in _MULTI_VALUE
+    )
+
+
+def test_the_element_type_survives_the_array_marker() -> None:
+    schema_json = {
+        "dimensionFieldSpecs": [
+            {"name": "tags", "dataType": "STRING", "singleValueField": False},
+            {"name": "ids", "dataType": "LONG", "singleValueField": False},
+        ]
+    }
+    card = table_schema("pinot", "default", "t", schema_json, {}, {})
+    assert [c.type for c in card.columns] == ["STRING[]", "LONG[]"]
+
+
+def test_an_explicit_single_value_flag_is_still_a_scalar() -> None:
+    schema_json = {
+        "dimensionFieldSpecs": [
+            {"name": "a", "dataType": "STRING", "singleValueField": True},
+            {"name": "b", "dataType": "STRING"},
+        ]
+    }
+    card = table_schema("pinot", "default", "t", schema_json, {}, {})
+    assert [c.type for c in card.columns] == ["STRING", "STRING"]
+
+
+def test_a_flag_that_is_not_a_boolean_is_read_as_a_scalar() -> None:
+    # Only an explicit false means multi-value; a shape we cannot read must
+    # not invent an array type the engine will not agree with.
+    schema_json = {
+        "dimensionFieldSpecs": [{"name": "a", "dataType": "STRING", "singleValueField": "no"}]
+    }
+    card = table_schema("pinot", "default", "t", schema_json, {}, {})
+    assert [c.type for c in card.columns] == ["STRING"]
+
+
 def test_pinot_has_no_column_comments() -> None:
     card = table_schema(
         "pinot",
