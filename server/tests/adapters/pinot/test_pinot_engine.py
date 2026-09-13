@@ -349,29 +349,6 @@ async def test_describe_table_sends_the_database_as_the_header() -> None:
     assert seen == ["default", "default", "default", "default"]
 
 
-async def test_estimate_cost_is_honest_that_it_cannot_price_yet() -> None:
-    # U11 builds the quotation from segment metadata. Until then there is no
-    # number, so confidence is low and the default budget denies the query.
-    estimate = await make_engine().estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
-    )
-    assert estimate.confidence == "low"
-    assert estimate.scanned_bytes is None
-    assert estimate.row_estimate is None
-    assert estimate.max_intermediate_rows is None
-
-
-async def test_the_interim_estimate_is_denied_by_the_default_budget() -> None:
-    from lagaam.core.budget import QueryBudget, enforce_budget
-    from lagaam.core.errors import BudgetExceededError
-
-    estimate = await make_engine().estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
-    )
-    with pytest.raises(BudgetExceededError, match="could not be estimated"):
-        enforce_budget(estimate, QueryBudget.from_env())
-
-
 async def test_from_env_reads_the_pinot_variables(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

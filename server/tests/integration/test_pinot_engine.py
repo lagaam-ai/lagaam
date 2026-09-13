@@ -10,18 +10,7 @@ from lagaam.adapters.pinot.client import PinotClient
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.adapters.pinot.names import two_part_sql
 from lagaam.adapters.pinot.response import result_failure
-from lagaam.core.budget import (
-    DEFAULT_MAX_INTERMEDIATE_ROWS,
-    DEFAULT_MAX_SCAN_BYTES,
-    DEFAULT_TIMEOUT_SECONDS,
-    QueryBudget,
-    enforce_budget,
-)
-from lagaam.core.errors import (
-    BudgetExceededError,
-    QueryFailedError,
-    TableNotFoundError,
-)
+from lagaam.core.errors import QueryFailedError, TableNotFoundError
 from lagaam.core.ports import QueryEngine
 from lagaam.core.safety import validate_query
 
@@ -359,24 +348,6 @@ async def test_the_adapter_neither_adds_nor_removes_a_limit(
     )
     assert result.row_count == 20
     assert result.truncated is True
-
-
-async def test_estimate_cost_denies_until_the_quotation_lands(
-    engine: PinotEngine,
-) -> None:
-    # U11 builds the quotation. Until then Pinot cannot be priced, so the
-    # default budget denies every query — and says so, rather than admitting it.
-    estimate = await engine.estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
-    )
-    assert estimate.confidence == "low"
-    with pytest.raises(BudgetExceededError, match="could not be estimated"):
-        budget = QueryBudget(
-            max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
-            max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
-            timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-        )
-        enforce_budget(estimate, budget)
 
 
 async def test_a_time_filter_quotes_less_than_no_filter(pinot_ready: None) -> None:
