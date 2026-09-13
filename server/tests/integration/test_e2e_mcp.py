@@ -19,6 +19,10 @@ _PINOT_GRANT = AgentIdentity(
     name="lagaam-e2e", allowed_tables=frozenset({"pinot.default.airlinestats"})
 )
 
+_BASEBALL_GRANT = AgentIdentity(
+    name="lagaam-e2e", allowed_tables=frozenset({"pinot.default.baseballstats"})
+)
+
 
 def _pinot_engine() -> PinotEngine:
     return PinotEngine(
@@ -109,3 +113,61 @@ async def test_query_data_on_pinot_is_denied_until_the_quotation_lands(
             block.text for block in answer.content if hasattr(block, "text")
         )
         assert "could not be estimated" in text
+
+
+async def test_a_later_cte_cannot_smuggle_an_ungranted_pinot_table(
+    pinot_ready: None,
+) -> None:
+    """A CTE declared after a reference must not vouch for that bare name.
+
+    The grant names baseballStats only, so `airlineStats` inside the first CTE
+    is the physical table the broker would resolve. No scan dimensions are set,
+    so the low-confidence denial cannot fire: this reaches the allowlist, which
+    fails closed on the bare name rather than letting the later CTE vouch.
+    """
+    budget = QueryBudget(timeout_seconds=10)
+    async with lagaam_client(
+        _pinot_engine(), budget=budget, identity=_BASEBALL_GRANT
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": (
+                    "WITH first AS (SELECT Carrier FROM airlineStats LIMIT 1),\n"
+                    "     airlineStats AS (SELECT playerName AS Carrier "
+                    "FROM pinot.default.baseballStats LIMIT 1)\n"
+                    "SELECT Carrier FROM first LIMIT 1"
+                )
+            },
+        )
+        assert answer.isError
+        text = " ".join(
+            block.text for block in answer.content if hasattr(block, "text")
+        )
+        # Both phrasings are TableAccessDeniedError's; neither is the budget's.
+        assert "cannot be checked against your grant" in text
+        assert "could not be estimated" not in text
+
+
+async def test_a_cte_declared_before_its_reference_still_grounds_on_pinot(
+    pinot_ready: None,
+) -> None:
+    """The control: the legitimate ordering of the same query must still run."""
+    budget = QueryBudget(timeout_seconds=10)
+    async with lagaam_client(
+        _pinot_engine(), budget=budget, identity=_BASEBALL_GRANT
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": (
+                    "WITH airlineStats AS (SELECT playerName AS Carrier "
+                    "FROM pinot.default.baseballStats LIMIT 1),\n"
+                    "     first AS (SELECT Carrier FROM airlineStats LIMIT 1)\n"
+                    "SELECT Carrier FROM first LIMIT 1"
+                )
+            },
+        )
+        assert not answer.isError
+        assert answer.structuredContent is not None
+        assert len(answer.structuredContent["rows"]) == 1
