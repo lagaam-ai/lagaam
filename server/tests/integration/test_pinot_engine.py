@@ -8,6 +8,7 @@ import pytest
 
 from lagaam.adapters.pinot.client import PinotClient
 from lagaam.adapters.pinot.engine import PinotEngine
+from lagaam.adapters.pinot.names import two_part_sql
 from lagaam.adapters.pinot.response import result_failure
 from lagaam.core.budget import (
     DEFAULT_MAX_INTERMEDIATE_ROWS,
@@ -27,11 +28,15 @@ from lagaam.core.safety import validate_query
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-def engine(pinot_ready: None) -> PinotEngine:
+def _engine() -> PinotEngine:
     return PinotEngine(
         controller_url="http://localhost:9000", broker_url="http://localhost:8000"
     )
+
+
+@pytest.fixture
+def engine(pinot_ready: None) -> PinotEngine:
+    return _engine()
 
 
 def test_pinot_engine_satisfies_the_port(engine: PinotEngine) -> None:
@@ -372,3 +377,71 @@ async def test_estimate_cost_denies_until_the_quotation_lands(
             timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
         )
         enforce_budget(estimate, budget)
+
+
+async def test_a_time_filter_quotes_less_than_no_filter(pinot_ready: None) -> None:
+    engine = _engine()
+    unfiltered = await engine.estimate_cost(
+        "SELECT Carrier, count(*) FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 10"
+    )
+    filtered = await engine.estimate_cost(
+        "SELECT Carrier, count(*) FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 10"
+    )
+    assert unfiltered.row_estimate is not None
+    assert filtered.row_estimate is not None
+    assert filtered.row_estimate < unfiltered.row_estimate
+    assert unfiltered.scanned_bytes is not None
+    assert filtered.scanned_bytes is not None
+    assert filtered.scanned_bytes < unfiltered.scanned_bytes
+    assert filtered.confidence == "high"
+
+
+async def test_the_quote_is_never_under_what_execution_scanned(
+    pinot_ready: None,
+) -> None:
+    """The whole contract: a bound, never a guess."""
+    sql = (
+        "SELECT Carrier, count(*) FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 10"
+    )
+    engine = _engine()
+    estimate = await engine.estimate_cost(sql)
+    body = await engine._client.broker_query(
+        two_part_sql(sql, PinotEngine.CATALOG), "useMultistageEngine=true"
+    )
+    scanned = body["numDocsScanned"]
+    assert scanned > 0
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate >= scanned
+
+
+async def test_a_cross_join_quotes_the_product_of_both_tables(
+    pinot_ready: None,
+) -> None:
+    engine = _engine()
+    estimate = await engine.estimate_cost(
+        "SELECT count(*) FROM pinot.default.airlineStats a, "
+        "pinot.default.baseballStats b LIMIT 10"
+    )
+    airline = await engine.describe_table("pinot", "default", "airlineStats")
+    baseball = await engine.describe_table("pinot", "default", "baseballStats")
+    assert airline.row_estimate is not None
+    assert baseball.row_estimate is not None
+    assert (
+        estimate.max_intermediate_rows
+        == airline.row_estimate * baseball.row_estimate
+    )
+    assert estimate.max_intermediate_rows is not None
+    assert estimate.max_intermediate_rows > 900_000_000
+
+
+async def test_an_equi_join_is_not_charged_the_product(pinot_ready: None) -> None:
+    engine = _engine()
+    estimate = await engine.estimate_cost(
+        "SELECT count(*) FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.baseballStats b ON a.Carrier = b.teamID LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows is not None
+    assert estimate.max_intermediate_rows < 9746 * 97889
