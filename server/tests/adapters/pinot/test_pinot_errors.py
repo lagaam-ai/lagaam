@@ -72,6 +72,42 @@ def test_the_single_stage_timeout_is_a_time_limit() -> None:
     )
 
 
+def test_the_oversized_response_503_is_the_only_one_that_reads_as_too_large() -> None:
+    # QueryScheduler reuses QUERY_CANCELLATION (503) for the size refusal, so
+    # the measured message is the only thing separating the two meanings.
+    code, message = first_exception(
+        load("query-options-matrix.json")["maxQueryResponseSizeBytes=100"]
+    )
+    assert code == 503
+    assert "exceeds threshold" in message
+    assert classify(code, message) == "RESPONSE_TOO_LARGE"
+
+
+def test_a_cancelled_leaf_is_not_blamed_on_the_query() -> None:
+    # LeafOperator emits 503 for a cancellation; blaming the query would tell
+    # the agent to shrink a result that was never too large.
+    assert not is_self_correctable(
+        classify(503, "Cancelled while waiting for leaf results")
+    )
+
+
+def test_a_bare_cancellation_503_is_not_self_correctable() -> None:
+    assert not is_self_correctable(classify(503, "QueryCancellationError"))
+
+
+def test_the_serialized_size_prefix_alone_reads_as_too_large() -> None:
+    assert classify(503, "Serialized query response size 5190 is over budget") == (
+        "RESPONSE_TOO_LARGE"
+    )
+
+
+def test_an_access_denial_is_a_permission_problem_the_agent_can_act_on() -> None:
+    assert classify(180, "AccessDenied: no access to table airlineStats") == (
+        "PERMISSION_DENIED"
+    )
+    assert is_self_correctable("PERMISSION_DENIED")
+
+
 def test_other_validation_errors_are_not_supported_rather_than_a_guess() -> None:
     assert classify(700, "QueryValidationError: something else entirely") == (
         "NOT_SUPPORTED"

@@ -513,6 +513,34 @@ async def test_a_broker_message_never_reaches_the_agent() -> None:
     assert "786551596000000039" not in str(caught.value)
 
 
+async def test_a_cancelled_query_is_an_engine_error_not_an_oversized_result() -> None:
+    # Pinot reuses errorCode 503 for a cancellation; telling the agent to
+    # shrink its result would send it chasing a problem it does not have.
+    body = dict(load("agg-groupby.json"))
+    body["exceptions"] = [
+        {"message": "Cancelled while waiting for leaf results", "errorCode": 503}
+    ]
+    with pytest.raises(EngineError):
+        await broker_engine(replying(body)).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
+async def test_an_oversized_response_503_is_still_teachable() -> None:
+    body = dict(load("agg-groupby.json"))
+    body["exceptions"] = [
+        {
+            "message": "Serialized query response size 5190 exceeds threshold 100 "
+            "for requestId 786551596000000039 from broker Broker_172.17.0.2_8000",
+            "errorCode": 503,
+        }
+    ]
+    with pytest.raises(QueryFailedError, match="too large to send back"):
+        await broker_engine(replying(body)).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+
+
 async def test_an_unmapped_failure_is_the_engines_fault_not_the_querys() -> None:
     body = dict(load("agg-groupby.json"))
     body["exceptions"] = [{"message": "who knows", "errorCode": 999}]
