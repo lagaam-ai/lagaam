@@ -550,6 +550,42 @@ async def test_an_unmapped_failure_is_the_engines_fault_not_the_querys() -> None
         )
 
 
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_query_is_the_agents_to_fix_not_an_outage(status: int) -> None:
+    # An outage tells the agent to retry unchanged, which never succeeds here.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied for table airlineStats")
+
+    with pytest.raises(QueryFailedError, match="refused access") as caught:
+        await broker_engine(handler).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+        )
+    assert "airlineStats" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_refused_controller_credentials_are_ours_to_fix_not_the_agents(
+    status: int,
+) -> None:
+    # Grounding is the server's own connection, so a refusal there is an
+    # operator's problem; the agent cannot rewrite its way out of it.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied for table airlineStats")
+
+    with pytest.raises(EngineError, match="credentials were refused") as caught:
+        await make_engine(handler).describe_table("pinot", "default", "airlineStats")
+    assert "airlineStats" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_refused_credentials_stop_list_catalogs_too(status: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied")
+
+    with pytest.raises(EngineError, match="credentials were refused"):
+        await make_engine(handler).list_catalogs()
+
+
 async def test_an_unreachable_broker_is_an_engine_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("refused", request=request)

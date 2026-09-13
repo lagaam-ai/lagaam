@@ -14,6 +14,7 @@ import httpx
 
 from lagaam.adapters.pinot.client import (
     PinotClient,
+    PinotForbidden,
     PinotResponseTooLarge,
     PinotTransportError,
 )
@@ -34,6 +35,9 @@ from lagaam.core.models import (
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
 
 _UNREACHABLE = "the query engine is not reachable right now"
+
+# Our own words: the refusal body names tables the agent may not be told about.
+_CREDENTIALS_REFUSED = "Lagaam's Pinot credentials were refused"
 
 # Pinot's namespace is database.table and `default` always exists; 1.5.1 does
 # expose GET /databases, but an older controller answering 404 still grounds.
@@ -109,6 +113,8 @@ class PinotEngine:
     async def list_catalogs(self) -> CatalogMetadata:
         try:
             databases = await self._databases()
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc
         schemas: list[SchemaInfo] = []
@@ -123,6 +129,9 @@ class PinotEngine:
             attempted += 1
             try:
                 body = await self._client.controller_get("/tables", database=database)
+            except PinotForbidden as exc:
+                # A refusal is the same for every database: never a skip.
+                raise EngineError(_CREDENTIALS_REFUSED) from exc
             except PinotTransportError:
                 # One broken database must not cost the grounding for healthy ones.
                 continue
@@ -166,6 +175,8 @@ class PinotEngine:
             config_json = await self._client.controller_get(
                 f"/tables/{part}", database=schema
             )
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc
         return table_schema(
@@ -204,6 +215,10 @@ class PinotEngine:
         except PinotResponseTooLarge as exc:
             raise QueryFailedError(
                 hint_for_engine_error("RESPONSE_TOO_LARGE")
+            ) from exc
+        except PinotForbidden as exc:
+            raise QueryFailedError(
+                hint_for_engine_error("PERMISSION_DENIED")
             ) from exc
         except PinotTransportError as exc:
             raise EngineError(_UNREACHABLE) from exc

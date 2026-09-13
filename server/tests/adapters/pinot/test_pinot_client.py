@@ -13,6 +13,7 @@ import pytest
 
 from lagaam.adapters.pinot.client import (
     PinotClient,
+    PinotForbidden,
     PinotResponseTooLarge,
     PinotTransportError,
 )
@@ -74,6 +75,47 @@ async def test_controller_500_is_a_transport_error() -> None:
 
     with pytest.raises(PinotTransportError):
         await make_client(handler).controller_get("/tables")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_broker_query_is_a_denial_not_an_outage(status: int) -> None:
+    # Both request handlers throw FORBIDDEN for a table-access refusal, and
+    # 401 comes from the auth filter; neither means the broker is down.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied for table airlineStats")
+
+    with pytest.raises(PinotForbidden):
+        await make_client(handler).broker_query("SELECT 1", "")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_broker_query_never_carries_the_response_body(
+    status: int,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied for table airlineStats")
+
+    with pytest.raises(PinotForbidden) as caught:
+        await make_client(handler).broker_query("SELECT 1", "")
+    assert "airlineStats" not in str(caught.value)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_refused_controller_get_is_a_denial_not_an_outage(status: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, text="Permission denied for table airlineStats")
+
+    with pytest.raises(PinotForbidden) as caught:
+        await make_client(handler).controller_get("/tables")
+    assert "airlineStats" not in str(caught.value)
+
+
+async def test_a_broker_500_is_still_a_transport_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    with pytest.raises(PinotTransportError):
+        await make_client(handler).broker_query("SELECT 1", "")
 
 
 async def test_broker_query_posts_sql_and_options() -> None:

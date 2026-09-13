@@ -22,6 +22,15 @@ class PinotTransportError(Exception):
     """
 
 
+class PinotForbidden(Exception):
+    """Pinot refused the credentials or the table: a 401 or a 403.
+
+    Adapter-private like PinotTransportError, and deliberately body-free: the
+    refusal text names tables the caller may not be allowed to learn about.
+    A refusal is not an outage — retrying it unchanged never succeeds.
+    """
+
+
 class PinotResponseTooLarge(Exception):
     """The broker's answer outgrew the byte ceiling this client will read.
 
@@ -38,6 +47,9 @@ class _NotFound:
 
 # Anything that could reshape a URL path, plus whitespace a name may not carry.
 _ILLEGAL_PART_CHARS: Final = frozenset("/.\\?#%")
+
+# 401 from the auth filter, 403 from either request handler's table refusal.
+_REFUSED_STATUSES: Final = frozenset({401, 403})
 
 
 class PinotClient:
@@ -97,6 +109,8 @@ class PinotClient:
             raise PinotTransportError(f"controller GET {path} failed") from exc
         if response.status_code == 404:
             return self.NotFound
+        if response.status_code in _REFUSED_STATUSES:
+            raise PinotForbidden(f"controller GET {path} was refused")
         if response.status_code >= 400:
             raise PinotTransportError(
                 f"controller GET {path} returned {response.status_code}"
@@ -121,13 +135,15 @@ class PinotClient:
                 json={"sql": sql, "queryOptions": options},
                 timeout=timeout_seconds if timeout_seconds is not None else httpx.USE_CLIENT_DEFAULT,
             ) as response:
+                if response.status_code in _REFUSED_STATUSES:
+                    raise PinotForbidden("broker query was refused")
                 if response.status_code >= 400:
                     raise PinotTransportError(
                         f"broker query returned {response.status_code}"
                     )
                 self._check_declared_size(response)
                 body = await self._read_capped(response)
-        except PinotResponseTooLarge:
+        except (PinotResponseTooLarge, PinotForbidden):
             # Must not be caught by the httpx.HTTPError handler below.
             raise
         except httpx.HTTPError as exc:
