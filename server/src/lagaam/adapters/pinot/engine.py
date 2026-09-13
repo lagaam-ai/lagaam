@@ -21,8 +21,19 @@ from lagaam.adapters.pinot.client import (
     PinotTransportError,
 )
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
-from lagaam.adapters.pinot.metadata import table_names, table_schema
-from lagaam.adapters.pinot.names import two_part_sql
+from lagaam.adapters.pinot.metadata import (
+    TableFacts,
+    table_facts,
+    table_names,
+    table_schema,
+)
+from lagaam.adapters.pinot.names import (
+    referenced_columns,
+    referenced_tables,
+    two_part_sql,
+)
+from lagaam.adapters.pinot.plan import max_intermediate_rows
+from lagaam.adapters.pinot.quote import quote, surviving_docs, surviving_segments
 from lagaam.adapters.pinot.response import parse_query_result, result_failure
 from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
 from lagaam.core.models import (
@@ -35,6 +46,11 @@ from lagaam.core.models import (
     TableSchema,
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
+from lagaam.core.scans import (
+    generator_fanout,
+    has_unpriceable_shape,
+    scan_counts_saturated,
+)
 
 _UNREACHABLE = "the query engine is not reachable right now"
 
@@ -55,9 +71,30 @@ _OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
 _OPT_MAX_ROWS_IN_WINDOW = "maxRowsInWindow"
 _OPT_MAX_RESPONSE_BYTES = "maxQueryResponseSizeBytes"
 
+# The pruning oracle. Single-stage only: the multi-stage engine reports no
+# pruning counters, and it refuses nothing that would reveal them.
+_EXPLAIN_PRUNING = "EXPLAIN PLAN FOR "
+_EXPLAIN_SHAPE = "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR "
+
 # Backstop only: the broker must hit its own timeoutMs and answer first. Now
 # also the total deadline, so a body arriving in slow chunks cannot outlast it.
 _TIMEOUT_GRACE_SECONDS = 5.0
+
+
+def _plan_cell(body: object) -> str | None:
+    """The PLAN column of a multi-stage EXPLAIN answer: one row, one string."""
+    if not isinstance(body, dict) or body.get("exceptions"):
+        return None
+    result = body.get("resultTable")
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    first = rows[0]
+    if not isinstance(first, list) or len(first) < 2:
+        return None
+    return first[1] if isinstance(first[1], str) else None
 
 
 class PinotEngine:
@@ -213,14 +250,109 @@ class PinotEngine:
         return matches[0]
 
     async def estimate_cost(self, sql: str) -> CostEstimate:
-        """No quotation exists yet — U11 builds it from segment metadata.
+        """An upper bound on what this SQL would scan, synthesised here.
 
-        Pinot 1.5.1 reports no bytes anywhere and a constant rowcount of 100
-        per table scan, so there is nothing honest to return but "unknown",
-        which the default budget denies. Guessing here would admit a query
-        the gate exists to stop.
+        Pinot reports no bytes and a constant rowcount of 100 per scan, so
+        every number below comes from segment metadata plus one honest
+        engine signal: how many segments survive the predicate. A number
+        that cannot be bounded is withheld, and the gate denies on that.
         """
-        return CostEstimate(confidence="low")
+        dialect = PINOT_DIALECT_CARD.sqlglot_dialect
+        # Generators and a saturated read count both break the byte sum in
+        # ways no scaling repairs — don't vouch for a quote at all.
+        if has_unpriceable_shape(sql, dialect) or scan_counts_saturated(sql, dialect):
+            return CostEstimate(confidence="low")
+        two_part = two_part_sql(sql, self.CATALOG)
+        tables = referenced_tables(sql, self.CATALOG)
+        if not tables:
+            return CostEstimate(confidence="low")
+        columns = referenced_columns(sql)
+        try:
+            facts = [
+                (database, await self._table_facts(database, table, columns))
+                for database, table in tables
+            ]
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except PinotTransportError:
+            # A quotation nobody could build is a denial at the gate, which
+            # is the safe answer; an EngineError would read as an outage.
+            return CostEstimate(confidence="low")
+        surviving = await self._surviving(two_part, len(tables))
+        located = [(database, fact, surviving) for database, fact in facts]
+        widest = await self._widest_rows(two_part, located)
+        estimate = quote([(fact, k) for _, fact, k in located], columns, widest)
+        if estimate.max_intermediate_rows is None:
+            return estimate
+        fanout = generator_fanout(sql, dialect)
+        return estimate.model_copy(
+            update={"max_intermediate_rows": estimate.max_intermediate_rows * fanout}
+        )
+
+    async def _table_facts(
+        self, database: str, table: str, columns: frozenset[str] | None
+    ) -> TableFacts:
+        """One table's config, segment metadata and size, from the controller."""
+        part = PinotClient.path_part(table)
+        params: dict[str, str | list[str]] | None = (
+            {"columns": sorted(columns)} if columns else None
+        )
+        config_json = await self._client.controller_get(
+            f"/tables/{part}", database=database
+        )
+        seg_json = await self._client.controller_get(
+            f"/segments/{part}/metadata", params=params, database=database
+        )
+        size_json = await self._client.controller_get(
+            f"/tables/{part}/size", database=database
+        )
+        return table_facts(
+            table,
+            None if config_json is PinotClient.NotFound else config_json,
+            None if seg_json is PinotClient.NotFound else seg_json,
+            None if size_json is PinotClient.NotFound else size_json,
+        )
+
+    async def _surviving(self, two_part: str, table_count: int) -> int | None:
+        """Segments surviving the predicate, or None meaning "charge them all".
+
+        Only ever asked for a single-table query: the single-stage engine
+        refuses a join outright, and it is the only engine that prunes.
+        """
+        if table_count != 1:
+            return None
+        try:
+            body = await self._client.broker_query(f"{_EXPLAIN_PRUNING}{two_part}", "")
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except (PinotTransportError, PinotResponseTooLarge):
+            return None
+        return surviving_segments(body)
+
+    async def _widest_rows(
+        self, two_part: str, tables: list[tuple[str, TableFacts, int | None]]
+    ) -> int | None:
+        """Rows the widest plan node would build, or None if unreadable.
+
+        Keyed as the plan spells a scan's table: [database, table], lowered.
+        """
+        leaves: dict[str, int | None] = {}
+        for database, facts, surviving in tables:
+            leaves[f"{database}.{facts.table}".lower()] = surviving_docs(
+                facts, surviving
+            )
+        try:
+            body = await self._client.broker_query(
+                f"{_EXPLAIN_SHAPE}{two_part}", f"{_OPT_MULTISTAGE}=true"
+            )
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except (PinotTransportError, PinotResponseTooLarge):
+            return None
+        cell = _plan_cell(body)
+        if cell is None:
+            return None
+        return max_intermediate_rows(cell, leaves)
 
     async def execute(
         self, sql: str, max_rows: int, timeout_seconds: float | None = None
