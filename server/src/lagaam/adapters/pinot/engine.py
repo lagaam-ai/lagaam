@@ -157,13 +157,15 @@ class PinotEngine:
         if catalog.lower() != self.CATALOG:
             raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
         try:
-            part = PinotClient.path_part(table)
+            PinotClient.path_part(table)
             PinotClient.path_part(schema)
         except ValueError as exc:
             raise TableNotFoundError(
                 catalog=catalog, schema=schema, table=table
             ) from exc
         try:
+            resolved = await self._resolve_table(catalog, schema, table)
+            part = PinotClient.path_part(resolved)
             schema_json = await self._client.controller_get(
                 f"/tables/{part}/schema", database=schema
             )
@@ -182,11 +184,30 @@ class PinotEngine:
         return table_schema(
             catalog,
             schema,
-            table,
+            resolved,
             schema_json,
             None if metadata_json is PinotClient.NotFound else metadata_json,
             None if config_json is PinotClient.NotFound else config_json,
         )
+
+    async def _resolve_table(self, catalog: str, schema: str, table: str) -> str:
+        """The controller's own spelling of the table the agent asked for.
+
+        Controller REST paths are case-sensitive while broker SQL and grants
+        are not, so the agent's spelling is a request, not an address: an
+        unresolved name would 404 on a table that plainly exists.
+        """
+        body = await self._client.controller_get("/tables", database=schema)
+        if body is PinotClient.NotFound:
+            raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
+        listed = table_names(body)
+        if table in listed:
+            return table
+        matches = [name for name in listed if name.lower() == table.lower()]
+        if len(matches) != 1:
+            # None is a missing table; more than one, and nothing says which.
+            raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
+        return matches[0]
 
     async def estimate_cost(self, sql: str) -> CostEstimate:
         """No quotation exists yet — U11 builds it from segment metadata.

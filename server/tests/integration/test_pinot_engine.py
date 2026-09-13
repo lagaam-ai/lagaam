@@ -61,12 +61,43 @@ async def test_describe_table_reads_columns_and_the_row_count(
     card = await engine.describe_table("pinot", "default", "airlineStats")
     assert card.catalog == "pinot"
     assert card.schema_name == "default"
-    assert card.table == "airlinestats"
+    assert card.table == "airlineStats"
     # The controller's numRows matched count(*) exactly on this OFFLINE table.
     assert card.row_estimate == 9746
     names = {c.name for c in card.columns}
     assert "Carrier" in names
     assert "DaysSinceEpoch" in names
+
+
+async def test_describe_table_accepts_the_name_it_just_returned(
+    engine: PinotEngine,
+) -> None:
+    # The round trip the controller's case-sensitive REST paths used to break:
+    # /tables/airlinestats/schema is a live 404, so a lowercased card name was
+    # a name the agent could not feed back.
+    first = await engine.describe_table("pinot", "default", "airlineStats")
+    again = await engine.describe_table("pinot", "default", first.table)
+    assert again.table == first.table
+    assert {c.name for c in again.columns} == {c.name for c in first.columns}
+
+
+async def test_describe_table_accepts_the_lowercase_grant_spelling(
+    engine: PinotEngine,
+) -> None:
+    # Grants match case-insensitively, so the spelling an operator writes in
+    # one must ground the agent just as well as the controller's own.
+    card = await engine.describe_table("pinot", "default", "airlinestats")
+    assert card.table == "airlineStats"
+    assert card.row_estimate == 9746
+
+
+async def test_the_listing_and_the_card_agree_on_the_spelling(
+    engine: PinotEngine,
+) -> None:
+    listed = (await engine.list_catalogs()).catalogs[0]
+    tables = {s.name: s.tables for s in listed.schemas}["default"]
+    card = await engine.describe_table("pinot", "default", "AIRLINESTATS")
+    assert card.table in tables
 
 
 async def test_a_table_that_does_not_exist_says_so(engine: PinotEngine) -> None:

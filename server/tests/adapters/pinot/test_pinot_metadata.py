@@ -91,7 +91,9 @@ def test_table_schema_concatenates_all_three_field_specs() -> None:
     assert by_name["ActualElapsedTime"].type == "INT"
 
 
-def test_table_schema_echoes_lowercased_names_and_the_row_estimate() -> None:
+def test_table_schema_echoes_the_controllers_table_spelling() -> None:
+    # The controller's REST paths are case-sensitive, so a lowercased name in
+    # the card is a name the agent cannot feed back — see the resolver in engine.
     card = table_schema(
         "pinot",
         "DEFAULT",
@@ -102,7 +104,7 @@ def test_table_schema_echoes_lowercased_names_and_the_row_estimate() -> None:
     )
     assert card.catalog == "pinot"
     assert card.schema_name == "default"
-    assert card.table == "airlinestats"
+    assert card.table == "airlineStats"
     assert card.row_estimate == 9746
 
 

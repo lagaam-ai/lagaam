@@ -59,11 +59,15 @@ def table_schema(
     metadata_json: Any,
     config_json: Any,
 ) -> TableSchema:
-    """One grounding card, from the schema, metadata and config documents."""
+    """One grounding card, from the schema, metadata and config documents.
+
+    `table` is echoed as given, because the caller resolves it to the
+    controller's own spelling first and the REST paths are case-sensitive.
+    """
     return TableSchema(
         catalog=catalog.lower(),
         schema=schema.lower(),
-        table=table.lower(),
+        table=table,
         columns=_columns(schema_json),
         row_estimate=row_estimate(metadata_json, table_types(config_json)),
     )

@@ -200,14 +200,93 @@ async def test_describe_table_returns_the_grounding_card() -> None:
     card = await make_engine().describe_table("pinot", "default", "airlineStats")
     assert card.catalog == "pinot"
     assert card.schema_name == "default"
-    assert card.table == "airlinestats"
+    assert card.table == "airlineStats"
     assert card.row_estimate == 9746
     assert any(c.name == "Carrier" for c in card.columns)
 
 
 async def test_describe_table_accepts_any_spelling_of_the_name() -> None:
     card = await make_engine().describe_table("PINOT", "DEFAULT", "airlineStats")
-    assert card.table == "airlinestats"
+    assert card.table == "airlineStats"
+
+
+@pytest.mark.parametrize("spelling", ["airlinestats", "AIRLINESTATS", "AirLineStats"])
+async def test_a_case_mismatched_name_resolves_to_the_controllers_spelling(
+    spelling: str,
+) -> None:
+    # Controller paths are case-sensitive (/tables/airlinestats/schema is a
+    # 404) but broker SQL and grants are not, so the agent's spelling is only
+    # a request to be resolved against the listing.
+    card = await make_engine().describe_table("pinot", "default", spelling)
+    assert card.table == "airlineStats"
+    assert any(c.name == "Carrier" for c in card.columns)
+
+
+async def test_the_resolved_spelling_is_what_reaches_the_rest_paths() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return controller_handler(request)
+
+    await make_engine(handler).describe_table("pinot", "default", "AIRLINESTATS")
+    assert "/tables/AIRLINESTATS/schema" not in paths
+    assert "/tables/airlineStats/schema" in paths
+
+
+async def test_the_card_echoes_the_spelling_list_catalogs_advertises() -> None:
+    # The round trip that matters: whatever list_catalogs names, describe_table
+    # must accept and echo back unchanged.
+    engine = make_engine()
+    listed = (await engine.list_catalogs()).catalogs[0].schemas[0].tables
+    card = await engine.describe_table("pinot", "default", "airlinestats")
+    assert card.table in listed
+
+
+async def test_two_spellings_that_differ_only_by_case_are_refused_as_ambiguous() -> None:
+    # Nothing in the request says which was meant, so guessing would ground
+    # the agent on a table it did not ask for.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return tables_response("airlineStats", "airlinestats")
+        return controller_handler(request)
+
+    with pytest.raises(TableNotFoundError):
+        await make_engine(handler).describe_table("pinot", "default", "AirlineStats")
+
+
+async def test_an_exact_match_is_taken_even_beside_a_case_variant() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return tables_response("airlineStats", "airlinestats")
+        return controller_handler(request)
+
+    card = await make_engine(handler).describe_table(
+        "pinot", "default", "airlineStats"
+    )
+    assert card.table == "airlineStats"
+
+
+async def test_a_name_absent_from_the_listing_is_a_missing_table() -> None:
+    called: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(request.url.path)
+        return controller_handler(request)
+
+    with pytest.raises(TableNotFoundError):
+        await make_engine(handler).describe_table("pinot", "default", "nosuchtable")
+    assert "/tables/nosuchtable/schema" not in called
+
+
+async def test_an_unreachable_controller_during_resolution_is_an_engine_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return httpx.Response(500, text="controller:9000 internal failure")
+        return controller_handler(request)
+
+    with pytest.raises(EngineError):
+        await make_engine(handler).describe_table("pinot", "default", "airlineStats")
 
 
 async def test_a_catalog_that_is_not_pinot_is_a_missing_table() -> None:
@@ -238,7 +317,8 @@ async def test_describe_table_sends_the_database_as_the_header() -> None:
         return controller_handler(request)
 
     await make_engine(handler).describe_table("pinot", "default", "airlineStats")
-    assert seen == ["default", "default", "default"]
+    # The listing that resolves the spelling, then schema, metadata and config.
+    assert seen == ["default", "default", "default", "default"]
 
 
 async def test_estimate_cost_is_honest_that_it_cannot_price_yet() -> None:
