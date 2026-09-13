@@ -952,3 +952,54 @@ async def test_a_realtime_half_is_quoted_low() -> None:
     )
     assert estimate.confidence == "low"
     assert estimate.scanned_bytes is None
+
+
+async def test_a_table_name_no_path_can_carry_is_not_found_before_any_request() -> (
+    None
+):
+    def routes(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no request should be made, got {request.url}")
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(TableNotFoundError):
+        await engine.estimate_cost(
+            'SELECT x FROM pinot.default."we%ird" LIMIT 10'
+        )
+
+
+async def test_the_explains_carry_their_own_deadline() -> None:
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            body = json.loads(request.content)
+            seen.append(body.get("queryOptions", ""))
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch > 16090 LIMIT 10"
+    )
+    assert seen
+    assert all("timeoutMs=10000" in options for options in seen)
+    single_stage = [o for o in seen if "useMultistageEngine=true" not in o]
+    multi_stage = [o for o in seen if "useMultistageEngine=true" in o]
+    assert single_stage
+    assert multi_stage
+
+
+async def test_a_broker_that_hangs_on_explain_degrades_to_low() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            raise httpx.ReadTimeout("slow")
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    # The oracle degrades to None (charge every segment) and the multi-stage
+    # plan is unreadable, but table facts alone still bound rows and bytes —
+    # only the join-shape signal is lost, and estimate_cost does not raise.
+    assert estimate.max_intermediate_rows is None

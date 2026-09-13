@@ -80,6 +80,12 @@ _EXPLAIN_SHAPE = "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR "
 # also the total deadline, so a body arriving in slow chunks cannot outlast it.
 _TIMEOUT_GRACE_SECONDS = 5.0
 
+# A quotation is advisory, not the query itself: a wedged broker must not hold
+# the gate for the client's full 30s default, so the EXPLAINs get their own
+# short deadline rather than inheriting execute()'s caller-supplied one.
+_EXPLAIN_TIMEOUT_SECONDS = 10.0
+_EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
+
 
 def _plan_cell(body: object) -> str | None:
     """The PLAN column of a multi-stage EXPLAIN answer: one row, one string."""
@@ -293,7 +299,14 @@ class PinotEngine:
         self, database: str, table: str, columns: frozenset[str] | None
     ) -> TableFacts:
         """One table's config, segment metadata and size, from the controller."""
-        part = PinotClient.path_part(table)
+        try:
+            part = PinotClient.path_part(table)
+        except ValueError as exc:
+            # No URL path can carry this name, so the table it would name
+            # cannot be reached either — decided before any request.
+            raise TableNotFoundError(
+                catalog=self.CATALOG, schema=database, table=table
+            ) from exc
         params: dict[str, str | list[str]] | None = (
             {"columns": sorted(columns)} if columns else None
         )
@@ -322,7 +335,11 @@ class PinotEngine:
         if table_count != 1:
             return None
         try:
-            body = await self._client.broker_query(f"{_EXPLAIN_PRUNING}{two_part}", "")
+            body = await self._client.broker_query(
+                f"{_EXPLAIN_PRUNING}{two_part}",
+                f"{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+                timeout_seconds=_EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS,
+            )
         except PinotForbidden as exc:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
         except (PinotTransportError, PinotResponseTooLarge):
@@ -343,7 +360,9 @@ class PinotEngine:
             )
         try:
             body = await self._client.broker_query(
-                f"{_EXPLAIN_SHAPE}{two_part}", f"{_OPT_MULTISTAGE}=true"
+                f"{_EXPLAIN_SHAPE}{two_part}",
+                f"{_OPT_MULTISTAGE}=true;{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+                timeout_seconds=_EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS,
             )
         except PinotForbidden as exc:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
