@@ -33,8 +33,12 @@ from lagaam.adapters.pinot.names import (
     two_part_sql,
 )
 from lagaam.adapters.pinot.plan import max_intermediate_rows
-from lagaam.adapters.pinot.quote import quote, surviving_docs, surviving_segments
-from lagaam.adapters.pinot.response import parse_query_result, result_failure
+from lagaam.adapters.pinot.quote import quote, surviving_docs
+from lagaam.adapters.pinot.response import (
+    parse_query_result,
+    result_failure,
+    surviving_segments,
+)
 from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
 from lagaam.core.models import (
     CatalogInfo,

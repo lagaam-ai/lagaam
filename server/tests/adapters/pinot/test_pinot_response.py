@@ -1,4 +1,4 @@
-"""Broker JSON to a QueryResult, or the failure it carries.
+"""Broker JSON to a QueryResult, its failure, or its pruning counters.
 
 Every fixture here is a real HTTP 200 from Pinot 1.5.1 — including the
 failures, because every Pinot query error is an HTTP 200. An incomplete
@@ -17,6 +17,7 @@ from lagaam.adapters.pinot.response import (
     INCOMPLETE_RESULT,
     parse_query_result,
     result_failure,
+    surviving_segments,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -120,3 +121,134 @@ def test_a_malformed_row_does_not_crash_the_parse() -> None:
     }
     result = parse_query_result(body, max_rows=10)
     assert result.rows == [["ok"], ["fine"]]
+
+
+def test_a_time_filter_survives_three_of_thirty_one_segments() -> None:
+    assert surviving_segments(load("explain-v1-timefilter.json")) == 3
+
+
+def test_no_filter_survives_every_segment() -> None:
+    assert surviving_segments(load("explain-v1-nofilter.json")) == 31
+
+
+def test_a_limit_prune_counts_as_pruning_too() -> None:
+    """Measured: this really does process one segment and scan ten docs."""
+    assert surviving_segments(load("explain-v1-limitpruned.json")) == 1
+
+
+def test_the_pruned_counters_are_maxed_never_summed() -> None:
+    """ByServer is the total; ByValue and ByLimit break it down, so a sum
+    would claim 56 of 31 pruned and quote a negative scan."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedByServer": 28,
+                "numSegmentsPrunedByValue": 28,
+                "numSegmentsPrunedByLimit": 0,
+                "numDocsScanned": 0,
+            }
+        )
+        == 3
+    )
+
+
+def test_a_counter_only_ever_seen_alone_is_still_read() -> None:
+    """Measurement 6: the same predicate once registered only as ByValue."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedByServer": 0,
+                "numSegmentsPrunedByValue": 28,
+                "numDocsScanned": 0,
+            }
+        )
+        == 3
+    )
+
+
+def test_every_segment_pruned_still_charges_one() -> None:
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedByServer": 31,
+                "numDocsScanned": 0,
+            }
+        )
+        == 1
+    )
+
+
+def test_an_unmeasured_broker_counter_is_not_read() -> None:
+    """ByBroker has never been observed non-zero on 1.5.1 and is not known to
+    be a breakdown of numSegmentsQueried; reading it risks under-counting."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 10,
+                "numSegmentsPrunedByBroker": 21,
+                "numSegmentsPrunedByServer": 0,
+                "numDocsScanned": 0,
+            }
+        )
+        == 10
+    )
+
+
+def test_an_unmeasured_invalid_counter_is_not_read() -> None:
+    """PrunedInvalid has never been observed non-zero on 1.5.1 either."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedInvalid": 30,
+                "numSegmentsPrunedByValue": 3,
+                "numDocsScanned": 0,
+            }
+        )
+        == 28
+    )
+
+
+def test_an_explain_that_scanned_anything_is_not_an_oracle() -> None:
+    """EXPLAIN must never execute; if it did, we misread the statement."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedByServer": 28,
+                "numDocsScanned": 1,
+            }
+        )
+        is None
+    )
+
+
+def test_an_explain_carrying_an_exception_is_no_oracle() -> None:
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numDocsScanned": 0,
+                "exceptions": [{"errorCode": 150, "message": "multi-stage only"}],
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {},
+        [],
+        "junk",
+        {"numSegmentsQueried": 0, "numDocsScanned": 0},
+        {"numSegmentsQueried": "31", "numDocsScanned": 0},
+    ],
+)
+def test_surviving_segments_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
+    assert surviving_segments(body) is None
