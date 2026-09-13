@@ -120,7 +120,7 @@ kind that runs for $500.
 
 ## How it works
 
-A `QueryEngine` port with a Trino adapter (native Pinot adapter is next).
+A `QueryEngine` port with a Trino adapter and an experimental Pinot adapter.
 Every `query_data` call walks one pipeline: **validate (sqlglot AST) → table
 allowlist → cost quotation → budget gate → execute (row cap + timeout) →
 verify → audit**.
@@ -135,11 +135,14 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 ## Status
 
-`v0.1.2` — Trino adapter, schema tools, plan-based cost guard, query
+`v0.1.4` — Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
-audit log. 381 unit + 87 integration tests, mypy strict. On deck
-([roadmap](docs/roadmap.md)): native Pinot adapter (realtime tables), then
-a Kubernetes control plane — agents as CRDs with token/dollar budgets and
-kill switches.
+audit log. 706 unit + 118 integration tests (live Trino 476 and Pinot
+1.5.1), mypy strict. `LAGAAM_ENGINE=pinot` starts the native Pinot adapter
+in its experimental state: grounding and execution work, but the quotation
+is not built yet, so `query_data` is denied under the default budget until
+it is. On deck ([roadmap](docs/roadmap.md)): the Pinot quotation from
+segment metadata, then a Kubernetes control plane — agents as CRDs with
+token/dollar budgets and kill switches.
 
 Apache 2.0.
