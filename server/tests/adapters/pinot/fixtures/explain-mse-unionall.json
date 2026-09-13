@@ -1,0 +1,72 @@
+{
+    "resultTable": {
+        "dataSchema": {
+            "columnNames": [
+                "SQL",
+                "PLAN",
+                "RULE_TIMINGS"
+            ],
+            "columnDataTypes": [
+                "STRING",
+                "STRING",
+                "STRING"
+            ]
+        },
+        "rows": [
+            [
+                "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT Carrier FROM default.airlineStats UNION ALL SELECT teamID FROM default.baseballStats",
+                "{\n  \"rels\": [\n    {\n      \"id\": \"0\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"airlineStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"1\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"Carrier\"\n      ],\n      \"exprs\": [\n        {\n          \"input\": 18,\n          \"name\": \"$18\"\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"2\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\",\n        \"keys\": [\n          0\n        ]\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"3\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"baseballStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"4\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"teamID\"\n      ],\n      \"exprs\": [\n        {\n          \"input\": 26,\n          \"name\": \"$26\"\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"5\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\",\n        \"keys\": [\n          0\n        ]\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"6\",\n      \"relOp\": \"LogicalUnion\",\n      \"all\": true,\n      \"inputs\": [\n        \"2\",\n        \"5\"\n      ],\n      \"type\": \"LogicalUnion\"\n    }\n  ]\n}",
+                "{\n  \"ruleExecutionTimes\": [\n    {\n      \"rule\": \"EvaluateProjectLiteral\", \n      \"time\": 0.00\n    }  ]\n}\n"
+            ]
+        ]
+    },
+    "numRowsResultSet": 1,
+    "partialResult": false,
+    "exceptions": [],
+    "numGroupsLimitReached": false,
+    "numGroupsWarningLimitReached": false,
+    "timeUsedMs": 0,
+    "requestId": "1146010015000001741",
+    "clientRequestId": null,
+    "brokerId": "Broker_172.17.0.2_8000",
+    "numDocsScanned": 0,
+    "totalDocs": 0,
+    "numEntriesScannedInFilter": 0,
+    "numEntriesScannedPostFilter": 0,
+    "numServersQueried": 0,
+    "numServersResponded": 0,
+    "numSegmentsQueried": 0,
+    "numSegmentsProcessed": 0,
+    "numSegmentsMatched": 0,
+    "numConsumingSegmentsQueried": 0,
+    "numConsumingSegmentsProcessed": 0,
+    "numConsumingSegmentsMatched": 0,
+    "minConsumingFreshnessTimeMs": 0,
+    "numSegmentsPrunedByBroker": 0,
+    "numSegmentsPrunedByServer": 0,
+    "numSegmentsPrunedInvalid": 0,
+    "numSegmentsPrunedByLimit": 0,
+    "numSegmentsPrunedByValue": 0,
+    "brokerReduceTimeMs": 0,
+    "offlineThreadCpuTimeNs": 0,
+    "realtimeThreadCpuTimeNs": 0,
+    "offlineSystemActivitiesCpuTimeNs": 0,
+    "realtimeSystemActivitiesCpuTimeNs": 0,
+    "offlineResponseSerializationCpuTimeNs": 0,
+    "realtimeResponseSerializationCpuTimeNs": 0,
+    "offlineTotalCpuTimeNs": 0,
+    "realtimeTotalCpuTimeNs": 0,
+    "explainPlanNumEmptyFilterSegments": 0,
+    "explainPlanNumMatchAllFilterSegments": 0,
+    "traceInfo": {},
+    "tablesQueried": [],
+    "offlineThreadMemAllocatedBytes": 0,
+    "realtimeThreadMemAllocatedBytes": 0,
+    "offlineResponseSerMemAllocatedBytes": 0,
+    "realtimeResponseSerMemAllocatedBytes": 0,
+    "offlineTotalMemAllocatedBytes": 0,
+    "realtimeTotalMemAllocatedBytes": 0,
+    "pools": [],
+    "rlsFiltersApplied": false,
+    "groupsTrimmed": false
+}

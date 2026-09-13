@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Work only in the worktree `/Users/muditkapoor/Documents/code/lagaam-pinot` on branch `feat/pinot-adapter`; never push, never `git stash`.
+- Work only in the worktree `/Users/muditkapoor/Documents/code/lagaam-pinot` on branch `feat/pinot-quotation` (off main at 3a6cf69, after U9–U10 merged as #30); never push, never `git stash`.
 - Conventional atomic commits (one logical change plus its tests), each message ending with the trailer line `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 - Inline comments are one line maximum, and only for a constraint the code cannot show; never restate what the line does.
 - Type hints everywhere; `uv run mypy` clean (`lagaam.adapters.pinot` is in the mypy packages, strict mode).

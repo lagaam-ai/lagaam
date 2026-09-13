@@ -1,9 +1,12 @@
-"""Broker JSON to a QueryResult, or the failure it carries. PURE, no I/O.
+"""Broker JSON to a QueryResult, its failure, or its pruning counters. PURE.
 
 Every Pinot query error is an HTTP 200 with a populated exceptions[], so the
 body is the only signal there is. An incomplete result is a failure and not a
 warning: measured, numGroupsLimit=2 returned 22 groups as though they were all
 of them, with HTTP 200 and plausible-looking aggregates.
+
+The pruning oracle reads an EXPLAIN envelope rather than a result one, but it
+is the same broker answer parsed the same way, so it lives here too.
 """
 
 from typing import Any
@@ -87,3 +90,48 @@ def parse_query_result(body: Any, max_rows: int) -> QueryResult:
         truncated=truncated,
         warnings=warnings,
     )
+
+
+# Only the counters measured to nest with numSegmentsQueried on 1.5.1. They
+# are not additive: the server-side total and its by-value / by-limit
+# breakdowns all appear at once, so the largest is read, not the sum.
+_PRUNED_COUNTERS = (
+    "numSegmentsPrunedByServer",
+    "numSegmentsPrunedByValue",
+    "numSegmentsPrunedByLimit",
+)
+
+
+def surviving_segments(explain_json: Any) -> int | None:
+    """How many segments survive the predicate, from a single-stage EXPLAIN.
+
+    Only ByServer, ByValue and ByLimit are read, and the largest is taken
+    rather than the sum: measured on 1.5.1 they nest, so a time filter
+    reporting ByServer 28 with ByValue 28 of 31 segments would otherwise
+    claim 56 pruned and quote a negative scan. ByBroker and Invalid are
+    excluded because every fixture reports them 0, so neither is known to
+    behave as a breakdown of numSegmentsQueried — and if the broker already
+    reports numSegmentsQueried net of its own pruning, subtracting ByBroker
+    again would under-count survivors. Leaving a counter unread can only
+    charge more segments, never fewer, which is the fail-safe side.
+
+    None means "no oracle" — the caller then charges every segment.
+    """
+    if not isinstance(explain_json, dict):
+        return None
+    if explain_json.get("exceptions"):
+        return None
+    # EXPLAIN must plan without running; anything scanned means we misread it.
+    scanned = explain_json.get("numDocsScanned")
+    if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned != 0:
+        return None
+    queried = explain_json.get("numSegmentsQueried")
+    if isinstance(queried, bool) or not isinstance(queried, int) or queried <= 0:
+        return None
+    pruned = 0
+    for key in _PRUNED_COUNTERS:
+        value = explain_json.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        pruned = max(pruned, value)
+    return max(1, queried - min(pruned, queried))

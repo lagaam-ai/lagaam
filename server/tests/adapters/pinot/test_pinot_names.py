@@ -7,7 +7,11 @@ SQL that has already been validated and allowlisted.
 
 import pytest
 
-from lagaam.adapters.pinot.names import two_part_sql
+from lagaam.adapters.pinot.names import (
+    referenced_columns,
+    referenced_tables,
+    two_part_sql,
+)
 from lagaam.core.errors import SqlValidationError, TableNotFoundError
 
 
@@ -126,3 +130,51 @@ def test_every_accepted_input_loses_the_synthetic_catalog_everywhere() -> None:
     for sql in ACCEPTED_INPUTS:
         out = two_part_sql(sql)
         assert "pinot." not in out.lower(), sql
+
+
+def test_referenced_tables_are_database_table_pairs() -> None:
+    assert referenced_tables(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    ) == [("default", "airlineStats")]
+
+
+def test_referenced_tables_deduplicate_and_sort() -> None:
+    assert referenced_tables(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.baseballStats b ON a.Carrier = b.teamID "
+        "JOIN pinot.default.airlineStats c ON a.Carrier = c.Carrier LIMIT 10"
+    ) == [("default", "airlineStats"), ("default", "baseballStats")]
+
+
+def test_referenced_tables_refuse_a_foreign_catalog() -> None:
+    with pytest.raises(TableNotFoundError):
+        referenced_tables("SELECT x FROM other.default.t LIMIT 1")
+
+
+def test_referenced_tables_are_none_when_the_sql_cannot_be_read() -> None:
+    assert referenced_tables("SELECT FROM WHERE ((((") is None
+
+
+def test_referenced_columns_are_lowercase_bare_names() -> None:
+    assert referenced_columns(
+        "SELECT a.Carrier, DaysSinceEpoch FROM pinot.default.airlineStats a "
+        "WHERE a.Origin = 'SFO' LIMIT 10"
+    ) == frozenset({"carrier", "dayssinceepoch", "origin"})
+
+
+def test_a_star_makes_the_columns_unresolvable() -> None:
+    """validate_query rejects SELECT *, but count(*) and a.* still parse."""
+    assert referenced_columns("SELECT * FROM pinot.default.airlineStats LIMIT 1") is None
+    assert referenced_columns(
+        "SELECT a.* FROM pinot.default.airlineStats a LIMIT 1"
+    ) is None
+
+
+def test_a_count_star_is_not_an_unresolvable_column() -> None:
+    assert referenced_columns(
+        "SELECT count(*) FROM pinot.default.airlineStats LIMIT 1"
+    ) == frozenset()
+
+
+def test_referenced_columns_are_none_when_the_sql_cannot_be_read() -> None:
+    assert referenced_columns("SELECT FROM WHERE ((((") is None

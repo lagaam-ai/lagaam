@@ -7,6 +7,8 @@ that crashes on an unexpected key costs an agent the names it needs, and a
 missing number fails safe at the budget gate anyway.
 """
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from lagaam.core.models import ColumnInfo, TableSchema
@@ -106,3 +108,150 @@ def _column_type(spec: dict[str, Any], data_type: str) -> str:
     if spec.get("singleValueField") is False:
         return f"{data_type}[]"
     return data_type
+
+
+@dataclass(frozen=True)
+class SegmentFact:
+    """One sealed segment's measurable size, as the controller reports it.
+
+    Every field is optional because a fact the controller does not carry must
+    stay absent rather than become a zero: a zero would quote a segment free.
+    """
+
+    name: str
+    docs: int | None
+    total_bytes: int | None
+    start_ms: int | None
+    end_ms: int | None
+    column_bytes: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class TableFacts:
+    """Everything about one table a quotation is built from."""
+
+    table: str
+    types: frozenset[str]
+    time_column: str | None
+    segments: tuple[SegmentFact, ...]
+
+
+def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
+    """Per-segment docs, bytes, time range and per-column bytes.
+
+    Bytes come from a different endpoint than docs, keyed by segment name, so
+    a segment missing from the size report keeps its docs and loses its bytes.
+    """
+    if not isinstance(seg_metadata_json, dict):
+        return []
+    sizes = _segment_sizes(size_json)
+    facts: list[SegmentFact] = []
+    for key, body in seg_metadata_json.items():
+        if not isinstance(body, dict):
+            continue
+        name = body.get("segmentName")
+        if not isinstance(name, str) or not name:
+            name = key if isinstance(key, str) else ""
+        if not name:
+            continue
+        facts.append(
+            SegmentFact(
+                name=name,
+                docs=_positive_int(body.get("totalDocs"), allow_zero=True),
+                total_bytes=sizes.get(name),
+                start_ms=_positive_int(body.get("startTimeMillis")),
+                end_ms=_positive_int(body.get("endTimeMillis")),
+                column_bytes=_column_bytes(body.get("columns")),
+            )
+        )
+    return facts
+
+
+def time_column(config_json: Any) -> str | None:
+    """The OFFLINE half's time column, which is what prunes segments."""
+    if not isinstance(config_json, dict):
+        return None
+    for key in ("OFFLINE", "REALTIME"):
+        half = config_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        segments_config = half.get("segmentsConfig")
+        if not isinstance(segments_config, dict):
+            continue
+        name = segments_config.get("timeColumnName")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def table_facts(
+    table: str,
+    config_json: Any,
+    seg_metadata_json: Any,
+    size_json: Any,
+) -> TableFacts:
+    """One table's type, time column and segments, from three documents."""
+    return TableFacts(
+        table=table,
+        types=table_types(config_json),
+        time_column=time_column(config_json),
+        segments=tuple(segment_facts(seg_metadata_json, size_json)),
+    )
+
+
+def _segment_sizes(size_json: Any) -> dict[str, int]:
+    """Segment name to reported bytes, from both halves of the size report."""
+    if not isinstance(size_json, dict):
+        return {}
+    sizes: dict[str, int] = {}
+    for key in ("offlineSegments", "realtimeSegments"):
+        half = size_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        segments = half.get("segments")
+        if not isinstance(segments, dict):
+            continue
+        for name, body in segments.items():
+            if not isinstance(name, str) or not isinstance(body, dict):
+                continue
+            # Measured: a consuming segment reports -1, which is "unknown".
+            reported = _positive_int(body.get("reportedSizeInBytes"), allow_zero=True)
+            if reported is not None:
+                sizes[name] = reported
+    return sizes
+
+
+def _column_bytes(columns_json: Any) -> Mapping[str, int]:
+    """Per-column bytes, summing every index entry the segment carries.
+
+    The entries differ by encoding — a RAW column has a forward_index and no
+    dictionary — so the sum is over whatever is present, never a fixed set.
+    """
+    if not isinstance(columns_json, list):
+        return {}
+    totals: dict[str, int] = {}
+    for column in columns_json:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("columnName")
+        index_sizes = column.get("indexSizeMap")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(index_sizes, dict):
+            continue
+        total = 0
+        for value in index_sizes.values():
+            size = _positive_int(value, allow_zero=True)
+            if size is not None:
+                total += size
+        totals[name] = total
+    return totals
+
+
+def _positive_int(value: Any, allow_zero: bool = False) -> int | None:
+    """An int the controller means as a measurement, or None."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < 0 or (value == 0 and not allow_zero):
+        return None
+    return value

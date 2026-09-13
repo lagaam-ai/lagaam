@@ -1,0 +1,356 @@
+{
+    "tableName": "airlineStats",
+    "reportedSizeInBytes": 4861355,
+    "estimatedSizeInBytes": 4861355,
+    "reportedSizePerReplicaInBytes": 4861355,
+    "offlineSegments": {
+        "reportedSizeInBytes": 4861355,
+        "estimatedSizeInBytes": 4861355,
+        "missingSegments": 0,
+        "reportedSizePerReplicaInBytes": 4861355,
+        "segments": {
+            "airlineStats_OFFLINE_16071_16071_0": {
+                "reportedSizeInBytes": 152577,
+                "estimatedSizeInBytes": 152577,
+                "maxReportedSizePerReplicaInBytes": 152577,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16071_16071_0",
+                        "diskSizeInBytes": 152577
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16072_16072_0": {
+                "reportedSizeInBytes": 175087,
+                "estimatedSizeInBytes": 175087,
+                "maxReportedSizePerReplicaInBytes": 175087,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16072_16072_0",
+                        "diskSizeInBytes": 175087
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16074_16074_0": {
+                "reportedSizeInBytes": 156801,
+                "estimatedSizeInBytes": 156801,
+                "maxReportedSizePerReplicaInBytes": 156801,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16074_16074_0",
+                        "diskSizeInBytes": 156801
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16081_16081_0": {
+                "reportedSizeInBytes": 147900,
+                "estimatedSizeInBytes": 147900,
+                "maxReportedSizePerReplicaInBytes": 147900,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16081_16081_0",
+                        "diskSizeInBytes": 147900
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16073_16073_0": {
+                "reportedSizeInBytes": 176636,
+                "estimatedSizeInBytes": 176636,
+                "maxReportedSizePerReplicaInBytes": 176636,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16073_16073_0",
+                        "diskSizeInBytes": 176636
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16083_16083_0": {
+                "reportedSizeInBytes": 150907,
+                "estimatedSizeInBytes": 150907,
+                "maxReportedSizePerReplicaInBytes": 150907,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16083_16083_0",
+                        "diskSizeInBytes": 150907
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16082_16082_0": {
+                "reportedSizeInBytes": 148740,
+                "estimatedSizeInBytes": 148740,
+                "maxReportedSizePerReplicaInBytes": 148740,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16082_16082_0",
+                        "diskSizeInBytes": 148740
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16077_16077_0": {
+                "reportedSizeInBytes": 151953,
+                "estimatedSizeInBytes": 151953,
+                "maxReportedSizePerReplicaInBytes": 151953,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16077_16077_0",
+                        "diskSizeInBytes": 151953
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16076_16076_0": {
+                "reportedSizeInBytes": 165158,
+                "estimatedSizeInBytes": 165158,
+                "maxReportedSizePerReplicaInBytes": 165158,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16076_16076_0",
+                        "diskSizeInBytes": 165158
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16085_16085_0": {
+                "reportedSizeInBytes": 159664,
+                "estimatedSizeInBytes": 159664,
+                "maxReportedSizePerReplicaInBytes": 159664,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16085_16085_0",
+                        "diskSizeInBytes": 159664
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16092_16092_0": {
+                "reportedSizeInBytes": 151250,
+                "estimatedSizeInBytes": 151250,
+                "maxReportedSizePerReplicaInBytes": 151250,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16092_16092_0",
+                        "diskSizeInBytes": 151250
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16093_16093_0": {
+                "reportedSizeInBytes": 156889,
+                "estimatedSizeInBytes": 156889,
+                "maxReportedSizePerReplicaInBytes": 156889,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16093_16093_0",
+                        "diskSizeInBytes": 156889
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16075_16075_0": {
+                "reportedSizeInBytes": 178490,
+                "estimatedSizeInBytes": 178490,
+                "maxReportedSizePerReplicaInBytes": 178490,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16075_16075_0",
+                        "diskSizeInBytes": 178490
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16084_16084_0": {
+                "reportedSizeInBytes": 155852,
+                "estimatedSizeInBytes": 155852,
+                "maxReportedSizePerReplicaInBytes": 155852,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16084_16084_0",
+                        "diskSizeInBytes": 155852
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16089_16089_0": {
+                "reportedSizeInBytes": 144572,
+                "estimatedSizeInBytes": 144572,
+                "maxReportedSizePerReplicaInBytes": 144572,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16089_16089_0",
+                        "diskSizeInBytes": 144572
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16101_16101_0": {
+                "reportedSizeInBytes": 166394,
+                "estimatedSizeInBytes": 166394,
+                "maxReportedSizePerReplicaInBytes": 166394,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16101_16101_0",
+                        "diskSizeInBytes": 166394
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16096_16096_0": {
+                "reportedSizeInBytes": 161532,
+                "estimatedSizeInBytes": 161532,
+                "maxReportedSizePerReplicaInBytes": 161532,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16096_16096_0",
+                        "diskSizeInBytes": 161532
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16088_16088_0": {
+                "reportedSizeInBytes": 140247,
+                "estimatedSizeInBytes": 140247,
+                "maxReportedSizePerReplicaInBytes": 140247,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16088_16088_0",
+                        "diskSizeInBytes": 140247
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16094_16094_0": {
+                "reportedSizeInBytes": 163581,
+                "estimatedSizeInBytes": 163581,
+                "maxReportedSizePerReplicaInBytes": 163581,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16094_16094_0",
+                        "diskSizeInBytes": 163581
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16091_16091_0": {
+                "reportedSizeInBytes": 153223,
+                "estimatedSizeInBytes": 153223,
+                "maxReportedSizePerReplicaInBytes": 153223,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16091_16091_0",
+                        "diskSizeInBytes": 153223
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16086_16086_0": {
+                "reportedSizeInBytes": 156754,
+                "estimatedSizeInBytes": 156754,
+                "maxReportedSizePerReplicaInBytes": 156754,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16086_16086_0",
+                        "diskSizeInBytes": 156754
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16087_16087_0": {
+                "reportedSizeInBytes": 151292,
+                "estimatedSizeInBytes": 151292,
+                "maxReportedSizePerReplicaInBytes": 151292,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16087_16087_0",
+                        "diskSizeInBytes": 151292
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16090_16090_0": {
+                "reportedSizeInBytes": 151479,
+                "estimatedSizeInBytes": 151479,
+                "maxReportedSizePerReplicaInBytes": 151479,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16090_16090_0",
+                        "diskSizeInBytes": 151479
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16095_16095_0": {
+                "reportedSizeInBytes": 137510,
+                "estimatedSizeInBytes": 137510,
+                "maxReportedSizePerReplicaInBytes": 137510,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16095_16095_0",
+                        "diskSizeInBytes": 137510
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16078_16078_0": {
+                "reportedSizeInBytes": 158991,
+                "estimatedSizeInBytes": 158991,
+                "maxReportedSizePerReplicaInBytes": 158991,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16078_16078_0",
+                        "diskSizeInBytes": 158991
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16079_16079_0": {
+                "reportedSizeInBytes": 164714,
+                "estimatedSizeInBytes": 164714,
+                "maxReportedSizePerReplicaInBytes": 164714,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16079_16079_0",
+                        "diskSizeInBytes": 164714
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16080_16080_0": {
+                "reportedSizeInBytes": 164378,
+                "estimatedSizeInBytes": 164378,
+                "maxReportedSizePerReplicaInBytes": 164378,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16080_16080_0",
+                        "diskSizeInBytes": 164378
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16099_16099_0": {
+                "reportedSizeInBytes": 156023,
+                "estimatedSizeInBytes": 156023,
+                "maxReportedSizePerReplicaInBytes": 156023,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16099_16099_0",
+                        "diskSizeInBytes": 156023
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16098_16098_0": {
+                "reportedSizeInBytes": 152021,
+                "estimatedSizeInBytes": 152021,
+                "maxReportedSizePerReplicaInBytes": 152021,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16098_16098_0",
+                        "diskSizeInBytes": 152021
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16100_16100_0": {
+                "reportedSizeInBytes": 162783,
+                "estimatedSizeInBytes": 162783,
+                "maxReportedSizePerReplicaInBytes": 162783,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16100_16100_0",
+                        "diskSizeInBytes": 162783
+                    }
+                }
+            },
+            "airlineStats_OFFLINE_16097_16097_0": {
+                "reportedSizeInBytes": 147957,
+                "estimatedSizeInBytes": 147957,
+                "maxReportedSizePerReplicaInBytes": 147957,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "airlineStats_OFFLINE_16097_16097_0",
+                        "diskSizeInBytes": 147957
+                    }
+                }
+            }
+        }
+    },
+    "realtimeSegments": null
+}

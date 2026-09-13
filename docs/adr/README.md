@@ -12,3 +12,4 @@ Title / Status / Context / Decision / Consequences.
 | [0005](0005-gate-on-max-intermediate-rows.md) | Gate on maximum intermediate rows, not output rows |
 | [0006](0006-row-generators-stay-sql-level.md) | Row generators remain a SQL-level check |
 | [0007](0007-parser-safety-bounds.md) | Parser safety bounds sit ahead of the parse |
+| [0008](0008-pinot-quotation-is-adapter-synthesised.md) | A Pinot quotation is synthesised by the adapter, not read from the engine |

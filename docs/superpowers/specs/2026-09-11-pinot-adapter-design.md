@@ -11,7 +11,7 @@ Lagaam prices a query before it runs and blocks it if it is over budget. On
 Trino the price comes from the engine's own plan. Pinot has no such plan:
 its multi-stage `EXPLAIN` reports `rowcount = 100.0` for every table scan —
 a 9,746-row table and a 97,889-row table both say 100 — and priced a
-954,024,994-row cross join at 10,000. There is no byte estimate anywhere.
+954,026,194-row cross join at 10,000. There is no byte estimate anywhere.
 The single-stage `EXPLAIN` names operators and, for a whole-segment match,
 a doc count; with a real predicate the count is gone.
 
@@ -196,7 +196,7 @@ Inputs, all pre-execution:
 | per-segment docs, time range | `GET /segments/{t}/metadata?columns=<referenced>` → `totalDocs`, `startTimeMillis`, `endTimeMillis` | exact for sealed; **0 / null for consuming** |
 | per-segment, per-column bytes | same call → `columns[i].indexSizeMap` (sum of its entries) | exact for sealed |
 | per-segment bytes | `GET /tables/{t}/size` → `offlineSegments.segments[s].reportedSizeInBytes` | exact for sealed; **-1 for consuming** |
-| segments surviving the predicate | single-stage `EXPLAIN PLAN FOR <two-part sql>` → response `numSegmentsQueried` minus the pruned counters; only for a query that references exactly one table (a join is an MSE-only statement and single-stage EXPLAIN refuses it) | engine-authoritative; `numDocsScanned` is 0, nothing runs |
+| segments surviving the predicate | single-stage `EXPLAIN PLAN FOR <two-part sql>` → response `numSegmentsQueried` minus the **largest** of `numSegmentsPrunedByServer`/`ByValue`/`ByLimit` (they nest: `ByServer` is the total and `ByValue`/`ByLimit` break it down, so a sum double-counts), floored at 1; `ByBroker` and `Invalid` are not read — neither was observed non-zero and neither is known to be a breakdown of `numSegmentsQueried`, and a counter not read can only leave more segments charged, never fewer; only for a query that references exactly one table (a join is an MSE-only statement and single-stage EXPLAIN refuses it) | engine-authoritative; `numDocsScanned` is 0, nothing runs |
 | plan shape | `EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR` on MSE → `rels[]` with `joinType` and the join condition; the `rowcount` attributes are **never read** | exact for shape |
 
 Rules:
@@ -205,16 +205,34 @@ Rules:
   many segments survive, not which. Charging the k largest by docs (and,
   separately, by bytes) is an upper bound on any k that could survive. A
   multi-table query, or one whose `EXPLAIN` failed, has k = all.
-- `row_estimate` = Σ over referenced tables of docs in its surviving set.
+- `numSegmentsProcessed` is **not** a pre-execution signal: measured under
+  `EXPLAIN` it is 0 in every shape, because nothing runs. The measurement
+  log's "use `numSegmentsProcessed / numSegmentsQueried`" is an
+  execution-time observation only. The pruned counters are what EXPLAIN
+  reports.
+- **A table is charged once per read.** The plan folds a repeated scan into
+  one node and the SQL's table list dedupes, so a table read N times would
+  be charged once: measured, a self-join quoted 9,746 rows against 19,492
+  scanned and `UNION ALL` x60 quoted 1/60th of the bytes. `core.scans.
+  table_scan_counts` supplies the count and the table's facts are charged
+  once per read, scaling docs and bytes alike. The walk's leaf sizes stay
+  per single read.
+- `row_estimate` = Σ over referenced tables, once per read, of docs in its
+  surviving set.
 - `scanned_bytes` = Σ over referenced tables, over its surviving set, of
-  the referenced columns' `indexSizeMap` bytes; a table whose column
-  attribution fails is charged `reportedSizeInBytes` of the surviving set.
-- `max_intermediate_rows`: `plan.py` walks `rels[]` post-order. A scan
-  node is its table's surviving docs; a join whose condition has no
-  equality is the product of its children; a join with an equality is the
-  max of its children (the ADR 0004 NaN-join rule); every other node is
-  the max of its children. The answer is the max over all nodes. A plan
-  that cannot be fetched or read is `None`.
+  the referenced columns' `indexSizeMap` bytes; attribution is decided
+  **per segment, not per table** — a segment in which none of the query's
+  columns are found is charged its whole `reportedSizeInBytes`, and a
+  segment with no size makes the sum unknown.
+- `max_intermediate_rows`: `plan.py` walks `rels[]` post-order. A scan node
+  is its table's surviving docs; **a join or `Correlate` is always the
+  product of its children**, since 1.5.1 exposes no cardinality to prove a
+  key and "has a conjunctive equality" is the SQL-shape proxy ADR 0004
+  rejected (measured: `ON a.Carrier = b.Carrier` builds 10,719,442 pairs
+  over 9,746 rows, 14 distinct carriers — the max branch quoted 9,746); a
+  `UNION` (all or distinct) is the sum of its children; every other node is
+  the max of its children. The answer is the max over all nodes. A plan that
+  cannot be fetched or read is `None`.
 - `core.scans.has_unpriceable_shape` and `generator_fanout` run first with
   the generic dialect exactly as the Trino adapter runs them; a flagged
   shape is `CostEstimate(confidence="low")` before any request.
