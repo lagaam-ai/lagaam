@@ -110,17 +110,35 @@ suite against the dockerized quickstart.
 - Tables: `GET /tables` → `$.tables[]` (bare names, no `_OFFLINE` suffix).
   Ordered, capped at `max_tables_per_catalog` with `truncated` set, like
   the Trino adapter.
-- `describe_table(catalog, schema, table)`: `GET /tables/{t}/schema` →
+- `describe_table(catalog, schema, table)` first **resolves the spelling**:
+  the controller's REST paths are case-sensitive (`/tables/airlinestats/schema`
+  is a live 404 for a table listed as `airlineStats`) while broker SQL and
+  grants are not. The agent's spelling is therefore a request, not an
+  address: one extra `GET /tables` matches it case-insensitively against
+  the listing, and the controller's spelling is what goes into every
+  subsequent REST path. Two listed names differing only by case are
+  refused as `TableNotFoundError` — nothing in the request says which was
+  meant. The fetch is one call per `describe_table`; `CachingQueryEngine`
+  above caches the resulting card.
+- Then `GET /tables/{t}/schema` →
   columns are `dimensionFieldSpecs` + `metricFieldSpecs` +
   `dateTimeFieldSpecs`, each `{name, dataType}`; Pinot has no column
-  comments. `row_estimate` = `GET /tables/{t}/metadata` → `$.numRows`,
+  comments. A spec with `singleValueField: false` is a multi-value column
+  and renders as `<dataType>[]` (`INT[]`, `STRING[]`) — measured, the
+  broker answers those as `INT_ARRAY`/`STRING_ARRAY` with array cells, so
+  a scalar type would invite a comparison that can never match. Only an
+  explicit `false` counts; an unreadable flag stays scalar.
+  `row_estimate` = `GET /tables/{t}/metadata` → `$.numRows`,
   which matched `count(*)` exactly on OFFLINE tables and is **0** while a
   REALTIME table is consuming, so a REALTIME half sets `row_estimate` to
   `None` rather than 0.
-- A catalog other than `pinot`, or a controller 404, is
-  `TableNotFoundError`. Table and column names are case-insensitive on
-  the broker, so the canonical names echoed back are the controller's
-  spelling, folded the way core folds grants (lowercase).
+- A catalog other than `pinot`, a name absent from the listing, or a
+  controller 404, is `TableNotFoundError`. The card echoes the
+  **controller's** spelling for `table` — not a lowercased one — so
+  `list_catalogs` and `describe_table` agree and a returned name can be
+  fed straight back. `catalog` stays `pinot` and `schema` stays the
+  database as the controller reports it; core's cache key lowercases all
+  three, so a grant written in any case still matches.
 
 Table names arrive from agents as name parts and are placed in URL paths;
 `client.py` percent-encodes and rejects a part containing `/`, `.` or
@@ -145,6 +163,15 @@ whitespace before building a URL.
    `PinotClient.broker_query` streams the body and raises
    `PinotResponseTooLarge` past `max_response_bytes`, which `execute` maps
    to `RESPONSE_TOO_LARGE`.
+   The whole call — submission through body read — is wrapped in
+   `anyio.fail_after(timeout_seconds + 5s grace)` whenever a budget
+   exists. httpx's timeout is **per operation** and resets on every read,
+   so a body arriving in slow chunks outlives it: measured, four chunks
+   1.5s apart returned a successful result 6.01s into a 0.2s budget.
+   Expiry raises `QueryFailedError(EXCEEDED_TIME_LIMIT)`. The
+   per-operation httpx timeout stays — it still catches a stalled single
+   read sooner. `timeout_seconds=None` means no deadline: that is core
+   declining to bound the query, and the adapter invents no bound of its own.
 3. `response.py` reads `resultTable.dataSchema.columnNames`,
    `resultTable.rows`, `numRowsResultSet`. Rows are capped at `max_rows`
    with `truncated` from the +1 the server already asked for.
@@ -219,7 +246,12 @@ for, never admissions.
 | 700 other `QueryValidationError` | `NOT_SUPPORTED` | `QueryFailedError` |
 | 245 join/window row limit | `EXCEEDED_ROW_LIMIT` (new, engine-agnostic) | `QueryFailedError` |
 | 400 `BrokerTimeoutError`, 427 servers not responded | `EXCEEDED_TIME_LIMIT` | `QueryFailedError` |
-| 503 response size (single-stage engine only) | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
+| 180 `AccessDenied` | `PERMISSION_DENIED` | `QueryFailedError` |
+| 503 whose message carries `exceeds threshold` or `Serialized query response size` (the oversized-response refusal, single-stage engine only) | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
+| 503 otherwise — it is `QUERY_CANCELLATION`, which `QueryScheduler` reuses for the size refusal and `LeafOperator` emits as `Cancelled while waiting for leaf results` | — (no core hint) | `EngineError` — a cancellation is not the query's fault |
+| broker HTTP 401/403 (auth filter, or either request handler's `WebApplicationException(FORBIDDEN)` for a table refusal) → adapter-private `PinotForbidden`, never carrying the response body | `PERMISSION_DENIED` | `QueryFailedError` |
+| controller HTTP 401/403 during grounding → `PinotForbidden` | — | `EngineError("Lagaam's Pinot credentials were refused")` — our text, never the body; the agent cannot rewrite its way out of the server's own credentials |
+| exceeded total deadline (`anyio.fail_after`) | `EXCEEDED_TIME_LIMIT` | `QueryFailedError` |
 | — client-side ceiling (`PinotResponseTooLarge`, adapter-private): the multi-stage engine does not enforce `maxQueryResponseSizeBytes` | `RESPONSE_TOO_LARGE` (new) | `QueryFailedError` |
 | HTTP 200 with `partialResult`, `numGroupsLimitReached` or `groupsTrimmed` true | `INCOMPLETE_RESULT` (new) | `QueryFailedError` |
 | anything else, transport, non-JSON body | — | `EngineError("the query engine is not reachable right now")` |
@@ -236,9 +268,10 @@ double quotes, strings in single quotes; table and column names are
 case-insensitive; time columns are epoch numbers, convert with
 `DATETIMECONVERT`/`DATETRUNC`/`ToDateTime`; always filter on the table's
 time column — that is what prunes segments; prefer `DISTINCTCOUNTHLL` over
-`DISTINCTCOUNT`; every query needs a LIMIT and one is added if missing;
-`SELECT *` is rejected; joins run on the multi-stage engine and are
-bounded by a row limit.
+`DISTINCTCOUNT`; a type ending in `[]` is a multi-value column, so use
+`ARRAYLENGTH`/ARRAY functions rather than scalar comparisons; every query
+needs a LIMIT and one is added if missing; `SELECT *` is rejected; joins
+run on the multi-stage engine and are bounded by a row limit.
 
 ## Configuration and wiring
 
@@ -264,6 +297,9 @@ loading over ~20 minutes, so the integration fixture waits for
   attribution, the product/max rule) on hand-built facts.
 - Integration (`-m integration`, `pinot_ready` fixture that skips when the
   controller is unreachable): the port is satisfied; grounding round-trip;
+  `describe_table` accepts the name it just returned and the lowercase
+  grant spelling, and agrees with the listing; a multi-value column grounds
+  as `INT[]`/`STRING[]` and its cells come back as arrays;
   a validated query executes with a LIMIT on MSE; each query option trips
   when set low; `numGroupsLimit=2` raises; a bad column, table, function
   and a timeout each map to their hint; the quotation for a time-filtered
