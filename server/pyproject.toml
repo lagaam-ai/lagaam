@@ -12,6 +12,8 @@ dependencies = [
     "sqlglot>=30,<31",
     # The Pinot adapter's only transport: one POST and one JSON response.
     "httpx>=0.27",
+    # httpx bounds each operation; anyio bounds the whole broker call.
+    "anyio>=4",
     "trino>=0.330",
 ]
 

@@ -10,6 +10,7 @@ httpx exceptions and broker messages never escape.
 import math
 import os
 
+import anyio
 import httpx
 
 from lagaam.adapters.pinot.client import (
@@ -53,7 +54,8 @@ _OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
 _OPT_MAX_ROWS_IN_WINDOW = "maxRowsInWindow"
 _OPT_MAX_RESPONSE_BYTES = "maxQueryResponseSizeBytes"
 
-# Backstop only: the broker must hit its own timeoutMs and answer first.
+# Backstop only: the broker must hit its own timeoutMs and answer first. Now
+# also the total deadline, so a body arriving in slow chunks cannot outlast it.
 _TIMEOUT_GRACE_SECONDS = 5.0
 
 
@@ -230,9 +232,13 @@ class PinotEngine:
             else timeout_seconds + _TIMEOUT_GRACE_SECONDS
         )
         try:
-            body = await self._client.broker_query(
-                two_part, options, timeout_seconds=client_timeout
+            body = await self._with_deadline(
+                two_part, options, client_timeout
             )
+        except TimeoutError as exc:
+            raise QueryFailedError(
+                hint_for_engine_error("EXCEEDED_TIME_LIMIT")
+            ) from exc
         except PinotResponseTooLarge as exc:
             raise QueryFailedError(
                 hint_for_engine_error("RESPONSE_TOO_LARGE")
@@ -250,6 +256,21 @@ class PinotEngine:
                 raise QueryFailedError(hint_for_engine_error(failure))
             raise EngineError(_UNREACHABLE)
         return parse_query_result(body, max_rows)
+
+    async def _with_deadline(
+        self, sql: str, options: str, deadline: float | None
+    ) -> object:
+        """The broker call, bounded end to end rather than per operation.
+
+        httpx's timeout resets on every read, so a body trickling in chunks
+        outlives it: measured, a 0.2s budget returned a result after 6.01s.
+        """
+        if deadline is None:
+            return await self._client.broker_query(sql, options)
+        with anyio.fail_after(deadline):
+            return await self._client.broker_query(
+                sql, options, timeout_seconds=deadline
+            )
 
     def _query_options(self, timeout_seconds: float | None) -> str:
         """The reins, as Pinot's semicolon-separated option string."""

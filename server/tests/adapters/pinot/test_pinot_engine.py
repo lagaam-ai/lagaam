@@ -3,12 +3,16 @@
 import base64
 import json
 import os
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import pytest
 
+from lagaam.adapters.pinot import engine as engine_module
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
 from lagaam.core.ports import QueryEngine
@@ -65,6 +69,17 @@ def two_database_handler(
 
 def tables_response(*names: str) -> httpx.Response:
     return httpx.Response(200, json={"tables": list(names)})
+
+
+class _AsyncStream(httpx.AsyncByteStream):
+    """A response body httpx reads one awaited chunk at a time."""
+
+    def __init__(self, chunks: AsyncIterator[bytes]) -> None:
+        self._chunks = chunks
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._chunks:
+            yield chunk
 
 
 def test_pinot_engine_satisfies_the_port() -> None:
@@ -487,6 +502,73 @@ async def test_the_client_read_timeout_outlives_the_brokers_own_deadline() -> No
     options = seen["body"]["queryOptions"].split(";")
     assert "timeoutMs=2000" in options
     assert seen["extensions"]["timeout"]["read"] == 7.0
+
+
+async def test_a_body_that_trickles_past_the_budget_is_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # httpx's timeout is per operation, so a body arriving in slow chunks
+    # never trips it: measured, a 0.2s budget returned a result after 6.01s.
+    # The grace is shortened here so the test costs a second, not six.
+    monkeypatch.setattr(engine_module, "_TIMEOUT_GRACE_SECONDS", 0.3)
+
+    async def chunks() -> Any:
+        raw = json.dumps(load("agg-groupby.json")).encode()
+        size = len(raw) // 4 + 1
+        for start in range(0, len(raw), size):
+            # Each read is well inside the per-operation timeout; only the
+            # total outlasts the budget, which is exactly the hole being shut.
+            await anyio.sleep(0.25)
+            yield raw[start : start + size]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_AsyncStream(chunks()))
+
+    started = time.monotonic()
+    with pytest.raises(QueryFailedError, match="took too long"):
+        await make_engine(handler).execute(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5",
+            max_rows=10,
+            timeout_seconds=0.05,
+        )
+    # Failed at the 0.35s deadline, not after the ~1.0s the body would take.
+    assert time.monotonic() - started < 0.8
+
+
+async def test_a_body_within_the_budget_still_answers() -> None:
+    # Without this, the deadline test above could pass on a broken request.
+    async def chunks() -> Any:
+        raw = json.dumps(load("agg-groupby.json")).encode()
+        await anyio.sleep(0.05)
+        yield raw
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_AsyncStream(chunks()))
+
+    result = await make_engine(handler).execute(
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 5",
+        max_rows=3,
+        timeout_seconds=10.0,
+    )
+    assert result.row_count == 3
+
+
+async def test_no_budget_means_no_deadline_to_outlast() -> None:
+    # timeout_seconds=None is core declining to bound the query; the adapter
+    # must not invent a bound of its own.
+    async def chunks() -> Any:
+        raw = json.dumps(load("agg-groupby.json")).encode()
+        await anyio.sleep(0.05)
+        yield raw
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=_AsyncStream(chunks()))
+
+    result = await make_engine(handler).execute(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5", max_rows=10
+    )
+    assert result.row_count == 5
 
 
 async def test_a_sub_millisecond_timeout_rounds_up_rather_than_to_zero() -> None:
