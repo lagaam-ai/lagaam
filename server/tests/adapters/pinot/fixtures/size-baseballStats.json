@@ -1,0 +1,26 @@
+{
+    "tableName": "baseballStats",
+    "reportedSizeInBytes": 3342450,
+    "estimatedSizeInBytes": 3342450,
+    "reportedSizePerReplicaInBytes": 3342450,
+    "offlineSegments": {
+        "reportedSizeInBytes": 3342450,
+        "estimatedSizeInBytes": 3342450,
+        "missingSegments": 0,
+        "reportedSizePerReplicaInBytes": 3342450,
+        "segments": {
+            "baseballStats_OFFLINE_0_d558c308-f227-4ffb-ba1a-04d217a0eae7": {
+                "reportedSizeInBytes": 3342450,
+                "estimatedSizeInBytes": 3342450,
+                "maxReportedSizePerReplicaInBytes": 3342450,
+                "serverInfo": {
+                    "Server_172.17.0.2_7050": {
+                        "segmentName": "baseballStats_OFFLINE_0_d558c308-f227-4ffb-ba1a-04d217a0eae7",
+                        "diskSizeInBytes": 3342450
+                    }
+                }
+            }
+        }
+    },
+    "realtimeSegments": null
+}
