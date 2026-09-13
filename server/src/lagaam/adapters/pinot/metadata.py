@@ -7,8 +7,9 @@ that crashes on an unexpected key costs an agent the names it needs, and a
 missing number fails safe at the budget gate anyway.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from lagaam.core.models import ColumnInfo, TableSchema
 
