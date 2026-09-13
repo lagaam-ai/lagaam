@@ -14,9 +14,9 @@ from lagaam.core.identity import AgentIdentity
 from lagaam.core.models import CatalogInfo, CatalogMetadata, SchemaInfo
 
 
-def guard(sql: str, allowed: set[str] | None) -> None:
+def guard(sql: str, allowed: set[str] | None, dialect: str = "trino") -> None:
     identity = AgentIdentity(name="agent-1", allowed_tables=allowed)
-    check_tables_allowed(sql, dialect="trino", identity=identity)
+    check_tables_allowed(sql, dialect=dialect, identity=identity)
 
 
 # --- what passes ---------------------------------------------------------
@@ -76,6 +76,72 @@ def test_cte_shapes_that_stay_in_scope_pass() -> None:
     )
 
 
+def test_a_cte_vouches_for_the_query_body_that_owns_its_with() -> None:
+    # The body runs after every declaration, so any of them is in scope there.
+    guard(
+        "WITH a AS (SELECT k FROM tpch.tiny.orders), b AS (SELECT 1 AS k) "
+        "SELECT a.k FROM a JOIN b ON a.k = b.k",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_cte_vouches_for_a_later_sibling() -> None:
+    # Backward reference: `a` is declared before `b`, so `b` reads the CTE.
+    guard(
+        "WITH a AS (SELECT k FROM tpch.tiny.orders), b AS (SELECT k FROM a) "
+        "SELECT k FROM b",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_cte_vouches_for_a_set_operation_on_the_query_body() -> None:
+    # A top-level UNION's `with_` hangs off the Union node, not a Select.
+    guard(
+        "WITH a AS (SELECT k FROM tpch.tiny.orders) "
+        "SELECT k FROM a UNION ALL SELECT k FROM a",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_sibling_vouches_for_a_reference_nested_several_subqueries_deep() -> None:
+    # The forward reference to `t` sits two derived-table levels inside `a`'s
+    # body; a sibling declared after `a` still must not vouch for it.
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "WITH a AS (SELECT * FROM (SELECT * FROM (SELECT k FROM t) q1) q2), "
+            "t AS (SELECT 1 AS k) SELECT * FROM a",
+            allowed={"tpch.tiny.orders"},
+        )
+    # Mirror: `t` declared first, `a` reads it several subquery levels deep.
+    guard(
+        "WITH t AS (SELECT 1 AS k), "
+        "a AS (SELECT * FROM (SELECT * FROM (SELECT k FROM t) q1) q2) "
+        "SELECT * FROM a",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_later_sibling_vouches_for_the_first_of_two_duplicate_names() -> None:
+    # Engines reject duplicate CTE names, but `b` reading `t` before the
+    # second `t` is declared must resolve to the first `t`, not be shadowed.
+    guard(
+        "WITH t AS (SELECT k FROM tpch.tiny.orders), b AS (SELECT k FROM t), "
+        "t AS (SELECT 1 AS k) SELECT k FROM b",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_forward_reference_shadowed_by_a_duplicate_name_stays_denied() -> None:
+    # `a`'s reference to `bad` is still a forward reference even though a
+    # later duplicate `bad` happens to be legitimately granted.
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "WITH a AS (SELECT k FROM bad), bad AS (SELECT 1 AS k), "
+            "bad AS (SELECT k FROM tpch.tiny.orders) SELECT k FROM a",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
 # --- what is denied ------------------------------------------------------
 
 
@@ -95,6 +161,34 @@ def test_a_cte_in_a_sibling_scope_does_not_vouch_for_a_bare_name() -> None:
         guard(
             "WITH a AS (WITH customer AS (SELECT 1 AS c) SELECT c FROM customer) "
             "SELECT x FROM customer",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
+def test_a_later_cte_does_not_vouch_for_a_bare_name_in_an_earlier_one() -> None:
+    # Forward reference: inside `first`, airlineStats is declared LATER, so
+    # the engine resolves it in the session database, not to the CTE.
+    # Measured through the Pinot adapter: this returned a row from the
+    # ungranted airlineStats while only baseballStats was granted.
+    with pytest.raises(TableAccessDeniedError, match="airlineStats"):
+        guard(
+            "WITH first AS (SELECT Carrier FROM airlineStats LIMIT 1), "
+            "airlineStats AS (SELECT playerName AS Carrier FROM "
+            "pinot.default.baseballStats LIMIT 1) "
+            "SELECT Carrier FROM first LIMIT 1",
+            allowed={"pinot.default.baseballstats"},
+        )
+
+
+def test_forward_reference_to_a_later_cte_is_denied_on_trino_names() -> None:
+    # The same shape in Trino spelling. Trino resolves the bare name against
+    # the session schema and returns the physical table's rows; our adapter
+    # sets no session schema today, which shields it only by accident.
+    with pytest.raises(TableAccessDeniedError, match="customer"):
+        guard(
+            "WITH first AS (SELECT name FROM customer LIMIT 1), "
+            "customer AS (SELECT k AS name FROM tpch.tiny.orders) "
+            "SELECT name FROM first",
             allowed={"tpch.tiny.orders"},
         )
 
