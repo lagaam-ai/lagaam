@@ -9,6 +9,7 @@ httpx exceptions and broker messages never escape.
 
 import math
 import os
+from typing import Any
 
 import anyio
 import httpx
@@ -259,7 +260,7 @@ class PinotEngine:
 
     async def _with_deadline(
         self, sql: str, options: str, deadline: float | None
-    ) -> object:
+    ) -> Any:
         """The broker call, bounded end to end rather than per operation.
 
         httpx's timeout resets on every read, so a body trickling in chunks
