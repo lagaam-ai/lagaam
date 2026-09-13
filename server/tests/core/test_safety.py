@@ -54,6 +54,96 @@ def test_existing_limit_is_kept() -> None:
     assert "1000" not in sql
 
 
+def test_a_tighter_limit_is_left_alone() -> None:
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders LIMIT 5",
+        dialect="trino",
+        default_limit=1001,
+    )
+    assert "LIMIT 5" in sql
+    assert "1001" not in sql
+
+
+def test_an_oversized_limit_is_lowered_to_the_cap() -> None:
+    # An engine without paging downloads every row the LIMIT allows, so the
+    # cap has to reach the SQL, not just the rows we keep afterwards.
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders LIMIT 5000",
+        dialect="trino",
+        default_limit=6,
+    )
+    assert sql == "SELECT orderkey FROM tpch.tiny.orders LIMIT 6"
+
+
+def test_a_clamped_limit_keeps_its_offset() -> None:
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders OFFSET 10 LIMIT 5000",
+        dialect="trino",
+        default_limit=6,
+    )
+    assert "OFFSET 10" in sql
+    assert "LIMIT 6" in sql
+    assert "5000" not in sql
+
+
+def test_an_oversized_fetch_first_is_lowered_too() -> None:
+    # FETCH FIRST parses under the same "limit" arg, as exp.Fetch.
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders FETCH FIRST 5000 ROWS ONLY",
+        dialect="trino",
+        default_limit=6,
+    )
+    assert "5000" not in sql
+    assert "6" in sql
+
+
+def test_an_oversized_limit_is_clamped_through_the_grouping_wrapper() -> None:
+    # ROLLUP renders through the _lagaam subquery wrapper; the clamp happens
+    # on the tree, so the wrapper inherits it instead of re-exporting 5000.
+    sql = validate_query(
+        "SELECT a, count(*) FROM c.s.t GROUP BY ROLLUP (a) LIMIT 5000",
+        dialect="trino",
+        default_limit=6,
+    )
+    assert "5000" not in sql
+    assert "LIMIT 6" in sql
+    assert sqlglot.parse_one(sql, dialect="trino") is not None
+
+
+@pytest.mark.parametrize(
+    "limit",
+    ["?", ":n", "10 + 20", "-5"],
+)
+@pytest.mark.parametrize("dialect", ["trino", None])
+def test_a_limit_that_is_not_a_plain_number_is_refused(
+    limit: str, dialect: str | None
+) -> None:
+    # These all parse in both dialects, so the refusal is ours to make: an
+    # unreadable LIMIT cannot be compared against the cap.
+    with pytest.raises(SqlValidationError, match="plain number"):
+        validate_query(
+            f"SELECT orderkey FROM tpch.tiny.orders LIMIT {limit}",
+            dialect=dialect or "",
+            default_limit=6,
+        )
+
+
+def test_limit_all_is_pinned() -> None:
+    # Trino's parser drops LIMIT ALL entirely, so the cap is injected; the
+    # generic dialect reads it as a column reference and it is refused.
+    assert "LIMIT 6" in validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders LIMIT ALL",
+        dialect="trino",
+        default_limit=6,
+    )
+    with pytest.raises(SqlValidationError, match="plain number"):
+        validate_query(
+            "SELECT orderkey FROM tpch.tiny.orders LIMIT ALL",
+            dialect="",
+            default_limit=6,
+        )
+
+
 def test_output_is_canonicalized_trino_sql() -> None:
     # What was validated is exactly what runs — the AST is re-rendered.
     sql = validate("select orderkey from tpch.tiny.orders limit 3")

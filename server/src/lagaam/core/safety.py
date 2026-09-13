@@ -156,13 +156,41 @@ def _parse_statements(sql: str, dialect: str) -> list[exp.Expr | None]:
         return statements
 
 
+def _clamp_limit(tree: exp.Expr, default_limit: int) -> None:
+    """Lower an outer LIMIT larger than ``default_limit``, in place.
+
+    Runs on the parsed tree, before rendering, so both the _GROUPING_LIMIT
+    re-attach path and the ``_reparseable`` wrapper inherit the clamped
+    value rather than re-exporting what the agent asked for. A tighter LIMIT
+    is the agent's own choice and is left alone.
+
+    An engine that streams pays only planning for an oversized LIMIT, but one
+    that downloads the whole result body transfers and parses every row the
+    LIMIT allows and can hit its response ceiling before returning the rows
+    the budget permits — measured on Pinot, where a 5-row budget survives
+    ``LIMIT 6`` and fails outright on ``LIMIT 5000``. Clamping here means the
+    audit line records what actually ran, and every adapter benefits.
+    """
+    limit = tree.args["limit"]
+    # exp.Fetch (FETCH FIRST n ROWS ONLY) keeps its count under a different key.
+    key = "count" if isinstance(limit, exp.Fetch) else "expression"
+    rows = limit.args.get(key)
+    if not isinstance(rows, exp.Literal) or rows.is_string or not rows.is_int:
+        raise SqlValidationError(
+            "The row limit must be a plain number this server can compare "
+            "against your row cap. Write LIMIT with a literal integer."
+        )
+    if int(rows.this) > default_limit:
+        limit.set(key, exp.Literal.number(default_limit))
+
+
 def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     """Validate one read-only SELECT and return the canonical SQL to execute.
 
     Rejects (with what-to-change text): unparseable input, multiple
     statements, anything but SELECT/UNION/CTE, write/DDL nodes anywhere in
     the tree, and ``*`` projections. Injects ``LIMIT default_limit`` when
-    the outer query has none.
+    the outer query has none, and lowers a larger one to it.
     """
     if len(sql) > _MAX_SQL_CHARS:
         raise SqlValidationError(
@@ -239,6 +267,8 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     # FETCH FIRST N ROWS parses under the "limit" key too, so this covers it.
     if tree.args.get("limit") is None:
         tree = tree.limit(default_limit)
+    else:
+        _clamp_limit(tree, default_limit)
 
     # Comments carry nothing the engine needs, and kilobytes of them are how
     # an agent pushes the real query out of a truncated audit line.
