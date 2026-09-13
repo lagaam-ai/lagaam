@@ -130,8 +130,10 @@ suite against the dockerized quickstart.
   explicit `false` counts; an unreadable flag stays scalar.
   `row_estimate` = `GET /tables/{t}/metadata` → `$.numRows`,
   which matched `count(*)` exactly on OFFLINE tables and is **0** while a
-  REALTIME table is consuming, so a REALTIME half sets `row_estimate` to
-  `None` rather than 0.
+  REALTIME table is consuming, so the count is carried only where the table
+  config positively establishes an offline-only table (types ==
+  `{"OFFLINE"}`); a REALTIME half, an unknown type set, or a config too
+  broken or missing to read all set `row_estimate` to `None` rather than 0.
 - A catalog other than `pinot`, a name absent from the listing, or a
   controller 404, is `TableNotFoundError`. The card echoes the
   **controller's** spelling for `table` — not a lowercased one — so

@@ -39,9 +39,13 @@ def row_estimate(metadata_json: Any, types: frozenset[str]) -> int | None:
 
     Measured: a REALTIME table serving 70 rows reported numRows 0, because a
     consuming segment's size is unknown until it is sealed. Zero would ground
-    an agent on a falsehood, so a REALTIME half means None.
+    an agent on a falsehood, so the count is a fact only where the config
+    positively establishes an offline-only table: a REALTIME half, an unknown
+    type set, or a config too broken to read all mean None. An empty set is
+    what an unreadable config yields, and that config is the only thing that
+    could have ruled out a consuming half.
     """
-    if "REALTIME" in types:
+    if types != frozenset({"OFFLINE"}):
         return None
     if not isinstance(metadata_json, dict):
         return None

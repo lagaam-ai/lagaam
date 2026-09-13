@@ -220,6 +220,19 @@ async def test_describe_table_returns_the_grounding_card() -> None:
     assert any(c.name == "Carrier" for c in card.columns)
 
 
+async def test_an_unreadable_config_costs_the_row_count_not_the_columns() -> None:
+    # A 404 on the config degrades to no type set, and without the config
+    # nothing rules out a consuming REALTIME half whose numRows reads 0.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables/airlineStats":
+            return httpx.Response(404, json={"code": 404, "error": "not found"})
+        return controller_handler(request)
+
+    card = await make_engine(handler).describe_table("pinot", "default", "airlineStats")
+    assert card.row_estimate is None
+    assert any(c.name == "Carrier" for c in card.columns)
+
+
 async def test_describe_table_accepts_any_spelling_of_the_name() -> None:
     card = await make_engine().describe_table("PINOT", "DEFAULT", "airlineStats")
     assert card.table == "airlineStats"

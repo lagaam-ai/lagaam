@@ -68,6 +68,20 @@ def test_a_realtime_half_makes_the_row_count_unknown_rather_than_zero() -> None:
     assert row_estimate(body, frozenset({"OFFLINE", "REALTIME"})) is None
 
 
+def test_an_unknown_type_set_makes_the_row_count_unknown_rather_than_zero() -> None:
+    # An empty set is what an unreadable config yields, and that config is the
+    # only thing that could have ruled out a consuming REALTIME half.
+    assert row_estimate(load("metadata-airlineStats.json"), frozenset()) is None
+    assert row_estimate(load("rt-metadata.json"), frozenset()) is None
+
+
+@pytest.mark.parametrize("config", [None, [], "junk", {}, {"NONSENSE": {}}])
+def test_an_unreadable_config_makes_the_row_count_unknown(config: Any) -> None:
+    metadata = load("metadata-airlineStats.json")
+    assert metadata["numRows"] == 9746
+    assert row_estimate(metadata, table_types(config)) is None
+
+
 @pytest.mark.parametrize("body", [None, {}, {"numRows": "many"}, "junk", []])
 def test_row_estimate_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
     assert row_estimate(body, frozenset({"OFFLINE"})) is None
