@@ -36,8 +36,8 @@ def surviving_bytes(
 ) -> int | None:
     """Bytes in the k largest segments, charging only referenced columns.
 
-    A table whose column attribution finds nothing is charged whole segments
-    rather than nothing at all — the fallback the spec requires.
+    A segment matching none of the referenced columns is charged whole,
+    and unresolvable columns fall back to whole segments table-wide.
     """
     sizes = _column_sizes(facts, columns)
     if sizes is None:
@@ -90,19 +90,23 @@ def _k(surviving: int | None, available: int) -> int:
 def _column_sizes(
     facts: TableFacts, columns: frozenset[str] | None
 ) -> list[int | None] | None:
-    """Per-segment bytes for the referenced columns, or None to fall back."""
+    """Per-segment bytes for the referenced columns; None only if columns is None.
+
+    A segment whose columns match none of `columns` falls back to its own
+    total_bytes, so the fallback is decided per segment, not per table.
+    """
     if columns is None:
         return None
     sizes: list[int | None] = []
-    matched = False
     for segment in facts.segments:
         total = 0
+        matched = False
         for name, size in segment.column_bytes.items():
             if name.lower() in columns:
                 total += size
                 matched = True
-        sizes.append(total)
-    return sizes if matched else None
+        sizes.append(total if matched else segment.total_bytes)
+    return sizes
 
 
 def _total(values: Iterable[int | None]) -> int | None:

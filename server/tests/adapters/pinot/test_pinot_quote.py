@@ -86,6 +86,14 @@ def test_a_table_matching_no_referenced_column_falls_back_to_whole_segments() ->
     assert surviving_bytes(table, None, frozenset({"absent"})) == 999
 
 
+def test_a_segment_matching_no_referenced_column_is_charged_whole() -> None:
+    table = facts(seg("a", 10, 100, x=5), seg("b", 10, 500_000))
+    assert surviving_bytes(table, None, frozenset({"x"})) == 500_005
+
+    table_no_size = facts(seg("a", 10, 100, x=5), seg("b", 10, None))
+    assert surviving_bytes(table_no_size, None, frozenset({"x"})) is None
+
+
 def test_unresolvable_columns_fall_back_to_whole_segments() -> None:
     table = facts(seg("a", 10, 999, other=7))
     assert surviving_bytes(table, None, None) == 999
