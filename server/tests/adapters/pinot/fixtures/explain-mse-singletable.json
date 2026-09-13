@@ -1,0 +1,72 @@
+{
+    "resultTable": {
+        "dataSchema": {
+            "columnNames": [
+                "SQL",
+                "PLAN",
+                "RULE_TIMINGS"
+            ],
+            "columnDataTypes": [
+                "STRING",
+                "STRING",
+                "STRING"
+            ]
+        },
+        "rows": [
+            [
+                "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT Carrier, count(*) FROM default.airlineStats WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 10",
+                "{\n  \"rels\": [\n    {\n      \"id\": \"0\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"airlineStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"1\",\n      \"relOp\": \"LogicalFilter\",\n      \"condition\": {\n        \"op\": {\n          \"name\": \"SEARCH\",\n          \"kind\": \"SEARCH\",\n          \"syntax\": \"INTERNAL\"\n        },\n        \"operands\": [\n          {\n            \"input\": 22,\n            \"name\": \"$22\"\n          },\n          {\n            \"literal\": {\n              \"rangeSet\": [\n                [\n                  \"closed\",\n                  \"16071\",\n                  \"16073\"\n                ]\n              ],\n              \"nullAs\": \"UNKNOWN\"\n            },\n            \"type\": {\n              \"type\": \"INTEGER\",\n              \"nullable\": false\n            }\n          }\n        ]\n      },\n      \"type\": \"LogicalFilter\"\n    },\n    {\n      \"id\": \"2\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalAggregate\",\n      \"group\": [\n        18\n      ],\n      \"aggs\": [\n        {\n          \"agg\": {\n            \"name\": \"COUNT\",\n            \"kind\": \"COUNT\",\n            \"syntax\": \"FUNCTION\"\n          },\n          \"type\": {\n            \"type\": \"BIGINT\",\n            \"nullable\": false\n          },\n          \"distinct\": false,\n          \"operands\": [],\n          \"name\": null\n        }\n      ],\n      \"aggType\": \"LEAF\",\n      \"type\": \"PinotLogicalAggregate\"\n    },\n    {\n      \"id\": \"3\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\",\n        \"keys\": [\n          0\n        ]\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"4\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalAggregate\",\n      \"group\": [\n        0\n      ],\n      \"aggs\": [\n        {\n          \"agg\": {\n            \"name\": \"COUNT\",\n            \"kind\": \"COUNT\",\n            \"syntax\": \"FUNCTION\"\n          },\n          \"type\": {\n            \"type\": \"BIGINT\",\n            \"nullable\": false\n          },\n          \"distinct\": false,\n          \"operands\": [],\n          \"name\": null\n        }\n      ],\n      \"aggType\": \"FINAL\",\n      \"type\": \"PinotLogicalAggregate\"\n    },\n    {\n      \"id\": \"5\",\n      \"relOp\": \"LogicalSort\",\n      \"collation\": [],\n      \"fetch\": {\n        \"literal\": 10,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"type\": \"LogicalSort\"\n    },\n    {\n      \"id\": \"6\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalSortExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\"\n      },\n      \"collation\": [],\n      \"isSortOnSender\": false,\n      \"isSortOnReceiver\": false,\n      \"type\": \"PinotLogicalSortExchange\"\n    },\n    {\n      \"id\": \"7\",\n      \"relOp\": \"LogicalSort\",\n      \"collation\": [],\n      \"offset\": {\n        \"literal\": 0,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"fetch\": {\n        \"literal\": 10,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"type\": \"LogicalSort\"\n    }\n  ]\n}",
+                "{\n  \"ruleExecutionTimes\": [\n    {\n      \"rule\": \"ProjectFilterTranspose\", \n      \"time\": 0.12\n    },\n    {\n      \"rule\": \"SortRemove\", \n      \"time\": 0.01\n    },\n    {\n      \"rule\": \"AggregateProjectMerge\", \n      \"time\": 0.05\n    },\n    {\n      \"rule\": \"ProjectMerge\", \n      \"time\": 0.02\n    },\n    {\n      \"rule\": \"EvaluateProjectLiteral\", \n      \"time\": 0.00\n    },\n    {\n      \"rule\": \"AggregateRemove\", \n      \"time\": 0.33\n    },\n    {\n      \"rule\": \"FilterProjectTranspose\", \n      \"time\": 0.04\n    },\n    {\n      \"rule\": \"EvaluateFilterLiteral\", \n      \"time\": 0.02\n    }  ]\n}\n"
+            ]
+        ]
+    },
+    "numRowsResultSet": 1,
+    "partialResult": false,
+    "exceptions": [],
+    "numGroupsLimitReached": false,
+    "numGroupsWarningLimitReached": false,
+    "timeUsedMs": 0,
+    "requestId": "1146010015000001730",
+    "clientRequestId": null,
+    "brokerId": "Broker_172.17.0.2_8000",
+    "numDocsScanned": 0,
+    "totalDocs": 0,
+    "numEntriesScannedInFilter": 0,
+    "numEntriesScannedPostFilter": 0,
+    "numServersQueried": 0,
+    "numServersResponded": 0,
+    "numSegmentsQueried": 0,
+    "numSegmentsProcessed": 0,
+    "numSegmentsMatched": 0,
+    "numConsumingSegmentsQueried": 0,
+    "numConsumingSegmentsProcessed": 0,
+    "numConsumingSegmentsMatched": 0,
+    "minConsumingFreshnessTimeMs": 0,
+    "numSegmentsPrunedByBroker": 0,
+    "numSegmentsPrunedByServer": 0,
+    "numSegmentsPrunedInvalid": 0,
+    "numSegmentsPrunedByLimit": 0,
+    "numSegmentsPrunedByValue": 0,
+    "brokerReduceTimeMs": 0,
+    "offlineThreadCpuTimeNs": 0,
+    "realtimeThreadCpuTimeNs": 0,
+    "offlineSystemActivitiesCpuTimeNs": 0,
+    "realtimeSystemActivitiesCpuTimeNs": 0,
+    "offlineResponseSerializationCpuTimeNs": 0,
+    "realtimeResponseSerializationCpuTimeNs": 0,
+    "offlineTotalCpuTimeNs": 0,
+    "realtimeTotalCpuTimeNs": 0,
+    "explainPlanNumEmptyFilterSegments": 0,
+    "explainPlanNumMatchAllFilterSegments": 0,
+    "traceInfo": {},
+    "tablesQueried": [],
+    "offlineThreadMemAllocatedBytes": 0,
+    "realtimeThreadMemAllocatedBytes": 0,
+    "offlineResponseSerMemAllocatedBytes": 0,
+    "realtimeResponseSerMemAllocatedBytes": 0,
+    "offlineTotalMemAllocatedBytes": 0,
+    "realtimeTotalMemAllocatedBytes": 0,
+    "pools": [],
+    "rlsFiltersApplied": false,
+    "groupsTrimmed": false
+}
