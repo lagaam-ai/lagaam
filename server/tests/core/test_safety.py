@@ -11,7 +11,7 @@ import pytest
 import sqlglot
 
 from lagaam.core.errors import SqlValidationError
-from lagaam.core.safety import _bracket_depth, validate_query
+from lagaam.core.safety import _bracket_depth, _clamp_limit, _reparseable, validate_query
 
 
 def validate(sql: str) -> str:
@@ -110,6 +110,20 @@ def test_an_oversized_limit_is_clamped_through_the_grouping_wrapper() -> None:
     assert sqlglot.parse_one(sql, dialect="trino") is not None
 
 
+def test_a_fetch_limited_rollup_is_clamped_through_the_wrapper() -> None:
+    # exp.Fetch keeps its count under "count", not "expression". Trino's own
+    # parser re-reads a plain FETCH-after-ROLLUP fine, so the wrapper isn't
+    # reached on the happy path — force it the way a reread failure would,
+    # to pin the wrapper's own handling of a Fetch-limited tree.
+    sql = "SELECT a, count(*) FROM c.s.t GROUP BY ROLLUP (a) FETCH FIRST 5000 ROWS ONLY"
+    tree = sqlglot.parse_one(sql, read="trino")
+    _clamp_limit(tree, 6)
+    out = _reparseable("garbage the parser cannot reread", tree, "trino")
+    assert "5000" not in out
+    assert "LIMIT 6" in out
+    assert sqlglot.parse_one(out, dialect="trino") is not None
+
+
 @pytest.mark.parametrize(
     "limit",
     ["?", ":n", "10 + 20", "-5"],
@@ -124,6 +138,31 @@ def test_a_limit_that_is_not_a_plain_number_is_refused(
         validate_query(
             f"SELECT orderkey FROM tpch.tiny.orders LIMIT {limit}",
             dialect=dialect or "",
+            default_limit=6,
+        )
+
+
+@pytest.mark.parametrize("dialect", ["trino", ""])
+def test_fetch_percent_is_refused(dialect: str) -> None:
+    # A percentage cannot be compared against a row-count cap.
+    with pytest.raises(SqlValidationError, match="row count"):
+        validate_query(
+            "SELECT orderkey FROM tpch.tiny.orders "
+            "FETCH FIRST 90 PERCENT ROWS ONLY",
+            dialect=dialect,
+            default_limit=6,
+        )
+
+
+@pytest.mark.parametrize("dialect", ["trino", ""])
+def test_fetch_with_ties_is_refused(dialect: str) -> None:
+    # WITH TIES can return more rows than the count, so the cap it would
+    # compare against is not the bound that actually runs.
+    with pytest.raises(SqlValidationError, match="WITH TIES"):
+        validate_query(
+            "SELECT orderkey FROM tpch.tiny.orders "
+            "FETCH FIRST 5 ROWS WITH TIES",
+            dialect=dialect,
             default_limit=6,
         )
 

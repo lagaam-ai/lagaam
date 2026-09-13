@@ -170,8 +170,25 @@ def _clamp_limit(tree: exp.Expr, default_limit: int) -> None:
     the budget permits — measured on Pinot, where a 5-row budget survives
     ``LIMIT 6`` and fails outright on ``LIMIT 5000``. Clamping here means the
     audit line records what actually ran, and every adapter benefits.
+    ``LIMIT ALL`` diverges by dialect: trino's parser drops it entirely, so
+    the cap is injected as an ordinary missing LIMIT; the generic dialect
+    reads ``ALL`` as a column and the non-integer check below refuses it.
     """
     limit = tree.args["limit"]
+    if isinstance(limit, exp.Fetch):
+        options = limit.args.get("limit_options")
+        if options is not None and options.args.get("percent"):
+            raise SqlValidationError(
+                "This server's row cap is a row count, so FETCH ... PERCENT "
+                "cannot be compared against it. Write FETCH FIRST n ROWS "
+                "ONLY with a literal integer."
+            )
+        if options is not None and options.args.get("with_ties"):
+            raise SqlValidationError(
+                "FETCH ... WITH TIES can return more rows than the count, "
+                "so it cannot be compared against this server's row cap. "
+                "Drop WITH TIES and retry."
+            )
     # exp.Fetch (FETCH FIRST n ROWS ONLY) keeps its count under a different key.
     key = "count" if isinstance(limit, exp.Fetch) else "expression"
     rows = limit.args.get(key)
@@ -301,9 +318,14 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
         )
     inner = tree.copy()
     inner.set("limit", None)
-    wrapped = (
-        exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(limit.expression)
-    )
+    # exp.Fetch keeps its row count under "count", not "expression".
+    rows = limit.args.get("count") if isinstance(limit, exp.Fetch) else limit.expression
+    if rows is None:
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        )
+    wrapped = exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(rows)
     rendered = wrapped.sql(dialect=dialect, comments=False)
     try:
         reread = sqlglot.parse_one(rendered, dialect=dialect)
