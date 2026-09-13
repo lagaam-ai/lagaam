@@ -1,0 +1,71 @@
+{
+ "maxQueryResponseSizeBytes=100": {
+  "http": 200,
+  "rows": 0,
+  "exceptions": [
+   {
+    "message": "Serialized query response size 5190 exceeds threshold 100 for requestId 786551596000000039 from broker Broker_172.17.0.2_8000",
+    "errorCode": 503
+   }
+  ],
+  "partialResult": true,
+  "groupsTrimmed": false
+ },
+ "maxServerResponseSizeBytes=100": {
+  "http": 200,
+  "rows": 0,
+  "exceptions": [
+   {
+    "message": "Serialized query response size 5190 exceeds threshold 100 for requestId 786551596000000040 from broker Broker_172.17.0.2_8000",
+    "errorCode": 503
+   }
+  ],
+  "partialResult": true,
+  "groupsTrimmed": false
+ },
+ "minSegmentGroupTrimSize=1": {
+  "http": 200,
+  "rows": 100,
+  "exceptions": [],
+  "partialResult": false,
+  "groupsTrimmed": false
+ },
+ "minServerGroupTrimSize=1": {
+  "http": 200,
+  "rows": 100,
+  "exceptions": [],
+  "partialResult": false,
+  "groupsTrimmed": false
+ },
+ "useMultistageEngine=true;maxRowsInJoin=5": {
+  "http": 200,
+  "rows": 0,
+  "exceptions": [
+   {
+    "message": "Received 1 error from stage 2 on Server_172.17.0.2_7050: Cannot build in memory hash table for join operator, reached number of rows limit: 5.\nConsider increasing the limit for the maximum number of rows in a join either via:\n  - The query option 'maxRowsInJoin'\n  - The hint 'max_rows_in_join' in the 'joinOptions\n'Alternatively, if partial results are acceptable, the join overflow mode can be set to 'BREAK' either via:\n  - The query option 'joinOverflowMode'\n  - The hint 'join_overflow_mode' in the 'joinOptions'\n",
+    "errorCode": 245
+   }
+  ],
+  "partialResult": true,
+  "groupsTrimmed": false
+ },
+ "useMultistageEngine=true;maxRowsInWindow=5": {
+  "http": 200,
+  "rows": 0,
+  "exceptions": [
+   {
+    "message": "Received 1 error from stage 2 on Server_172.17.0.2_7050: Cannot build in memory window cache for WINDOW operator, reach number of rows limit: 5",
+    "errorCode": 245
+   }
+  ],
+  "partialResult": true,
+  "groupsTrimmed": false
+ },
+ "bogusOptionName=7": {
+  "http": 200,
+  "rows": 1,
+  "exceptions": [],
+  "partialResult": false,
+  "groupsTrimmed": false
+ }
+}

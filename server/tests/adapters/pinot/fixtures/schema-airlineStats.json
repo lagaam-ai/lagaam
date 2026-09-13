@@ -1,0 +1,345 @@
+{
+  "schemaName" : "airlineStats",
+  "enableColumnBasedNullHandling" : false,
+  "dimensionFieldSpecs" : [ {
+    "name" : "ActualElapsedTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "AirTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "AirlineID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrDel15",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrDelayMinutes",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrTimeBlk",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "ArrivalDelayGroups",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "CRSArrTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "CRSDepTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "CRSElapsedTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "CancellationCode",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Cancelled",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Carrier",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "CarrierDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DayOfWeek",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DayofMonth",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepDel15",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepDelayMinutes",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepTimeBlk",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DepartureDelayGroups",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Dest",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestAirportID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestAirportSeqID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestCityMarketID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestCityName",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestState",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestStateFips",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestStateName",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DestWac",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Distance",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DistanceGroup",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivActualElapsedTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivAirportIDs",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivAirportLandings",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivAirportSeqIDs",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivAirports",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivArrDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivDistance",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivLongestGTimes",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivReachedDest",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "DivTailNums",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivTotalGTimes",
+    "dataType" : "LONG",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivWheelsOffs",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "DivWheelsOns",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "Diverted",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "FirstDepTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "FlightDate",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "FlightNum",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Flights",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "LateAircraftDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "LongestAddGTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Month",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "NASDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Origin",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginAirportID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginAirportSeqID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginCityMarketID",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginCityName",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginState",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginStateFips",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginStateName",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "OriginWac",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Quarter",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "RandomAirports",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION",
+    "singleValueField" : false
+  }, {
+    "name" : "SecurityDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "TailNum",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "TaxiIn",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "TaxiOut",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "Year",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "WheelsOn",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "WheelsOff",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "WeatherDelay",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "UniqueCarrier",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "TotalAddGTime",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  } ],
+  "dateTimeFieldSpecs" : [ {
+    "name" : "DaysSinceEpoch",
+    "dataType" : "INT",
+    "fieldType" : "DATE_TIME",
+    "format" : "1:DAYS:EPOCH",
+    "granularity" : "1:DAYS"
+  }, {
+    "name" : "ts",
+    "dataType" : "TIMESTAMP",
+    "fieldType" : "DATE_TIME",
+    "format" : "TIMESTAMP",
+    "granularity" : "1:SECONDS"
+  }, {
+    "name" : "tsRaw",
+    "dataType" : "TIMESTAMP",
+    "fieldType" : "DATE_TIME",
+    "format" : "TIMESTAMP",
+    "granularity" : "1:SECONDS"
+  } ]
+}

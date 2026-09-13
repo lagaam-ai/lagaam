@@ -95,7 +95,7 @@ The agent gets three tools — `list_catalogs`, `describe_table`,
 | `LAGAAM_MAX_SCAN_BYTES` | Scan-bytes budget per query, pre-execution | 50 GiB |
 | `LAGAAM_MAX_ROWS` | Scanned-row estimate budget per query | ungated |
 | `LAGAAM_MAX_INTERMEDIATE_ROWS` | Rows the engine would *build* at its widest step — not rows returned, so a `LIMIT` doesn't lower it | 50,000,000 |
-| `LAGAAM_MAX_RETURNED_ROWS` | Rows returned to the agent per query — unset, the server applies its own 1000-row cap | `1000` (max `100000`) |
+| `LAGAAM_MAX_RETURNED_ROWS` | Rows returned to the agent per query — unset, the server applies its own 1000-row cap, and a bigger `LIMIT` in the query is lowered to it before it runs | `1000` (max `100000`) |
 | `LAGAAM_QUERY_TIMEOUT` | Wall-clock seconds per query | `300` |
 | `LAGAAM_METADATA_TTL` | Metadata cache TTL, seconds | `300` |
 | `LAGAAM_AUDIT_LOG` | Audit JSONL file path | stderr |

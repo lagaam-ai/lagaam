@@ -1,0 +1,11 @@
+{
+  "tableName" : "airlineStats_REALTIME",
+  "diskSizeInBytes" : 0,
+  "numSegments" : 10,
+  "numRows" : 0,
+  "columnLengthMap" : { },
+  "columnCardinalityMap" : { },
+  "maxNumMultiValuesMap" : { },
+  "columnIndexSizeMap" : { },
+  "upsertPartitionToServerPrimaryKeyCountMap" : { }
+}

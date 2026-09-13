@@ -52,6 +52,25 @@ _HINTS: dict[str, str] = {
         "to optimise — reduce the number of joins or CTEs, or split it into "
         "separate queries — then retry."
     ),
+    # A hard backstop, not a truncation: the engine refused rather than
+    # returning a partial answer, so the query has to build fewer rows.
+    "EXCEEDED_ROW_LIMIT": (
+        "The query built too many rows at one step and was stopped. Join on a "
+        "column with more distinct values, filter each side before the join, "
+        "or aggregate earlier, then retry."
+    ),
+    "RESPONSE_TOO_LARGE": (
+        "The result was too large to send back. Return fewer columns, lower "
+        "the LIMIT, or aggregate instead of returning raw rows, then retry."
+    ),
+    # The engine answered, but trimmed groups or servers on the way: the
+    # numbers look complete and are not, so they are refused, not returned.
+    "INCOMPLETE_RESULT": (
+        "The engine returned an incomplete result — some groups or servers "
+        "were dropped, so the numbers cannot be trusted. Add a WHERE filter "
+        "to read less, or group by a column with fewer distinct values, then "
+        "retry."
+    ),
 }
 
 _GENERIC = (

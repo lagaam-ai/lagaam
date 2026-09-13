@@ -156,13 +156,67 @@ def _parse_statements(sql: str, dialect: str) -> list[exp.Expr | None]:
         return statements
 
 
+def _clamp_limit(tree: exp.Expr, default_limit: int) -> None:
+    """Lower an outer LIMIT larger than ``default_limit``, in place.
+
+    Runs on the parsed tree, before rendering, so both the _GROUPING_LIMIT
+    re-attach path and the ``_reparseable`` wrapper inherit the clamped
+    value rather than re-exporting what the agent asked for. A tighter LIMIT
+    is the agent's own choice and is left alone.
+
+    An engine that streams pays only planning for an oversized LIMIT, but one
+    that downloads the whole result body transfers and parses every row the
+    LIMIT allows and can hit its response ceiling before returning the rows
+    the budget permits — measured on Pinot, where a 5-row budget survives
+    ``LIMIT 6`` and fails outright on ``LIMIT 5000``. Clamping here means the
+    audit line records what actually ran, and every adapter benefits.
+    ``LIMIT ALL`` diverges by dialect: trino's parser drops it entirely, so
+    the cap is injected as an ordinary missing LIMIT; the generic dialect
+    reads ``ALL`` as a column and the non-integer check below refuses it.
+
+    ``FETCH FIRST/NEXT ROWS ONLY`` omits the count, which the SQL standard
+    and Trino both read as one row — parsed as an ``exp.Fetch`` whose
+    ``count`` is ``None``. One row is under every cap, so the node is left
+    exactly as written rather than rewritten to ``1``: the SQL that runs
+    stays the SQL that was checked, in whichever spelling the agent sent.
+    """
+    limit = tree.args["limit"]
+    if isinstance(limit, exp.Fetch):
+        options = limit.args.get("limit_options")
+        if options is not None and options.args.get("percent"):
+            raise SqlValidationError(
+                "This server's row cap is a row count, so FETCH ... PERCENT "
+                "cannot be compared against it. Write FETCH FIRST n ROWS "
+                "ONLY with a literal integer."
+            )
+        if options is not None and options.args.get("with_ties"):
+            raise SqlValidationError(
+                "FETCH ... WITH TIES can return more rows than the count, "
+                "so it cannot be compared against this server's row cap. "
+                "Drop WITH TIES and retry."
+            )
+        if limit.args.get("count") is None:
+            # FETCH FIRST/NEXT ROWS ONLY with no count is one row, always under the cap.
+            return
+    # exp.Fetch (FETCH FIRST n ROWS ONLY) keeps its count under a different key.
+    key = "count" if isinstance(limit, exp.Fetch) else "expression"
+    rows = limit.args.get(key)
+    if not isinstance(rows, exp.Literal) or rows.is_string or not rows.is_int:
+        raise SqlValidationError(
+            "The row limit must be a plain number this server can compare "
+            "against your row cap. Write LIMIT with a literal integer."
+        )
+    if int(rows.this) > default_limit:
+        limit.set(key, exp.Literal.number(default_limit))
+
+
 def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     """Validate one read-only SELECT and return the canonical SQL to execute.
 
     Rejects (with what-to-change text): unparseable input, multiple
     statements, anything but SELECT/UNION/CTE, write/DDL nodes anywhere in
     the tree, and ``*`` projections. Injects ``LIMIT default_limit`` when
-    the outer query has none.
+    the outer query has none, and lowers a larger one to it.
     """
     if len(sql) > _MAX_SQL_CHARS:
         raise SqlValidationError(
@@ -239,6 +293,8 @@ def validate_query(sql: str, dialect: str, default_limit: int = 1000) -> str:
     # FETCH FIRST N ROWS parses under the "limit" key too, so this covers it.
     if tree.args.get("limit") is None:
         tree = tree.limit(default_limit)
+    else:
+        _clamp_limit(tree, default_limit)
 
     # Comments carry nothing the engine needs, and kilobytes of them are how
     # an agent pushes the real query out of a truncated audit line.
@@ -271,9 +327,14 @@ def _reparseable(rendered: str, tree: exp.Expr, dialect: str) -> str:
         )
     inner = tree.copy()
     inner.set("limit", None)
-    wrapped = (
-        exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(limit.expression)
-    )
+    # exp.Fetch keeps its row count under "count", not "expression".
+    rows = limit.args.get("count") if isinstance(limit, exp.Fetch) else limit.expression
+    if rows is None:
+        raise SqlValidationError(
+            "The SQL uses a construct this server cannot re-read safely. "
+            "Rewrite it more simply and retry."
+        )
+    wrapped = exp.select("*").from_(inner.subquery(alias="_lagaam")).limit(rows)
     rendered = wrapped.sql(dialect=dialect, comments=False)
     try:
         reread = sqlglot.parse_one(rendered, dialect=dialect)
