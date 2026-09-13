@@ -97,6 +97,51 @@ def test_an_oversized_fetch_first_is_lowered_too() -> None:
     assert "6" in sql
 
 
+@pytest.mark.parametrize("direction", ["FIRST", "NEXT"])
+@pytest.mark.parametrize("dialect", ["trino", ""])
+def test_an_omitted_fetch_count_is_left_untouched(dialect: str, direction: str) -> None:
+    # No count means one row per the SQL standard, which Trino runs and which
+    # is under any cap — so it passes through exactly as it was written.
+    sql = validate_query(
+        f"SELECT orderkey FROM tpch.tiny.orders FETCH {direction} ROWS ONLY",
+        dialect=dialect,
+        default_limit=6,
+    )
+    assert sql == f"SELECT orderkey FROM tpch.tiny.orders FETCH {direction} ROWS ONLY"
+
+
+def test_a_singular_fetch_row_is_left_untouched() -> None:
+    # Singular ROW parses only in the generic dialect; trino's parser rejects
+    # it outright, so there is no trino half to pin here.
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders FETCH FIRST 1 ROW ONLY",
+        dialect="",
+        default_limit=6,
+    )
+    assert "FETCH FIRST 1 ROW" in sql.replace("ROWS", "ROW")
+    assert "6" not in sql
+
+
+@pytest.mark.parametrize("dialect", ["trino", ""])
+def test_a_fetch_count_under_the_cap_is_left_alone(dialect: str) -> None:
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders FETCH NEXT 3 ROWS ONLY",
+        dialect=dialect,
+        default_limit=6,
+    )
+    assert sql == "SELECT orderkey FROM tpch.tiny.orders FETCH NEXT 3 ROWS ONLY"
+
+
+@pytest.mark.parametrize("dialect", ["trino", ""])
+def test_an_oversized_fetch_next_is_clamped_and_keeps_its_keyword(dialect: str) -> None:
+    sql = validate_query(
+        "SELECT orderkey FROM tpch.tiny.orders FETCH NEXT 5000 ROWS ONLY",
+        dialect=dialect,
+        default_limit=6,
+    )
+    assert sql == "SELECT orderkey FROM tpch.tiny.orders FETCH NEXT 6 ROWS ONLY"
+
+
 def test_an_oversized_limit_is_clamped_through_the_grouping_wrapper() -> None:
     # ROLLUP renders through the _lagaam subquery wrapper; the clamp happens
     # on the tree, so the wrapper inherits it instead of re-exporting 5000.

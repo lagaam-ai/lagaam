@@ -173,6 +173,12 @@ def _clamp_limit(tree: exp.Expr, default_limit: int) -> None:
     ``LIMIT ALL`` diverges by dialect: trino's parser drops it entirely, so
     the cap is injected as an ordinary missing LIMIT; the generic dialect
     reads ``ALL`` as a column and the non-integer check below refuses it.
+
+    ``FETCH FIRST/NEXT ROWS ONLY`` omits the count, which the SQL standard
+    and Trino both read as one row — parsed as an ``exp.Fetch`` whose
+    ``count`` is ``None``. One row is under every cap, so the node is left
+    exactly as written rather than rewritten to ``1``: the SQL that runs
+    stays the SQL that was checked, in whichever spelling the agent sent.
     """
     limit = tree.args["limit"]
     if isinstance(limit, exp.Fetch):
@@ -189,6 +195,9 @@ def _clamp_limit(tree: exp.Expr, default_limit: int) -> None:
                 "so it cannot be compared against this server's row cap. "
                 "Drop WITH TIES and retry."
             )
+        if limit.args.get("count") is None:
+            # FETCH FIRST/NEXT ROWS ONLY with no count is one row, always under the cap.
+            return
     # exp.Fetch (FETCH FIRST n ROWS ONLY) keeps its count under a different key.
     key = "count" if isinstance(limit, exp.Fetch) else "expression"
     rows = limit.args.get(key)
