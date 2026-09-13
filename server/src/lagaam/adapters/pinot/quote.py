@@ -120,14 +120,13 @@ def _total(values: Iterable[int | None]) -> int | None:
     return total
 
 
-# Every counter Pinot may report a prune under. They are not additive: the
-# server-side total and its by-value / by-limit breakdowns all appear at once.
+# Only the counters measured to nest with numSegmentsQueried on 1.5.1. They
+# are not additive: the server-side total and its by-value / by-limit
+# breakdowns all appear at once, so the largest is read, not the sum.
 _PRUNED_COUNTERS = (
-    "numSegmentsPrunedByBroker",
     "numSegmentsPrunedByServer",
     "numSegmentsPrunedByValue",
     "numSegmentsPrunedByLimit",
-    "numSegmentsPrunedInvalid",
 )
 
 
@@ -138,6 +137,18 @@ def surviving_segments(explain_json: Any) -> int | None:
     filter reported ByServer 28 with ByValue 28 of 31 segments, so summing
     would claim 56 pruned and quote a negative scan. The largest single
     counter is exact where they nest and conservative where they do not.
+
+    Only ByServer, ByValue and ByLimit are read: those are the three the
+    time filter, the limit prune and the bare scan actually measured
+    nesting against. numSegmentsPrunedByBroker and numSegmentsPrunedInvalid
+    are excluded — every fixture reports them 0, so neither is known to
+    behave as a breakdown of numSegmentsQueried, and if a broker reports
+    numSegmentsQueried already net of its own pruning, subtracting
+    ByBroker again would under-count survivors (e.g. queried 10, ByBroker
+    21 quotes 1 where 10 are actually read). Not reading a counter can
+    only leave more segments charged, never fewer, which keeps this the
+    fail-safe side. Re-add either only with a fixture from a table that
+    actually trips it.
 
     None means "no oracle" — the caller then charges every segment.
     """

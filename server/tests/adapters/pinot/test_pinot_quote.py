@@ -219,6 +219,37 @@ def test_every_segment_pruned_still_charges_one() -> None:
     )
 
 
+def test_an_unmeasured_broker_counter_is_not_read() -> None:
+    """ByBroker has never been observed non-zero on 1.5.1 and is not known to
+    be a breakdown of numSegmentsQueried; reading it risks under-counting."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 10,
+                "numSegmentsPrunedByBroker": 21,
+                "numSegmentsPrunedByServer": 0,
+                "numDocsScanned": 0,
+            }
+        )
+        == 10
+    )
+
+
+def test_an_unmeasured_invalid_counter_is_not_read() -> None:
+    """PrunedInvalid has never been observed non-zero on 1.5.1 either."""
+    assert (
+        surviving_segments(
+            {
+                "numSegmentsQueried": 31,
+                "numSegmentsPrunedInvalid": 30,
+                "numSegmentsPrunedByValue": 3,
+                "numDocsScanned": 0,
+            }
+        )
+        == 28
+    )
+
+
 def test_an_explain_that_scanned_anything_is_not_an_oracle() -> None:
     """EXPLAIN must never execute; if it did, we misread the statement."""
     assert (
