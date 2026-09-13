@@ -7,7 +7,6 @@ sizes from the segment metadata the quotation already fetched.
 
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -37,10 +36,21 @@ def test_a_cross_join_is_charged_the_product_of_its_children() -> None:
     )
 
 
-def test_an_equi_join_is_charged_the_max_of_its_children() -> None:
+def test_an_equi_join_is_charged_the_product_since_no_key_can_be_proven() -> None:
     assert (
         max_intermediate_rows(plan_cell("explain-mse-equijoin.json"), LEAVES)
-        == BASEBALL_DOCS
+        == AIRLINE_DOCS * BASEBALL_DOCS
+    )
+
+
+def test_a_self_join_pairs_the_one_scan_calcite_folded_it_into() -> None:
+    """Measured on 1.5.1: the LogicalJoin's two inputs are the same node id."""
+    assert (
+        max_intermediate_rows(
+            plan_cell("explain-mse-selfjoin.json"),
+            {"default.airlinestats": AIRLINE_DOCS},
+        )
+        == AIRLINE_DOCS * AIRLINE_DOCS
     )
 
 
@@ -84,7 +94,7 @@ def test_a_node_without_inputs_consumes_the_node_before_it() -> None:
     assert max_intermediate_rows(plan, {"default.t": 42}) == 42
 
 
-def test_a_join_whose_condition_nests_an_equality_is_a_max() -> None:
+def test_a_join_whose_condition_nests_an_equality_is_still_the_product() -> None:
     plan = json.dumps(
         {
             "rels": [
@@ -106,7 +116,7 @@ def test_a_join_whose_condition_nests_an_equality_is_a_max() -> None:
             ]
         }
     )
-    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 500
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
 
 
 def test_an_or_of_equalities_is_charged_the_product() -> None:

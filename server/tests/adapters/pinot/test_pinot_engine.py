@@ -1000,3 +1000,42 @@ async def test_a_broker_that_hangs_on_explain_degrades_to_low() -> None:
     # plan is unreadable, but table facts alone still bound rows and bytes —
     # only the join-shape signal is lost, and estimate_cost does not raise.
     assert estimate.max_intermediate_rows is None
+
+
+def _selfjoin_routes(request: httpx.Request) -> httpx.Response:
+    """One table, read twice by a self-join, with the joins-refusing oracle."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-selfjoin.json"))
+        # 1.5.1's single-stage engine refuses a join outright, so no oracle.
+        return httpx.Response(
+            200,
+            json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
+        )
+    if path.endswith("/size"):
+        return httpx.Response(200, json=load("size-airlineStats.json"))
+    if path.startswith("/segments/"):
+        return httpx.Response(200, json=load("seg-metadata-airlineStats-columns.json"))
+    if path == "/tables/airlineStats":
+        return httpx.Response(200, json=load("tableconfig-airlineStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_a_self_join_is_charged_two_reads_and_the_product() -> None:
+    """Calcite folds the repeated scan into one node; the SQL still reads twice."""
+    engine = PinotEngine(transport=httpx.MockTransport(_selfjoin_routes))
+    self_join = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    # The single-read figure for the same column, from the same fixtures.
+    single = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert single.scanned_bytes is not None
+    assert self_join.row_estimate == 2 * 9746
+    assert self_join.scanned_bytes == 2 * single.scanned_bytes
+    assert self_join.max_intermediate_rows == 9746 * 9746
+    assert self_join.confidence == "high"

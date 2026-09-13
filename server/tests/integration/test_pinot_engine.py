@@ -408,11 +408,29 @@ async def test_a_cross_join_quotes_the_product_of_both_tables(
     assert estimate.max_intermediate_rows > 900_000_000
 
 
-async def test_an_equi_join_is_not_charged_the_product(pinot_ready: None) -> None:
+async def test_an_equi_join_is_charged_the_product_until_a_key_is_proven(
+    pinot_ready: None,
+) -> None:
     engine = _engine()
     estimate = await engine.estimate_cost(
         "SELECT count(*) FROM pinot.default.airlineStats a "
         "JOIN pinot.default.baseballStats b ON a.Carrier = b.teamID LIMIT 10"
     )
+    assert estimate.max_intermediate_rows == 9746 * 97889
+
+
+async def test_a_self_join_quote_is_never_under_what_execution_scanned(
+    pinot_ready: None,
+) -> None:
+    """Shape 33 of the under-quote audit: 14 distinct carriers, 10.7M pairs."""
+    sql = (
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    estimate = await _engine().estimate_cost(sql)
+    assert estimate.row_estimate is not None
+    # Measured: the multi-stage run scans the table twice, 19,492 docs.
+    assert estimate.row_estimate >= 19492
     assert estimate.max_intermediate_rows is not None
-    assert estimate.max_intermediate_rows < 9746 * 97889
+    # The true pair count, computed in Pinot: sum(n*n) over Carrier groups.
+    assert estimate.max_intermediate_rows >= 10_719_442

@@ -50,6 +50,7 @@ from lagaam.core.scans import (
     generator_fanout,
     has_unpriceable_shape,
     scan_counts_saturated,
+    table_scan_counts,
 )
 
 _UNREACHABLE = "the query engine is not reachable right now"
@@ -80,9 +81,7 @@ _EXPLAIN_SHAPE = "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR "
 # also the total deadline, so a body arriving in slow chunks cannot outlast it.
 _TIMEOUT_GRACE_SECONDS = 5.0
 
-# A quotation is advisory, not the query itself: a wedged broker must not hold
-# the gate for the client's full 30s default, so the EXPLAINs get their own
-# short deadline rather than inheriting execute()'s caller-supplied one.
+# Advisory, so a wedged broker must not hold the gate for execute()'s default.
 _EXPLAIN_TIMEOUT_SECONDS = 10.0
 _EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
 
@@ -287,7 +286,19 @@ class PinotEngine:
         surviving = await self._surviving(two_part, len(tables))
         located = [(database, fact, surviving) for database, fact in facts]
         widest = await self._widest_rows(two_part, located)
-        estimate = quote([(fact, k) for _, fact, k in located], columns, widest)
+        # The plan folds a repeated scan into one node and referenced_tables
+        # dedupes, so a table read N times would be charged once: measured,
+        # a self-join quoted 9,746 rows against 19,492 scanned, and UNION ALL
+        # of 60 identical arms quoted 1/60th of the bytes at high confidence.
+        # Charging the table's facts once per read scales both dimensions.
+        reads = table_scan_counts(sql, dialect)
+        charged = [
+            pair
+            for database, fact, k in located
+            for pair in [(fact, k)]
+            * max(1, reads.get(f"{self.CATALOG}.{database}.{fact.table}".lower(), 1))
+        ]
+        estimate = quote(charged, columns, widest)
         if estimate.max_intermediate_rows is None:
             return estimate
         fanout = generator_fanout(sql, dialect)

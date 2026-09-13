@@ -8,10 +8,16 @@ segment metadata the quotation already fetched. The rowcount and cumulative
 cost attributes are never read.
 
 The rule is ADR 0004's, applied to a plan that carries shape but no sizes: a
-join or correlate without a conjunctive equality multiplies its inputs, one
-with an equality reached through AND alone is charged the max, a union (all
-or distinct) is the sum of its inputs, and everything else passes its widest
+join or correlate is always the product of its inputs, a union (all or
+distinct) is the sum of its inputs, and everything else passes its widest
 input through.
+
+The product holds for an equi-join too. Nothing on 1.5.1 can prove a join key:
+there are no cardinality statistics anywhere in the pricing path, and an
+equality on a 14-distinct-value column is a near-product, not a lookup —
+measured, `airlineStats a JOIN airlineStats b ON a.Carrier = b.Carrier` builds
+10,719,442 pairs over 9,746 rows. "Has an equality" is exactly the SQL-shape
+proxy ADR 0004 rejected.
 
 rels[] is a flat topological list, not a tree. A node's children are its
 "inputs" ids; a node with no inputs key at all consumes the node immediately
@@ -19,7 +25,8 @@ before it, which is how Calcite serialises a linear chain.
 """
 
 import json
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 # A plan this deep is a machine's, not an analyst's.
 _MAX_DEPTH = 400
@@ -105,9 +112,9 @@ def _rows(
     elif _is_union(rel):
         # A distinct union still builds every input row before deduplicating.
         answer = sum(child_rows)
-    elif _is_join(rel) and not _has_equality(rel.get("condition")):
-        # A join the plan cannot prove is keyed pairs its inputs; charging
-        # less is how a laundered cross join reads as one table's size.
+    elif _is_join(rel):
+        # No key can be proven on 1.5.1, so every join pairs its inputs;
+        # charging less is how a near-product reads as one table's size.
         product = 1
         for rows in child_rows:
             product *= rows
@@ -162,26 +169,3 @@ def _is_union(rel: dict[str, Any]) -> bool:
     if not isinstance(rel_op, str):
         return False
     return rel_op.rsplit(".", 1)[-1].lower().endswith("union")
-
-
-def _has_equality(condition: Any) -> bool:
-    """True if this join condition is an equality reached through AND alone.
-
-    A cross join's condition is the bare literal true, with no op at all.
-    OR, NOT, and any other kind stop the search: they cannot prove every
-    matched pair shares a key, so the search must not look past them.
-    """
-    if not isinstance(condition, dict):
-        return False
-    op = condition.get("op")
-    if not isinstance(op, dict):
-        return False
-    kind = op.get("kind")
-    if kind == "EQUALS":
-        return True
-    if kind != "AND":
-        return False
-    operands = condition.get("operands")
-    if isinstance(operands, list):
-        return any(_has_equality(operand) for operand in operands)
-    return False
