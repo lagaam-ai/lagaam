@@ -210,20 +210,29 @@ Rules:
   log's "use `numSegmentsProcessed / numSegmentsQueried`" is an
   execution-time observation only. The pruned counters are what EXPLAIN
   reports.
-- `row_estimate` = Σ over referenced tables of docs in its surviving set.
+- **A table is charged once per read.** The plan folds a repeated scan into
+  one node and the SQL's table list dedupes, so a table read N times would
+  be charged once: measured, a self-join quoted 9,746 rows against 19,492
+  scanned and `UNION ALL` x60 quoted 1/60th of the bytes. `core.scans.
+  table_scan_counts` supplies the count and the table's facts are charged
+  once per read, scaling docs and bytes alike. The walk's leaf sizes stay
+  per single read.
+- `row_estimate` = Σ over referenced tables, once per read, of docs in its
+  surviving set.
 - `scanned_bytes` = Σ over referenced tables, over its surviving set, of
   the referenced columns' `indexSizeMap` bytes; attribution is decided
   **per segment, not per table** — a segment in which none of the query's
   columns are found is charged its whole `reportedSizeInBytes`, and a
   segment with no size makes the sum unknown.
-- `max_intermediate_rows`: `plan.py` walks `rels[]` post-order. A scan
-  node is its table's surviving docs; a join or `Correlate` whose
-  condition has no equality reached through AND alone (`OR`/`NOT` of an
-  equality counts as none) is the product of its children; one with a
-  conjunctive equality is the max of its children (the ADR 0004 NaN-join
-  rule); a `UNION` (all or distinct) is the sum of its children; every
-  other node is the max of its children. The answer is the max over all
-  nodes. A plan that cannot be fetched or read is `None`.
+- `max_intermediate_rows`: `plan.py` walks `rels[]` post-order. A scan node
+  is its table's surviving docs; **a join or `Correlate` is always the
+  product of its children**, since 1.5.1 exposes no cardinality to prove a
+  key and "has a conjunctive equality" is the SQL-shape proxy ADR 0004
+  rejected (measured: `ON a.Carrier = b.Carrier` builds 10,719,442 pairs
+  over 9,746 rows, 14 distinct carriers — the max branch quoted 9,746); a
+  `UNION` (all or distinct) is the sum of its children; every other node is
+  the max of its children. The answer is the max over all nodes. A plan that
+  cannot be fetched or read is `None`.
 - `core.scans.has_unpriceable_shape` and `generator_fanout` run first with
   the generic dialect exactly as the Trino adapter runs them; a flagged
   shape is `CostEstimate(confidence="low")` before any request.

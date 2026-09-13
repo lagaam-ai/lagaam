@@ -49,15 +49,28 @@ Column attribution is decided per segment, not per table: a segment in
 which none of the query's columns are found is charged its whole size, and
 a segment with no size makes the sum unknown.
 
-The multi-stage plan walk applies ADR 0004's product/max rule to shape
-alone. An equality in a join or `Correlate` condition counts only when it
-is reached through AND alone — `OR` or `NOT` of an equality is charged the
-product, not the max, because neither can prove every matched pair shares
-a key (measured: `ON a.Carrier = b.teamID OR a.Origin = b.playerID` would
-otherwise quote 97,889 for a 954,026,194 worst case). A `UNION`, all or
-distinct, is charged the sum of its inputs, since a distinct union still
-builds every input row before deduplicating. Calcite's `Correlate` takes
-the product branch beside the joins.
+Every table is charged once per read. The plan folds a repeated scan into a
+single node — measured, a self-join's `LogicalJoin` names the same node id as
+both its inputs — and the SQL's own table list dedupes, so a table read N
+times would otherwise be charged once: a self-join quoted 9,746 rows against
+19,492 scanned, and `UNION ALL` of 60 identical arms quoted 1/60th of the
+bytes. Core's `table_scan_counts` supplies the count, and the table's facts
+are charged once per read. Docs and bytes both scale; the plan walk's leaf
+sizes stay per single read, since the walker multiplies or sums the folded
+node as the plan references it.
+
+Every join and `Correlate` is the product of its inputs. A `UNION`, all or
+distinct, is the sum, since a distinct union still builds every input row
+before deduplicating. There is no max branch: 1.5.1 exposes no cardinality
+anywhere in the pricing path — segment metadata carries docs, bytes and time
+ranges but never distinct counts, and the plan's own rowcount is a constant
+100 — so no equality can be shown to be a key. Measured, `ON a.Carrier =
+b.Carrier` builds 10,719,442 pairs over 9,746 rows, because `Carrier` has 14
+distinct values; charging the max quoted 9,746, a 1,100x under-quote. Taking
+"has a conjunctive equality" as proof of a key is exactly the SQL-shape proxy
+ADR 0004 rejected. The measured `OR` case remains evidence of the same thing
+(`ON a.Carrier = b.teamID OR a.Origin = b.playerID`, 954,026,194 worst case),
+but it is no longer the exception: the product is the rule.
 
 Because the number is ours rather than the engine's, its honest confidence
 ceiling is lower than Trino's, and anything unmeasurable stays `None` —
@@ -75,6 +88,12 @@ partitioned table is over-charged too, until `numSegmentsPrunedByBroker`
 is measured against a table that actually trips it and re-added with a
 fixture. All three are denials an operator can raise a budget for, never
 admissions.
+
+A join of two real-sized tables is denied under the default budget until
+key evidence exists — a single-segment column whose cardinality equals its
+docs, or an upsert table's primary key, both U12 or later. That is a denial
+an operator can raise a budget for, and Pinot's own `maxRowsInJoin` backstop
+remains as the second line. An admitted join was never bounded by us anyway.
 
 A REALTIME half is quoted `"low"` until U12 charges consuming segments at
 the stream's flush threshold: a consuming segment reports 0 docs and -1
