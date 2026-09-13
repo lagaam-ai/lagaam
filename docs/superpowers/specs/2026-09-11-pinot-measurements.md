@@ -341,7 +341,7 @@ real size:**
 Derived numbers inherit the fiction: the cross join
 `SELECT count(*) FROM airlineStats a, baseballStats b` (`03-explain-mse-crossjoin.json`)
 reports `LogicalJoin: rowcount = 10000.0` = 100 x 100, whereas the true product is
-9,746 x 97,889 = **954,024,994** — five orders of magnitude larger. A selective filter gets a
+9,746 x 97,889 = **954,026,194** — five orders of magnitude larger. A selective filter gets a
 flat 50% guess: `LogicalFilter(condition=[>($22, 16090)]): rowcount = 50.0` on a 100.0 input
 (`03-explain-mse-airline-filter.json`), true selectivity ~11/31 segments.
 
