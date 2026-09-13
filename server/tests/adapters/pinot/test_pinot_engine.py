@@ -14,7 +14,19 @@ import pytest
 
 from lagaam.adapters.pinot import engine as engine_module
 from lagaam.adapters.pinot.engine import PinotEngine
-from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    QueryBudget,
+    enforce_budget,
+)
+from lagaam.core.errors import (
+    BudgetExceededError,
+    EngineError,
+    QueryFailedError,
+    TableNotFoundError,
+)
 from lagaam.core.ports import QueryEngine
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -915,7 +927,7 @@ async def test_refused_credentials_stop_a_quotation_too() -> None:
         )
 
 
-async def test_a_realtime_half_is_quoted_low() -> None:
+async def test_a_realtime_half_is_quoted_low_and_denied() -> None:
     def routes(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/tables/airlineStats":
             config = load("tableconfig-airlineStats.json")
@@ -929,6 +941,14 @@ async def test_a_realtime_half_is_quoted_low() -> None:
     )
     assert estimate.confidence == "low"
     assert estimate.scanned_bytes is None
+
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
+    with pytest.raises(BudgetExceededError, match="could not be estimated"):
+        enforce_budget(estimate, budget)
 
 
 async def test_a_table_name_no_path_can_carry_is_not_found_before_any_request() -> (
