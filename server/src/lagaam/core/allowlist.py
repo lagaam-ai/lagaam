@@ -78,10 +78,11 @@ def _cte_in_scope(table: exp.Table, scopes: dict[int, dict[str, int]]) -> bool:
         if isinstance(with_clause, exp.With):
             declared = scopes.get(id(with_clause))
             if declared is None:
-                declared = {
-                    cte.alias_or_name.lower(): index
-                    for index, cte in enumerate(with_clause.expressions)
-                }
+                declared = {}
+                for index, cte in enumerate(with_clause.expressions):
+                    # A duplicate name keeps its first index: engines reject
+                    # duplicates anyway, but earlier siblings see the first one.
+                    declared.setdefault(cte.alias_or_name.lower(), index)
                 scopes[id(with_clause)] = declared
             declared_at = declared.get(name)
             if declared_at is not None:

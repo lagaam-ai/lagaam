@@ -94,6 +94,54 @@ def test_a_cte_vouches_for_a_later_sibling() -> None:
     )
 
 
+def test_a_cte_vouches_for_a_set_operation_on_the_query_body() -> None:
+    # A top-level UNION's `with_` hangs off the Union node, not a Select.
+    guard(
+        "WITH a AS (SELECT k FROM tpch.tiny.orders) "
+        "SELECT k FROM a UNION ALL SELECT k FROM a",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_sibling_vouches_for_a_reference_nested_several_subqueries_deep() -> None:
+    # The forward reference to `t` sits two derived-table levels inside `a`'s
+    # body; a sibling declared after `a` still must not vouch for it.
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "WITH a AS (SELECT * FROM (SELECT * FROM (SELECT k FROM t) q1) q2), "
+            "t AS (SELECT 1 AS k) SELECT * FROM a",
+            allowed={"tpch.tiny.orders"},
+        )
+    # Mirror: `t` declared first, `a` reads it several subquery levels deep.
+    guard(
+        "WITH t AS (SELECT 1 AS k), "
+        "a AS (SELECT * FROM (SELECT * FROM (SELECT k FROM t) q1) q2) "
+        "SELECT * FROM a",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_a_later_sibling_vouches_for_the_first_of_two_duplicate_names() -> None:
+    # Engines reject duplicate CTE names, but `b` reading `t` before the
+    # second `t` is declared must resolve to the first `t`, not be shadowed.
+    guard(
+        "WITH t AS (SELECT k FROM tpch.tiny.orders), b AS (SELECT k FROM t), "
+        "t AS (SELECT 1 AS k) SELECT k FROM b",
+        allowed={"tpch.tiny.orders"},
+    )
+
+
+def test_forward_reference_shadowed_by_a_duplicate_name_stays_denied() -> None:
+    # `a`'s reference to `bad` is still a forward reference even though a
+    # later duplicate `bad` happens to be legitimately granted.
+    with pytest.raises(TableAccessDeniedError):
+        guard(
+            "WITH a AS (SELECT k FROM bad), bad AS (SELECT 1 AS k), "
+            "bad AS (SELECT k FROM tpch.tiny.orders) SELECT k FROM a",
+            allowed={"tpch.tiny.orders"},
+        )
+
+
 # --- what is denied ------------------------------------------------------
 
 
