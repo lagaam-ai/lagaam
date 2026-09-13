@@ -109,6 +109,80 @@ def test_a_join_whose_condition_nests_an_equality_is_a_max() -> None:
     assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 500
 
 
+def test_an_or_of_equalities_is_charged_the_product() -> None:
+    assert (
+        max_intermediate_rows(plan_cell("explain-mse-orjoin.json"), LEAVES)
+        == AIRLINE_DOCS * BASEBALL_DOCS
+    )
+
+
+def test_a_negated_equality_is_charged_the_product() -> None:
+    plan = json.dumps(
+        {
+            "rels": [
+                {"id": "0", "relOp": "PinotLogicalTableScan", "table": ["default", "a"], "inputs": []},
+                {"id": "1", "relOp": "PinotLogicalTableScan", "table": ["default", "b"], "inputs": []},
+                {
+                    "id": "2",
+                    "relOp": "LogicalJoin",
+                    "joinType": "inner",
+                    "inputs": ["0", "1"],
+                    "condition": {
+                        "op": {"name": "NOT", "kind": "NOT"},
+                        "operands": [
+                            {"op": {"name": "=", "kind": "EQUALS"}, "operands": []},
+                        ],
+                    },
+                },
+            ]
+        }
+    )
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+
+
+def test_a_union_all_is_charged_the_sum_of_its_inputs() -> None:
+    assert (
+        max_intermediate_rows(plan_cell("explain-mse-unionall.json"), LEAVES)
+        == AIRLINE_DOCS + BASEBALL_DOCS
+    )
+
+
+def test_a_distinct_union_is_charged_the_sum_too() -> None:
+    plan = json.dumps(
+        {
+            "rels": [
+                {"id": "0", "relOp": "PinotLogicalTableScan", "table": ["default", "a"], "inputs": []},
+                {"id": "1", "relOp": "PinotLogicalTableScan", "table": ["default", "b"], "inputs": []},
+                {
+                    "id": "2",
+                    "relOp": "LogicalUnion",
+                    "all": False,
+                    "inputs": ["0", "1"],
+                },
+            ]
+        }
+    )
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 510
+
+
+def test_a_correlate_is_charged_the_product() -> None:
+    plan = json.dumps(
+        {
+            "rels": [
+                {"id": "0", "relOp": "PinotLogicalTableScan", "table": ["default", "a"], "inputs": []},
+                {"id": "1", "relOp": "PinotLogicalTableScan", "table": ["default", "b"], "inputs": []},
+                {
+                    "id": "2",
+                    "relOp": "LogicalCorrelate",
+                    "inputs": ["0", "1"],
+                    "joinType": "inner",
+                },
+            ]
+        }
+    )
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+
+
 def test_an_inequality_join_is_charged_the_product() -> None:
     plan = json.dumps(
         {

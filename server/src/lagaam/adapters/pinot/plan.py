@@ -8,8 +8,10 @@ segment metadata the quotation already fetched. The rowcount and cumulative
 cost attributes are never read.
 
 The rule is ADR 0004's, applied to a plan that carries shape but no sizes: a
-join without an equality multiplies its inputs, a join with one cannot be
-proven to, and everything else passes its widest input through.
+join or correlate without a conjunctive equality multiplies its inputs, one
+with an equality reached through AND alone is charged the max, a union (all
+or distinct) is the sum of its inputs, and everything else passes its widest
+input through.
 
 rels[] is a flat topological list, not a tree. A node's children are its
 "inputs" ids; a node with no inputs key at all consumes the node immediately
@@ -100,6 +102,9 @@ def _rows(
         child_rows.append(rows)
     if not child_rows:
         answer = _leaf_rows(rel, leaf_docs)
+    elif _is_union(rel):
+        # A distinct union still builds every input row before deduplicating.
+        answer = sum(child_rows)
     elif _is_join(rel) and not _has_equality(rel.get("condition")):
         # A join the plan cannot prove is keyed pairs its inputs; charging
         # less is how a laundered cross join reads as one table's size.
@@ -148,19 +153,34 @@ def _is_join(rel: dict[str, Any]) -> bool:
     rel_op = rel.get("relOp")
     if not isinstance(rel_op, str):
         return False
-    return rel_op.rsplit(".", 1)[-1].lower().endswith("join")
+    suffix = rel_op.rsplit(".", 1)[-1].lower()
+    return suffix.endswith("join") or suffix.endswith("correlate")
+
+
+def _is_union(rel: dict[str, Any]) -> bool:
+    rel_op = rel.get("relOp")
+    if not isinstance(rel_op, str):
+        return False
+    return rel_op.rsplit(".", 1)[-1].lower().endswith("union")
 
 
 def _has_equality(condition: Any) -> bool:
-    """True if an equality appears anywhere in this join condition.
+    """True if this join condition is an equality reached through AND alone.
 
     A cross join's condition is the bare literal true, with no op at all.
+    OR, NOT, and any other kind stop the search: they cannot prove every
+    matched pair shares a key, so the search must not look past them.
     """
     if not isinstance(condition, dict):
         return False
     op = condition.get("op")
-    if isinstance(op, dict) and op.get("kind") == "EQUALS":
+    if not isinstance(op, dict):
+        return False
+    kind = op.get("kind")
+    if kind == "EQUALS":
         return True
+    if kind != "AND":
+        return False
     operands = condition.get("operands")
     if isinstance(operands, list):
         return any(_has_equality(operand) for operand in operands)
