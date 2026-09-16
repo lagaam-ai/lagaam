@@ -495,3 +495,21 @@ async def test_mixed_case_columns_are_quoted_at_their_real_size(
     assert charged >= 578_965
     assert estimate.scanned_bytes is not None
     assert estimate.scanned_bytes >= charged
+
+
+async def test_a_lowercase_table_quotes_what_the_canonical_one_does(
+    pinot_ready: None,
+) -> None:
+    """The broker executes either spelling; the controller's REST paths are
+    case-sensitive, so the lowercase one used to 404 into a false denial."""
+    engine = _engine()
+    lowered = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlinestats LIMIT 5"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
+    )
+    assert canonical.confidence == "high"
+    assert lowered.confidence == "high"
+    assert lowered.row_estimate == canonical.row_estimate
+    assert lowered.scanned_bytes == canonical.scanned_bytes

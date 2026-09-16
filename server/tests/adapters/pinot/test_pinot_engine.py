@@ -777,6 +777,9 @@ async def test_another_catalog_is_refused_before_the_broker_is_called() -> None:
 def _quote_routes(request: httpx.Request) -> httpx.Response:
     """Controller and broker answers for a quotation, from captured JSON."""
     path = request.url.path
+    if path == "/tables":
+        # The quotation resolves the controller's own spelling first.
+        return httpx.Response(200, json={"tables": ["airlineStats", "baseballStats"]})
     if path == "/query/sql":
         body = json.loads(request.content)
         sql = body["sql"]
@@ -846,6 +849,10 @@ async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
 
     def routes(request: httpx.Request) -> httpx.Response:
         path = request.url.path
+        if path == "/tables":
+            return httpx.Response(
+                200, json={"tables": ["airlineStats", "baseballStats"]}
+            )
         if path == "/query/sql":
             sql = json.loads(request.content)["sql"]
             asked.append(sql)
@@ -931,6 +938,64 @@ async def test_a_column_belonging_to_no_table_is_not_asked_for() -> None:
     )
     assert asked
     assert asked[0].params.get_list("columns") == ["league"]
+
+
+async def test_a_lowercase_table_is_quoted_on_the_controllers_spelling() -> None:
+    """The broker executes any casing; the controller's REST paths are
+    case-sensitive, so the raw spelling 404'd and quoted low — a valid query
+    denied for nothing but the shape of its name."""
+    asked: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        asked.append(request.url.path)
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    lowered = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlinestats LIMIT 5"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
+    )
+    assert lowered.confidence == "high"
+    assert lowered.row_estimate == canonical.row_estimate
+    assert lowered.scanned_bytes == canonical.scanned_bytes
+    assert "/tables/airlineStats" in asked
+    assert not any("airlinestats" in path for path in asked)
+
+
+async def test_a_quotation_lists_the_tables_once_however_many_it_reads() -> None:
+    """One listing per quotation, not one per table."""
+    listings = 0
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        nonlocal listings
+        if request.url.path == "/tables":
+            listings += 1
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        return _selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlinestats a "
+        "JOIN pinot.default.airlinestats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert listings == 1
+
+
+async def test_a_table_the_controller_does_not_list_is_not_found() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(TableNotFoundError):
+        await engine.estimate_cost(
+            "SELECT x FROM pinot.default.nosuchtable LIMIT 5"
+        )
 
 
 def _limitpruned_routes(request: httpx.Request) -> httpx.Response:
@@ -1123,6 +1188,8 @@ async def test_an_explain_that_trickles_past_the_deadline_degrades_to_low(
 def _selfjoin_routes(request: httpx.Request) -> httpx.Response:
     """One table, read twice by a self-join, with the joins-refusing oracle."""
     path = request.url.path
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["airlineStats"]})
     if path == "/query/sql":
         sql = json.loads(request.content)["sql"]
         if "AS JSON" in sql:

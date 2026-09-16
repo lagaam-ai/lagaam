@@ -92,6 +92,17 @@ _EXPLAIN_TIMEOUT_SECONDS = 10.0
 _EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
 
 
+def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
+    """The controller's own spelling of a table, from its listing."""
+    if table in listed:
+        return table
+    matches = [name for name in listed if name.lower() == table.lower()]
+    if len(matches) != 1:
+        # None is a missing table; more than one, and nothing says which.
+        raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
+    return matches[0]
+
+
 def _plan_cell(body: object) -> str | None:
     """The PLAN column of a multi-stage EXPLAIN answer: one row, one string."""
     if not isinstance(body, dict) or body.get("exceptions"):
@@ -251,14 +262,7 @@ class PinotEngine:
         body = await self._client.controller_get("/tables", database=schema)
         if body is PinotClient.NotFound:
             raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
-        listed = table_names(body)
-        if table in listed:
-            return table
-        matches = [name for name in listed if name.lower() == table.lower()]
-        if len(matches) != 1:
-            # None is a missing table; more than one, and nothing says which.
-            raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
-        return matches[0]
+        return _spelled(catalog, schema, table, table_names(body))
 
     async def estimate_cost(self, sql: str) -> CostEstimate:
         """An upper bound on what this SQL would scan, synthesised here.
@@ -278,9 +282,12 @@ class PinotEngine:
         if not tables:
             return CostEstimate(confidence="low")
         columns = referenced_columns(sql)
+        # One /tables listing per quotation, not one per table: every table
+        # here shares a database, and a self-join reads the same name twice.
+        listings: dict[str, list[str]] = {}
         try:
             facts = [
-                (database, await self._table_facts(database, table, columns))
+                (database, await self._table_facts(database, table, columns, listings))
                 for database, table in tables
             ]
         except PinotForbidden as exc:
@@ -315,17 +322,37 @@ class PinotEngine:
         )
 
     async def _table_facts(
-        self, database: str, table: str, columns: frozenset[str] | None
+        self,
+        database: str,
+        table: str,
+        columns: frozenset[str] | None,
+        listings: dict[str, list[str]],
     ) -> TableFacts:
-        """One table's config, segment metadata and size, from the controller."""
+        """One table's config, segment metadata and size, from the controller.
+
+        The agent's spelling is a request, not an address, exactly as in
+        describe_table: broker SQL is case-insensitive and controller REST
+        paths are not, so an unresolved name 404s on a table that plainly
+        exists and quotes low — denying a query the broker would run.
+        """
         try:
-            part = PinotClient.path_part(table)
+            PinotClient.path_part(table)
         except ValueError as exc:
             # No URL path can carry this name, so the table it would name
             # cannot be reached either — decided before any request.
             raise TableNotFoundError(
                 catalog=self.CATALOG, schema=database, table=table
             ) from exc
+        if database not in listings:
+            body = await self._client.controller_get("/tables", database=database)
+            if body is PinotClient.NotFound:
+                raise TableNotFoundError(
+                    catalog=self.CATALOG, schema=database, table=table
+                )
+            listings[database] = table_names(body)
+        part = PinotClient.path_part(
+            _spelled(self.CATALOG, database, table, listings[database])
+        )
         resolved = await self._table_columns(part, database, columns)
         params: dict[str, str | list[str]] | None = (
             {"columns": sorted(resolved.values())} if resolved else None
