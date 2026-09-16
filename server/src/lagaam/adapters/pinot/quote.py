@@ -93,13 +93,25 @@ def _column_sizes(
 ) -> list[int | None] | None:
     """Per-segment bytes for the referenced columns; None only if columns is None.
 
-    A segment whose columns match none of `columns` falls back to its own
-    total_bytes, so the fallback is decided per segment, not per table.
+    A segment is priced per column only when it carries every one of the
+    table's referenced columns. One matching column used to be enough, which
+    is how a segment answering `league` alone was quoted 36,739 bytes while
+    `playerID` added 542,226 more: a partial answer looks exactly like a
+    cheap one. Missing any of them falls back to the segment's own
+    total_bytes, decided per segment rather than per table.
+
+    `facts.columns` empty means no referenced column was resolved to this
+    table — no schema, or none of them belongs here — and then a match is
+    all there is to go on, as before.
     """
     if columns is None:
         return None
     sizes: list[int | None] = []
     for segment in facts.segments:
+        carried = {name.lower() for name in segment.column_bytes}
+        if facts.columns and not facts.columns <= carried:
+            sizes.append(segment.total_bytes)
+            continue
         total = 0
         matched = False
         for name, size in segment.column_bytes.items():

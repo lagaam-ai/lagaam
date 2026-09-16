@@ -31,8 +31,18 @@ def seg(name: str, docs: int | None, total: int | None, **columns: int) -> Segme
     )
 
 
-def facts(*segments: SegmentFact, types: frozenset[str] = frozenset({"OFFLINE"})) -> TableFacts:
-    return TableFacts(table="t", types=types, time_column=None, segments=segments)
+def facts(
+    *segments: SegmentFact,
+    types: frozenset[str] = frozenset({"OFFLINE"}),
+    columns: frozenset[str] = frozenset(),
+) -> TableFacts:
+    return TableFacts(
+        table="t",
+        types=types,
+        time_column=None,
+        segments=segments,
+        columns=columns,
+    )
 
 
 def airline() -> TableFacts:
@@ -92,6 +102,31 @@ def test_a_segment_matching_no_referenced_column_is_charged_whole() -> None:
 
     table_no_size = facts(seg("a", 10, 100, x=5), seg("b", 10, None))
     assert surviving_bytes(table_no_size, None, frozenset({"x"})) is None
+
+
+def test_a_segment_missing_one_of_the_tables_columns_is_charged_whole() -> None:
+    """Measured: the controller answered ?columns=league&columns=playerid with
+    league alone (36,739 bytes), so one match made the segment look priced
+    while 578,965 bytes of playerID went uncharged."""
+    table = facts(
+        seg("a", 10, 500_000, league=36_739),
+        columns=frozenset({"league", "playerid"}),
+    )
+    assert surviving_bytes(table, None, frozenset({"league", "playerid"})) == 500_000
+
+
+def test_a_segment_carrying_every_resolved_column_is_charged_per_column() -> None:
+    table = facts(
+        seg("a", 10, 500_000, league=36_739, playerID=578_965 - 36_739),
+        columns=frozenset({"league", "playerid"}),
+    )
+    assert surviving_bytes(table, None, frozenset({"league", "playerid"})) == 578_965
+
+
+def test_without_a_resolved_column_set_one_match_still_prices_the_segment() -> None:
+    """No schema, no way to know a column is missing rather than absent."""
+    table = facts(seg("a", 10, 500_000, league=36_739))
+    assert surviving_bytes(table, None, frozenset({"league", "playerid"})) == 36_739
 
 
 def test_unresolvable_columns_fall_back_to_whole_segments() -> None:

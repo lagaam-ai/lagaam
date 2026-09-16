@@ -134,6 +134,10 @@ class TableFacts:
     types: frozenset[str]
     time_column: str | None
     segments: tuple[SegmentFact, ...]
+    # Lowercase names of the referenced columns this table actually carries,
+    # empty when none was asked for or the schema could not be read. A
+    # segment missing any of them is priced whole rather than per column.
+    columns: frozenset[str] = frozenset()
 
 
 def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
@@ -184,11 +188,23 @@ def time_column(config_json: Any) -> str | None:
     return None
 
 
+def schema_columns(schema_json: Any) -> dict[str, str]:
+    """Lowercase column name to the schema's own spelling of it.
+
+    The controller's `?columns=` filter is case-sensitive while SQL is not,
+    so a referenced name has to be translated into this spelling before it
+    can be asked for. A schema nobody could read yields nothing, which
+    charges whole segments rather than a name the controller would drop.
+    """
+    return {column.name.lower(): column.name for column in _columns(schema_json)}
+
+
 def table_facts(
     table: str,
     config_json: Any,
     seg_metadata_json: Any,
     size_json: Any,
+    columns: frozenset[str] = frozenset(),
 ) -> TableFacts:
     """One table's type, time column and segments, from three documents."""
     return TableFacts(
@@ -196,6 +212,7 @@ def table_facts(
         types=table_types(config_json),
         time_column=time_column(config_json),
         segments=tuple(segment_facts(seg_metadata_json, size_json)),
+        columns=columns,
     )
 
 

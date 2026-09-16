@@ -472,3 +472,26 @@ async def test_an_offset_is_quoted_above_what_it_really_scans(
     )
     with pytest.raises(BudgetExceededError):
         enforce_budget(estimate, budget)
+
+
+async def test_mixed_case_columns_are_quoted_at_their_real_size(
+    pinot_ready: None,
+) -> None:
+    """The controller's ?columns= filter is case-sensitive, so a lowercased
+    playerID returned nothing and the quote lost 578,965 bytes to 36,739."""
+    engine = _engine()
+    estimate = await engine.estimate_cost(
+        "SELECT league, playerID FROM pinot.default.baseballStats LIMIT 10"
+    )
+    truth = await engine._client.controller_get(
+        "/segments/baseballStats/metadata",
+        params={"columns": ["league", "playerID"]},
+        database="default",
+    )
+    charged = 0
+    for body in truth.values():
+        for column in body["columns"]:
+            charged += sum(column["indexSizeMap"].values())
+    assert charged >= 578_965
+    assert estimate.scanned_bytes is not None
+    assert estimate.scanned_bytes >= charged

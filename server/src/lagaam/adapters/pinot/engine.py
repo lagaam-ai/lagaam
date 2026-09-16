@@ -23,6 +23,7 @@ from lagaam.adapters.pinot.client import (
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
+    schema_columns,
     table_facts,
     table_names,
     table_schema,
@@ -325,8 +326,9 @@ class PinotEngine:
             raise TableNotFoundError(
                 catalog=self.CATALOG, schema=database, table=table
             ) from exc
+        resolved = await self._table_columns(part, database, columns)
         params: dict[str, str | list[str]] | None = (
-            {"columns": sorted(columns)} if columns else None
+            {"columns": sorted(resolved.values())} if resolved else None
         )
         config_json = await self._client.controller_get(
             f"/tables/{part}", database=database
@@ -342,7 +344,35 @@ class PinotEngine:
             None if config_json is PinotClient.NotFound else config_json,
             None if seg_json is PinotClient.NotFound else seg_json,
             None if size_json is PinotClient.NotFound else size_json,
+            frozenset(resolved),
         )
+
+    async def _table_columns(
+        self, part: str, database: str, columns: frozenset[str] | None
+    ) -> dict[str, str]:
+        """The referenced columns this table carries, lowercase to its spelling.
+
+        The controller's `?columns=` filter is case-sensitive and SQL is not,
+        so asking for `playerid` returns nothing at all and the segment reads
+        as though the column were free. A name the schema does not carry
+        belongs to another table (or to no table) and is not asked for.
+
+        Empty when there is nothing to resolve or no schema to resolve
+        against, which charges whole segments — the fail-safe side.
+        """
+        if not columns:
+            return {}
+        schema_json = await self._client.controller_get(
+            f"/tables/{part}/schema", database=database
+        )
+        if schema_json is PinotClient.NotFound:
+            return {}
+        spellings = schema_columns(schema_json)
+        return {
+            lowered: spelling
+            for lowered, spelling in spellings.items()
+            if lowered in columns
+        }
 
     async def _surviving(
         self, two_part: str, table_count: int, *, trust_limit_prune: bool

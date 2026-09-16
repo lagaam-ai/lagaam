@@ -877,6 +877,62 @@ async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
     assert sum(1 for sql in asked if "AS JSON" not in sql) == 0
 
 
+def _baseball_routes(request: httpx.Request) -> httpx.Response:
+    """The baseballStats quotation, schema included, from captured JSON."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-nofilter.json"))
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["baseballStats"]})
+    if path == "/tables/baseballStats/schema":
+        return httpx.Response(200, json=load("schema-baseballStats.json"))
+    if path.endswith("/size"):
+        return httpx.Response(200, json=load("size-baseballStats.json"))
+    if path.startswith("/segments/"):
+        return httpx.Response(200, json=load("seg-metadata-baseballStats-columns.json"))
+    if path == "/tables/baseballStats":
+        return httpx.Response(200, json=load("tableconfig-baseballStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_the_controller_is_asked_for_columns_in_its_own_spelling() -> None:
+    """Measured: ?columns=playerid returns nothing, because the controller's
+    column filter is case-sensitive while referenced_columns lowercases."""
+    asked: list[httpx.URL] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/segments/"):
+            asked.append(request.url)
+        return _baseball_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT league, playerID FROM pinot.default.baseballStats LIMIT 10"
+    )
+    assert asked
+    assert sorted(asked[0].params.get_list("columns")) == ["league", "playerID"]
+
+
+async def test_a_column_belonging_to_no_table_is_not_asked_for() -> None:
+    """A name the schema does not carry is another table's, or a literal."""
+    asked: list[httpx.URL] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/segments/"):
+            asked.append(request.url)
+        return _baseball_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT league FROM pinot.default.baseballStats WHERE nosuchcolumn > 1 LIMIT 10"
+    )
+    assert asked
+    assert asked[0].params.get_list("columns") == ["league"]
+
+
 def _limitpruned_routes(request: httpx.Request) -> httpx.Response:
     """The oracle answering with a limit prune, whatever the statement."""
     if request.url.path == "/query/sql":
