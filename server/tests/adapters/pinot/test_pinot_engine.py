@@ -877,6 +877,35 @@ async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
     assert sum(1 for sql in asked if "AS JSON" not in sql) == 0
 
 
+def _limitpruned_routes(request: httpx.Request) -> httpx.Response:
+    """The oracle answering with a limit prune, whatever the statement."""
+    if request.url.path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-limitpruned.json"))
+    return _quote_routes(request)
+
+
+async def test_an_offset_does_not_get_to_keep_the_limit_prune() -> None:
+    """Measured: the EXPLAIN prunes 30 of 31 either way, but the OFFSET query
+    then scans 9,117 docs over 29 segments — the counter is offset-blind."""
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10 OFFSET 9000"
+    )
+    assert estimate.row_estimate == 9746
+
+
+async def test_without_an_offset_the_limit_prune_is_still_the_oracle() -> None:
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate < 9746
+
+
 async def test_an_unpriceable_shape_is_refused_before_any_request() -> None:
     def routes(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"no request should be made, got {request.url}")

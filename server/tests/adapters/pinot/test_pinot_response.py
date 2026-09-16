@@ -136,6 +136,31 @@ def test_a_limit_prune_counts_as_pruning_too() -> None:
     assert surviving_segments(load("explain-v1-limitpruned.json")) == 1
 
 
+def test_an_untrusted_limit_prune_survives_every_segment() -> None:
+    """Measured: the OFFSET query's EXPLAIN reports the same 30 ByServer /
+    30 ByLimit as the bare LIMIT, then executes over 29 segments. ByServer
+    is the total that ByLimit breaks down, so distrusting the limit prune
+    has to discount ByServer by it as well."""
+    assert (
+        surviving_segments(load("explain-v1-limitpruned.json"), trust_limit_prune=False)
+        == 31
+    )
+    assert (
+        surviving_segments(load("explain-v1-limitpruned.json"), trust_limit_prune=True)
+        == 1
+    )
+
+
+def test_an_untrusted_limit_prune_still_reads_a_value_prune() -> None:
+    """Only the limit prune is offset-blind; a predicate's prune is real."""
+    assert (
+        surviving_segments(
+            load("explain-v1-timefilter.json"), trust_limit_prune=False
+        )
+        == 3
+    )
+
+
 def test_the_pruned_counters_are_maxed_never_summed() -> None:
     """ByServer is the total; ByValue and ByLimit break it down, so a sum
     would claim 56 of 31 pruned and quote a negative scan."""

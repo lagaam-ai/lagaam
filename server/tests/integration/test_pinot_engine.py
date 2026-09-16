@@ -10,7 +10,18 @@ from lagaam.adapters.pinot.client import PinotClient
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.adapters.pinot.names import two_part_sql
 from lagaam.adapters.pinot.response import result_failure
-from lagaam.core.errors import QueryFailedError, TableNotFoundError
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    QueryBudget,
+    enforce_budget,
+)
+from lagaam.core.errors import (
+    BudgetExceededError,
+    QueryFailedError,
+    TableNotFoundError,
+)
 from lagaam.core.ports import QueryEngine
 from lagaam.core.safety import validate_query
 
@@ -434,3 +445,30 @@ async def test_a_self_join_quote_is_never_under_what_execution_scanned(
     assert estimate.max_intermediate_rows is not None
     # The true pair count, computed in Pinot: sum(n*n) over Carrier groups.
     assert estimate.max_intermediate_rows >= 10_719_442
+
+
+async def test_an_offset_is_quoted_above_what_it_really_scans(
+    pinot_ready: None,
+) -> None:
+    """The limit prune is offset-blind: the EXPLAIN prunes 30 of 31 segments
+    for this query exactly as for the bare LIMIT, and it then walks 9,117
+    docs over 29 segments to reach row 9,000."""
+    sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10 OFFSET 9000"
+    engine = _engine()
+    estimate = await engine.estimate_cost(sql)
+    body = await engine._client.broker_query(
+        two_part_sql(sql, PinotEngine.CATALOG), "useMultistageEngine=true"
+    )
+    scanned = body["numDocsScanned"]
+    assert scanned > 1000
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate >= scanned
+
+    budget = QueryBudget(
+        max_rows=1000,
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
+    with pytest.raises(BudgetExceededError):
+        enforce_budget(estimate, budget)

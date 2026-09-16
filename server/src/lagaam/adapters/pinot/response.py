@@ -101,8 +101,17 @@ _PRUNED_COUNTERS = (
     "numSegmentsPrunedByLimit",
 )
 
+# The counters left once the limit prune is not believed. ByServer is the
+# server-side total that ByLimit breaks down, so it cannot be read either:
+# measured, the limit-pruned EXPLAIN reports ByServer 30 and ByLimit 30 of
+# 31 segments, and crediting ByServer would keep the very prune being
+# distrusted. ByValue carries a predicate's own pruning independently.
+_UNLIMITED_PRUNED_COUNTERS = ("numSegmentsPrunedByValue",)
 
-def surviving_segments(explain_json: Any) -> int | None:
+
+def surviving_segments(
+    explain_json: Any, *, trust_limit_prune: bool = True
+) -> int | None:
     """How many segments survive the predicate, from a single-stage EXPLAIN.
 
     Only ByServer, ByValue and ByLimit are read, and the largest is taken
@@ -114,6 +123,12 @@ def surviving_segments(explain_json: Any) -> int | None:
     reports numSegmentsQueried net of its own pruning, subtracting ByBroker
     again would under-count survivors. Leaving a counter unread can only
     charge more segments, never fewer, which is the fail-safe side.
+
+    `trust_limit_prune` is False when the statement carries an OFFSET, which
+    the planner prices as though it were absent: measured, `LIMIT 10 OFFSET
+    9000` reports the same 30-of-31 limit prune as the bare `LIMIT 10` and
+    then walks 9,117 docs over 29 segments. The caller decides, because only
+    it has the SQL; this module sees a broker answer and nothing else.
 
     None means "no oracle" — the caller then charges every segment.
     """
@@ -129,7 +144,8 @@ def surviving_segments(explain_json: Any) -> int | None:
     if isinstance(queried, bool) or not isinstance(queried, int) or queried <= 0:
         return None
     pruned = 0
-    for key in _PRUNED_COUNTERS:
+    counters = _PRUNED_COUNTERS if trust_limit_prune else _UNLIMITED_PRUNED_COUNTERS
+    for key in counters:
         value = explain_json.get(key)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             continue

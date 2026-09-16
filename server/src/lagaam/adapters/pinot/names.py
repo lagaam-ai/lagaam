@@ -87,6 +87,19 @@ def referenced_tables(sql: str, catalog: str = "pinot") -> list[tuple[str, str]]
     return sorted(found)
 
 
+def has_offset(sql: str) -> bool:
+    """Does this statement carry an OFFSET anywhere?
+
+    True is the safe answer: a statement nobody could re-parse is treated as
+    though it had one, which only ever charges more segments.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_DIALECT)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return True
+    return any(True for _ in tree.find_all(exp.Offset))
+
+
 def referenced_columns(sql: str) -> frozenset[str] | None:
     """Lowercase bare names of every column this SQL mentions.
 

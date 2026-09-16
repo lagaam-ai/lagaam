@@ -28,6 +28,7 @@ from lagaam.adapters.pinot.metadata import (
     table_schema,
 )
 from lagaam.adapters.pinot.names import (
+    has_offset,
     referenced_columns,
     referenced_tables,
     two_part_sql,
@@ -287,7 +288,9 @@ class PinotEngine:
             # A quotation nobody could build is a denial at the gate, which
             # is the safe answer; an EngineError would read as an outage.
             return CostEstimate(confidence="low")
-        surviving = await self._surviving(two_part, len(tables))
+        surviving = await self._surviving(
+            two_part, len(tables), trust_limit_prune=not has_offset(sql)
+        )
         located = [(database, fact, surviving) for database, fact in facts]
         widest = await self._widest_rows(two_part, located)
         # The plan folds a repeated scan into one node and referenced_tables
@@ -341,11 +344,16 @@ class PinotEngine:
             None if size_json is PinotClient.NotFound else size_json,
         )
 
-    async def _surviving(self, two_part: str, table_count: int) -> int | None:
+    async def _surviving(
+        self, two_part: str, table_count: int, *, trust_limit_prune: bool
+    ) -> int | None:
         """Segments surviving the predicate, or None meaning "charge them all".
 
         Only ever asked for a single-table query: the single-stage engine
         refuses a join outright, and it is the only engine that prunes.
+
+        The SQL is known here and not in the parser, so whether the limit
+        prune may be believed is decided here and passed down.
         """
         if table_count != 1:
             return None
@@ -359,7 +367,7 @@ class PinotEngine:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
         except (PinotTransportError, PinotResponseTooLarge):
             return None
-        return surviving_segments(body)
+        return surviving_segments(body, trust_limit_prune=trust_limit_prune)
 
     async def _widest_rows(
         self, two_part: str, tables: list[tuple[str, TableFacts, int | None]]
