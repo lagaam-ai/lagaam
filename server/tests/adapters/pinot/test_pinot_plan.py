@@ -29,17 +29,17 @@ def plan_cell(name: str) -> str:
     return cell
 
 
-def test_a_cross_join_is_charged_the_product_of_its_children() -> None:
+def test_a_cross_join_is_charged_the_product_plus_its_children() -> None:
     assert (
         max_intermediate_rows(plan_cell("explain-mse-crossjoin.json"), LEAVES)
-        == AIRLINE_DOCS * BASEBALL_DOCS
+        == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
     )
 
 
 def test_an_equi_join_is_charged_the_product_since_no_key_can_be_proven() -> None:
     assert (
         max_intermediate_rows(plan_cell("explain-mse-equijoin.json"), LEAVES)
-        == AIRLINE_DOCS * BASEBALL_DOCS
+        == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
     )
 
 
@@ -50,7 +50,7 @@ def test_a_self_join_pairs_the_one_scan_calcite_folded_it_into() -> None:
             plan_cell("explain-mse-selfjoin.json"),
             {"default.airlinestats": AIRLINE_DOCS},
         )
-        == AIRLINE_DOCS * AIRLINE_DOCS
+        == AIRLINE_DOCS * AIRLINE_DOCS + 2 * AIRLINE_DOCS
     )
 
 
@@ -79,7 +79,7 @@ def test_the_rowcount_attributes_are_never_read() -> None:
     """Pinot prices every scan at a constant 100; reading it admits a cross join."""
     answer = max_intermediate_rows(plan_cell("explain-mse-crossjoin.json"), LEAVES)
     assert answer not in (100, 10000)
-    assert answer == AIRLINE_DOCS * BASEBALL_DOCS
+    assert answer == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
 
 
 def test_a_node_without_inputs_consumes_the_node_before_it() -> None:
@@ -116,13 +116,13 @@ def test_a_join_whose_condition_nests_an_equality_is_still_the_product() -> None
             ]
         }
     )
-    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5510
 
 
 def test_an_or_of_equalities_is_charged_the_product() -> None:
     assert (
         max_intermediate_rows(plan_cell("explain-mse-orjoin.json"), LEAVES)
-        == AIRLINE_DOCS * BASEBALL_DOCS
+        == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
     )
 
 
@@ -147,7 +147,30 @@ def test_a_negated_equality_is_charged_the_product() -> None:
             ]
         }
     )
-    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5510
+
+
+def test_an_outer_joins_unmatched_rows_ride_on_top_of_the_product() -> None:
+    """Measured on 1.5.1: a 1-row side FULL OUTER JOIN a 4-row side with no
+    matching key returned 5, where the bare product bounds only 4. The
+    unmatched rows of both sides pass through on top of the matched pairs,
+    so a + b is added — without reading joinType, which is one more plan
+    attribute to trust for a term worth 0.02% on real tables."""
+    plan = json.dumps(
+        {
+            "rels": [
+                {"id": "0", "relOp": "PinotLogicalTableScan", "table": ["default", "a"], "inputs": []},
+                {"id": "1", "relOp": "PinotLogicalTableScan", "table": ["default", "b"], "inputs": []},
+                {
+                    "id": "2",
+                    "relOp": "LogicalJoin",
+                    "joinType": "full",
+                    "inputs": ["0", "1"],
+                },
+            ]
+        }
+    )
+    assert max_intermediate_rows(plan, {"default.a": 1, "default.b": 4}) == 9
 
 
 def test_a_union_all_is_charged_the_sum_of_its_inputs() -> None:
@@ -190,7 +213,7 @@ def test_a_correlate_is_charged_the_product() -> None:
             ]
         }
     )
-    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5510
 
 
 def test_an_inequality_join_is_charged_the_product() -> None:
@@ -209,7 +232,7 @@ def test_an_inequality_join_is_charged_the_product() -> None:
             ]
         }
     )
-    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5000
+    assert max_intermediate_rows(plan, {"default.a": 10, "default.b": 500}) == 5510
 
 
 @pytest.mark.parametrize(

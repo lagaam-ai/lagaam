@@ -59,9 +59,10 @@ are charged once per read. Docs and bytes both scale; the plan walk's leaf
 sizes stay per single read, since the walker multiplies or sums the folded
 node as the plan references it.
 
-Every join and `Correlate` is the product of its inputs. A `UNION`, all or
-distinct, is the sum, since a distinct union still builds every input row
-before deduplicating. There is no max branch: 1.5.1 exposes no cardinality
+Every join and `Correlate` is the product of its inputs plus their sum: the
+unmatched rows of an outer join ride on top of the product, so the sum is
+added. A `UNION`, all or distinct, is the sum, since a distinct union still
+builds every input row before deduplicating. There is no max branch: 1.5.1 exposes no cardinality
 anywhere in the pricing path — segment metadata carries docs, bytes and time
 ranges but never distinct counts, and the plan's own rowcount is a constant
 100 — so no equality can be shown to be a key. Measured, `ON a.Carrier =

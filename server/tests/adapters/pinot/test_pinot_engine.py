@@ -879,7 +879,7 @@ async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
         "pinot.default.baseballStats b LIMIT 10"
     )
     assert estimate.row_estimate == 9746 + 97889
-    assert estimate.max_intermediate_rows == 9746 * 97889
+    assert estimate.max_intermediate_rows == 9746 * 97889 + 9746 + 97889
     # The oracle is asked at most once, and never for a two-table query.
     assert sum(1 for sql in asked if "AS JSON" not in sql) == 0
 
@@ -1222,5 +1222,5 @@ async def test_a_self_join_is_charged_two_reads_and_the_product() -> None:
     assert single.scanned_bytes is not None
     assert self_join.row_estimate == 2 * 9746
     assert self_join.scanned_bytes == 2 * single.scanned_bytes
-    assert self_join.max_intermediate_rows == 9746 * 9746
+    assert self_join.max_intermediate_rows == 9746 * 9746 + 2 * 9746
     assert self_join.confidence == "high"

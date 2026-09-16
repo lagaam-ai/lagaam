@@ -226,10 +226,15 @@ Rules:
   segment with no size makes the sum unknown.
 - `max_intermediate_rows`: `plan.py` walks `rels[]` post-order. A scan node
   is its table's surviving docs; **a join or `Correlate` is always the
-  product of its children**, since 1.5.1 exposes no cardinality to prove a
-  key and "has a conjunctive equality" is the SQL-shape proxy ADR 0004
-  rejected (measured: `ON a.Carrier = b.Carrier` builds 10,719,442 pairs
-  over 9,746 rows, 14 distinct carriers — the max branch quoted 9,746); a
+  product of its children plus their sum**, since 1.5.1 exposes no
+  cardinality to prove a key and "has a conjunctive equality" is the
+  SQL-shape proxy ADR 0004 rejected (measured: `ON a.Carrier = b.Carrier`
+  builds 10,719,442 pairs over 9,746 rows, 14 distinct carriers — the max
+  branch quoted 9,746). The unmatched rows of an outer join ride on top of
+  the product, so the sum is added — `joinType` is not read, since the term
+  is worth 0.0113% on these tables and exact-safe on a side of 0 or 1 rows
+  (measured: a 1-row side FULL OUTER JOIN a 4-row side returned 5, where the
+  product bounds only 4); a
   `UNION` (all or distinct) is the sum of its children; every other node is
   the max of its children. The answer is the max over all nodes. A plan that
   cannot be fetched or read is `None`.

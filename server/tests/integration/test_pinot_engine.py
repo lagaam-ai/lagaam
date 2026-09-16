@@ -414,6 +414,8 @@ async def test_a_cross_join_quotes_the_product_of_both_tables(
     assert (
         estimate.max_intermediate_rows
         == airline.row_estimate * baseball.row_estimate
+        + airline.row_estimate
+        + baseball.row_estimate
     )
     assert estimate.max_intermediate_rows is not None
     assert estimate.max_intermediate_rows > 900_000_000
@@ -427,7 +429,7 @@ async def test_an_equi_join_is_charged_the_product_until_a_key_is_proven(
         "SELECT count(*) FROM pinot.default.airlineStats a "
         "JOIN pinot.default.baseballStats b ON a.Carrier = b.teamID LIMIT 10"
     )
-    assert estimate.max_intermediate_rows == 9746 * 97889
+    assert estimate.max_intermediate_rows == 9746 * 97889 + 9746 + 97889
 
 
 async def test_a_self_join_quote_is_never_under_what_execution_scanned(
@@ -445,6 +447,8 @@ async def test_a_self_join_quote_is_never_under_what_execution_scanned(
     assert estimate.max_intermediate_rows is not None
     # The true pair count, computed in Pinot: sum(n*n) over Carrier groups.
     assert estimate.max_intermediate_rows >= 10_719_442
+    # The product, plus the unmatched rows an outer join would ride on top.
+    assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
 
 
 async def test_an_offset_is_quoted_above_what_it_really_scans(

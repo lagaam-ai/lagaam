@@ -8,9 +8,18 @@ segment metadata the quotation already fetched. The rowcount and cumulative
 cost attributes are never read.
 
 The rule is ADR 0004's, applied to a plan that carries shape but no sizes: a
-join or correlate is always the product of its inputs, a union (all or
-distinct) is the sum of its inputs, and everything else passes its widest
-input through.
+join or correlate is always the product of its inputs plus their sum, a union
+(all or distinct) is the sum of its inputs, and everything else passes its
+widest input through.
+
+The sum rides on top of the product because Pinot MSE supports full, left and
+right outer joins, whose unmatched rows are emitted on top of the matched
+pairs: measured, a 1-row side FULL OUTER JOIN a 4-row side with no matching
+key returned 5, where the product bounds only 4. The product alone under-bounds
+exactly when a x b < a + b, i.e. when a side has 0 or 1 rows. joinType is not
+read: it would be one more plan attribute to trust, and the additive term is
+worth 0.0113% on these tables (954,026,194 against 954,133,829) while being
+exact-safe on the degenerate ones.
 
 The product holds for an equi-join too. Nothing on 1.5.1 can prove a join key:
 there are no cardinality statistics anywhere in the pricing path, and an
@@ -115,10 +124,12 @@ def _rows(
     elif _is_join(rel):
         # No key can be proven on 1.5.1, so every join pairs its inputs;
         # charging less is how a near-product reads as one table's size.
+        # The inputs are added on top because an outer join also emits the
+        # rows that matched nothing, which the product alone does not cover.
         product = 1
         for rows in child_rows:
             product *= rows
-        answer = product
+        answer = product + sum(child_rows)
     else:
         answer = max(child_rows)
     memo[rel_id] = answer
