@@ -1087,6 +1087,39 @@ async def test_a_broker_that_hangs_on_explain_degrades_to_low() -> None:
     assert estimate.max_intermediate_rows is None
 
 
+async def test_an_explain_that_trickles_past_the_deadline_degrades_to_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx's timeout is a read-gap timeout, so a body arriving in slow
+    chunks outlasts it: measured, a 1s timeout returned after 3.51s. The
+    quotation's EXPLAINs need the same total deadline execute() uses."""
+    monkeypatch.setattr(engine_module, "_EXPLAIN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(engine_module, "_TIMEOUT_GRACE_SECONDS", 0.3)
+
+    async def chunks() -> Any:
+        raw = json.dumps(load("explain-v1-nofilter.json")).encode()
+        size = len(raw) // 4 + 1
+        for start in range(0, len(raw), size):
+            # No single gap trips the per-operation timeout; only the total.
+            await anyio.sleep(0.25)
+            yield raw[start : start + size]
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            return httpx.Response(200, stream=_AsyncStream(chunks()))
+        return _quote_routes(request)
+
+    started = time.monotonic()
+    estimate = await make_engine(routes).estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    # Both EXPLAINs give up at their 0.5s deadline, not after ~1s of body each.
+    assert time.monotonic() - started < 2.0
+    # A timeout degrades exactly like a transport failure: no plan, no oracle.
+    assert estimate.max_intermediate_rows is None
+    assert estimate.row_estimate == 9746
+
+
 def _selfjoin_routes(request: httpx.Request) -> httpx.Response:
     """One table, read twice by a self-join, with the joins-refusing oracle."""
     path = request.url.path

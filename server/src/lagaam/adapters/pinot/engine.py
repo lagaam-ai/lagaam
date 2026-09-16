@@ -388,16 +388,29 @@ class PinotEngine:
         if table_count != 1:
             return None
         try:
-            body = await self._client.broker_query(
+            body = await self._explain(
                 f"{_EXPLAIN_PRUNING}{two_part}",
                 f"{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
-                timeout_seconds=_EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS,
             )
         except PinotForbidden as exc:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
-        except (PinotTransportError, PinotResponseTooLarge):
+        except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
             return None
         return surviving_segments(body, trust_limit_prune=trust_limit_prune)
+
+    async def _explain(self, sql: str, options: str) -> Any:
+        """One quotation EXPLAIN, bounded end to end rather than per operation.
+
+        The same deadline execute() carries, for the same reason: httpx's
+        timeout resets on every read, so a body trickling in chunks outlives
+        it — measured, a 1s timeout returned a result after 3.51s. The
+        quotation is advisory, so a wedged broker must not hold the gate.
+        """
+        deadline = _EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS
+        with anyio.fail_after(deadline):
+            return await self._client.broker_query(
+                sql, options, timeout_seconds=deadline
+            )
 
     async def _widest_rows(
         self, two_part: str, tables: list[tuple[str, TableFacts, int | None]]
@@ -412,14 +425,13 @@ class PinotEngine:
                 facts, surviving
             )
         try:
-            body = await self._client.broker_query(
+            body = await self._explain(
                 f"{_EXPLAIN_SHAPE}{two_part}",
                 f"{_OPT_MULTISTAGE}=true;{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
-                timeout_seconds=_EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS,
             )
         except PinotForbidden as exc:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
-        except (PinotTransportError, PinotResponseTooLarge):
+        except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
             return None
         cell = _plan_cell(body)
         if cell is None:
