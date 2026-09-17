@@ -829,6 +829,47 @@ def test_a_size_report_naming_one_sealed_segment_matching_metadata_is_evidence_f
     )
 
 
+def test_a_consuming_segment_named_only_by_size_proves_nothing() -> None:
+    """A -1 entry the metadata never listed still holds rows no one can count.
+
+    Metadata carries only the one sealed segment; the size report also names
+    a second segment at reportedSizeInBytes -1, which metadata omits
+    entirely (not even a consuming-shaped body). That segment's rows are
+    invisible to metadata_is_complete's == 1 check, but they are still rows
+    the sealed segment does not have, so the column is not a table key.
+    """
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    size = {
+        "realtimeSegments": {
+            "segments": {
+                "seg0": {"reportedSizeInBytes": 100},
+                "seg1": {"reportedSizeInBytes": -1},
+            }
+        }
+    }
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+
+
 @pytest.mark.parametrize("size", [None, {}])
 def test_an_unreadable_size_report_proves_nothing_f1(size: Any) -> None:
     """F1: size_json unreadable means the one-sealed-segment claim is unverifiable."""

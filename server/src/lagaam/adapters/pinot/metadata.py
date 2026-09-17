@@ -522,6 +522,14 @@ def single_segment_unique_columns(
     reportedSizeInBytes >= 0 entry), the metadata response must be complete
     against it, and the one metadata entry must be that same segment.
 
+    A consuming segment can be invisible to metadata entirely — named only
+    by a reportedSizeInBytes -1 entry in the size report, with no body at
+    all on the metadata side. metadata_is_complete does not catch this (it
+    only requires every *sealed* name to be present), so this function
+    checks the size report for any -1 entry itself: such a segment holds
+    rows the one sealed segment does not, so its presence alone voids the
+    key regardless of what metadata says.
+
     Gated on nullability because the null caveat is unclosed (log §6): if
     cardinality counts a null or a default as a distinct value, a column with
     one null could report cardinality == totalDocs while two rows share the
@@ -534,11 +542,10 @@ def single_segment_unique_columns(
     """
     if not isinstance(seg_metadata_json, dict):
         return frozenset()
-    sealed_names = {
-        name
-        for name, size in _reported_sizes(size_json).items()
-        if size is not None and size >= 0
-    }
+    reported = _reported_sizes(size_json)
+    if any(size < 0 for size in reported.values()):
+        return frozenset()
+    sealed_names = {name for name, size in reported.items() if size is not None and size >= 0}
     if len(sealed_names) != 1:
         return frozenset()
     if not metadata_is_complete(seg_metadata_json, size_json):
