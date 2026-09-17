@@ -535,3 +535,28 @@ async def test_a_lowercase_table_quotes_what_the_canonical_one_does(
     assert lowered.confidence == "high"
     assert lowered.row_estimate == canonical.row_estimate
     assert lowered.scanned_bytes == canonical.scanned_bytes
+
+
+def _realtime_engine() -> PinotEngine:
+    return PinotEngine(
+        controller_url="http://localhost:9001", broker_url="http://localhost:8001"
+    )
+
+
+async def test_a_realtime_table_grounds_without_a_row_count(
+    pinot_realtime_ready: None,
+) -> None:
+    """The STREAM half of the profile answers, and a REALTIME table carries no
+    grounding count: the controller's numRows is an OFFLINE fact, so a card
+    built from a consuming table has to say None rather than guess."""
+    engine = _realtime_engine()
+    card = await engine.describe_table("pinot", "default", "airlineStats")
+    assert card.table == "airlineStats"
+    assert card.row_estimate is None
+
+    result = await engine.execute(
+        "SELECT count(*) FROM pinot.default.airlineStats LIMIT 1",
+        max_rows=1,
+        timeout_seconds=30.0,
+    )
+    assert result.rows[0][0] > 0
