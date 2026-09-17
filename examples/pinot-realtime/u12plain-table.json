@@ -25,6 +25,31 @@
       ]
     }
   },
+  "instanceAssignmentConfigMap": {
+    "CONSUMING": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    },
+    "COMPLETED": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    }
+  },
+  "routing": {
+    "instanceSelectorType": "strictReplicaGroup"
+  },
   "metadata": {
     "customConfigs": {}
   }

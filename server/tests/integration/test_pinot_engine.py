@@ -814,43 +814,101 @@ async def test_realtime_a_mixed_case_name_quotes_what_the_canonical_one_does(
     assert mixed.scanned_bytes == canonical.scanned_bytes
 
 
-async def test_realtime_a_split_metadata_table_is_denied_not_under_quoted(
+async def _realtime_docs_bound(engine: PinotEngine, table: str) -> int:
+    """The per-table docs bound the quotation walker itself charges, D.
+
+    Derived from the controller, not from a single-table quote: that quote
+    carries the limit prune, so it answers about a k-largest subset (600 for
+    these tables) rather than the whole table the join walks. D is every
+    sealed segment's totalDocs plus one flush-threshold charge per consuming
+    segment — the same two documents the completeness check compares, and
+    the same arithmetic quote.py applies.
+    """
+    size = await engine._client.controller_get(
+        f"/tables/{table}/size", database="default"
+    )
+    segments = size["realtimeSegments"]["segments"] or {}
+    metadata = await engine._client.controller_get(
+        f"/segments/{table}/metadata", database="default"
+    )
+    # The premise of every number below: the metadata really is the table.
+    named = set(segments)
+    assert named <= set(metadata), (
+        f"{table} metadata is short of /size — the segments split across "
+        f"servers again and D cannot be derived ({sorted(named - set(metadata))})"
+    )
+    config = await engine._client.controller_get(f"/tables/{table}")
+    stream = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
+        "streamConfigMaps"
+    ][0]
+    flush_rows = int(stream["realtime.segment.flush.threshold.rows"])
+
+    sealed_docs = 0
+    consuming = 0
+    for name, body in segments.items():
+        if body["reportedSizeInBytes"] < 0:
+            consuming += 1
+            continue
+        sealed_docs += int(metadata[name]["totalDocs"])
+    assert consuming > 0, f"{table} has no consuming segment"
+    return sealed_docs + consuming * flush_rows
+
+
+async def _realtime_true_pairs(engine: PinotEngine, table: str) -> int:
+    """The join's real output size: sum over keys of (versions per key)^2."""
+    body = await engine._client.broker_query(
+        f"SELECT SUM(c*c) FROM (SELECT pk, COUNT(*) c FROM {table} GROUP BY pk) t",
+        "useMultistageEngine=true",
+    )
+    assert not body.get("exceptions"), body.get("exceptions")
+    return int(body["resultTable"]["rows"][0][0])
+
+
+async def test_realtime_an_upsert_self_join_is_bounded_by_its_key(
     pinot_realtime_ready: None,
 ) -> None:
-    """Shapes (d)/(e), as the live cluster actually presents them.
+    """Shape (d), live. u12upsert declares pk as its primary key, so a
+    self-join on pk is at most one match per key: the walker charges
+    min(left, right) + left + right instead of the product.
 
-    u12upsert and u12plain sit on a 2-partition topic, so their segments
-    land on two servers — and /segments/{t}/metadata returns only one
-    server's half while /size names both. The segments in hand are then not
-    the table, and the completeness guard withholds every number rather
-    than summing a confident subset into an under-quote. That denial is the
-    behaviour worth pinning: it is the one failure mode the gate exists to
-    prevent, and it is what makes the upsert-vs-twin join contrast
-    unobservable here (see the task-8 report).
+    Every number is derived — D from the controller's own segment metadata,
+    the true pair count from the broker — so this fails loudly rather than
+    vacuously if the cluster layout changes.
     """
     engine = _realtime_engine()
-    for table in ("u12upsert", "u12plain"):
-        size = await engine._client.controller_get(
-            f"/tables/{table}/size", database="default"
-        )
-        named = {
-            name
-            for name, body in (size["realtimeSegments"]["segments"] or {}).items()
-            if body["reportedSizeInBytes"] >= 0
-        }
-        metadata = await engine._client.controller_get(
-            f"/segments/{table}/metadata", database="default"
-        )
-        # Derived, not assumed: the metadata response really is short.
-        assert not named <= set(metadata), (
-            f"{table} metadata is complete after all — this test's premise is gone"
-        )
-        estimate = await engine.estimate_cost(
-            f"SELECT pk FROM pinot.default.{table} LIMIT 1000"
-        )
-        assert estimate.confidence == "low"
-        assert estimate.row_estimate is None
-        assert estimate.scanned_bytes is None
+    docs = await _realtime_docs_bound(engine, "u12upsert")
+    estimate = await engine.estimate_cost(
+        "SELECT a.pk FROM pinot.default.u12upsert a "
+        "JOIN pinot.default.u12upsert b ON a.pk = b.pk LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == min(docs, docs) + docs + docs
+    # The whole point of the key rule: strictly under the product bound.
+    assert estimate.max_intermediate_rows < docs * docs + 2 * docs
+    # And still a bound, never a guess.
+    assert estimate.max_intermediate_rows >= await _realtime_true_pairs(
+        engine, "u12upsert"
+    )
+
+
+async def test_realtime_the_plain_twin_self_join_is_charged_the_product(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (e), live. The contrast that makes (d) mean anything: the same
+    rows, the same topic, the same SQL — but no declared primary key, so
+    nothing rules out every row matching every row and the walker charges
+    the full product."""
+    engine = _realtime_engine()
+    docs = await _realtime_docs_bound(engine, "u12plain")
+    estimate = await engine.estimate_cost(
+        "SELECT a.pk FROM pinot.default.u12plain a "
+        "JOIN pinot.default.u12plain b ON a.pk = b.pk LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == docs * docs + 2 * docs
+    assert estimate.max_intermediate_rows >= await _realtime_true_pairs(
+        engine, "u12plain"
+    )
 
 
 async def test_realtime_the_upsert_pk_is_the_schema_s_primary_key(

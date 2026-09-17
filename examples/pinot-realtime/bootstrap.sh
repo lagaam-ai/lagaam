@@ -49,7 +49,7 @@ except Exception:
     print(0)
 else:
     print(len(payload.get("RealtimeServerInstances") or []))' 2>/dev/null \
-    || echo 0
+    || true
 }
 
 wait_for_realtime_server() {
@@ -157,7 +157,15 @@ feed_needed() {
 wait_for_controller
 wait_for_realtime_server
 create_topic u12-flights 1
-create_topic u12-upsert 2
+# One partition, not two. An upsert table needs its stream partitioned by the
+# primary key, and one partition satisfies that trivially — but it also keeps
+# both u12 tables' segments on a single server. Measured on the 2-partition
+# version: the quickstart runs four servers, the sealed segments split across
+# two of them, and GET /segments/{table}/metadata returns only one server's
+# half while /tables/{table}/size names both. The completeness guard then
+# (correctly) denies every quote, and the upsert-key join bound the U12 tests
+# exist to prove becomes unobservable on the live cluster.
+create_topic u12-upsert 1
 
 post_table airlineStats airlineStats-schema.json airlineStats-table.json
 post_table u12upsert    u12upsert-schema.json    u12upsert-table.json
@@ -183,8 +191,10 @@ if feed_needed u12-flights "${ROWS}"; then
   echo "produced ${ROWS} rows to u12-flights"
 fi
 
-# The upsert feed: 100 distinct keys x 6 versions, keyed by pk so both
-# partitions get whole keys and the upsert view is the last version of each.
+# The upsert feed: 100 distinct keys x 6 versions, keyed by pk so every
+# version of a key lands in the same partition and the upsert view is the
+# last version of each. The topic has one partition, so that is automatic —
+# the key is still produced, because it is what upsert partitioning requires.
 if feed_needed u12-upsert "${UPSERT_ROWS}"; then
   UP_FEED="$(mktemp -t u12up_feed.XXXXXX)"
   python3 - > "${UP_FEED}" <<'PY'

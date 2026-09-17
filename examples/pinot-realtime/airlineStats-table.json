@@ -7,7 +7,12 @@
     "replication": "1"
   },
   "tableIndexConfig": {},
-  "routing": {"segmentPrunerTypes": ["time"]},
+  "routing": {
+    "segmentPrunerTypes": [
+      "time"
+    ],
+    "instanceSelectorType": "strictReplicaGroup"
+  },
   "ingestionConfig": {
     "streamIngestionConfig": {
       "streamConfigMaps": [
@@ -24,17 +29,55 @@
       ]
     },
     "transformConfigs": [
-      {"columnName": "ts", "transformFunction": "fromEpochDays(DaysSinceEpoch)"},
-      {"columnName": "tsRaw", "transformFunction": "fromEpochDays(DaysSinceEpoch)"}
+      {
+        "columnName": "ts",
+        "transformFunction": "fromEpochDays(DaysSinceEpoch)"
+      },
+      {
+        "columnName": "tsRaw",
+        "transformFunction": "fromEpochDays(DaysSinceEpoch)"
+      }
     ]
   },
   "fieldConfigList": [
     {
       "name": "ts",
       "encodingType": "DICTIONARY",
-      "indexTypes": ["TIMESTAMP"],
-      "timestampConfig": {"granularities": ["DAY", "WEEK", "MONTH"]}
+      "indexTypes": [
+        "TIMESTAMP"
+      ],
+      "timestampConfig": {
+        "granularities": [
+          "DAY",
+          "WEEK",
+          "MONTH"
+        ]
+      }
     }
   ],
-  "metadata": {"customConfigs": {}}
+  "instanceAssignmentConfigMap": {
+    "CONSUMING": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    },
+    "COMPLETED": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    }
+  },
+  "metadata": {
+    "customConfigs": {}
+  }
 }

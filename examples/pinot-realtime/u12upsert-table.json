@@ -2,10 +2,19 @@
   "tableName": "u12upsert",
   "tableType": "REALTIME",
   "tenants": {},
-  "segmentsConfig": {"timeColumnName": "ts", "replication": "1"},
-  "tableIndexConfig": {"nullHandlingEnabled": false},
-  "upsertConfig": {"mode": "FULL"},
-  "routing": {"instanceSelectorType": "strictReplicaGroup"},
+  "segmentsConfig": {
+    "timeColumnName": "ts",
+    "replication": "1"
+  },
+  "tableIndexConfig": {
+    "nullHandlingEnabled": false
+  },
+  "upsertConfig": {
+    "mode": "FULL"
+  },
+  "routing": {
+    "instanceSelectorType": "strictReplicaGroup"
+  },
   "ingestionConfig": {
     "streamIngestionConfig": {
       "streamConfigMaps": [
@@ -22,5 +31,19 @@
       ]
     }
   },
-  "metadata": {"customConfigs": {}}
+  "instanceAssignmentConfigMap": {
+    "CONSUMING": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    }
+  },
+  "metadata": {
+    "customConfigs": {}
+  }
 }
