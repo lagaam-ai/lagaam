@@ -136,6 +136,18 @@ class _Keycols:
     columns: tuple[str, ...]
 
 
+def _is_bare_identifier(name: str) -> bool:
+    """Is this a name the ordinals EXPLAIN can carry as it stands?
+
+    A key column's spelling comes from the schema document and is
+    interpolated into a SELECT list, so it is checked like any other name
+    this module puts in a statement: a controller is trusted for facts, not
+    for syntax, and a name carrying a comma or a comment marker would be a
+    second clause rather than a column.
+    """
+    return bool(name) and name.isascii() and name.replace("_", "").isalnum()
+
+
 def _schema_name(config_json: Any, resolved: str) -> str:
     """The schema document's own name for this table.
 
@@ -486,6 +498,10 @@ class PinotEngine:
         resolved = [spellings.get(name) for name in names]
         if not resolved or any(name is None for name in resolved):
             # A key column the schema does not name cannot be selected at all.
+            return
+        if not all(_is_bare_identifier(name) for name in resolved if name):
+            # This name is interpolated into the ordinals EXPLAIN, so anything
+            # but a plain identifier forfeits the evidence rather than be sent.
             return
         keycols[f"{database}.{table}".lower()] = _Keycols(
             database=database,

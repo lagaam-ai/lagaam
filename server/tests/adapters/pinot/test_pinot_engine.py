@@ -1541,3 +1541,35 @@ async def test_the_externalview_is_what_tells_consuming_from_online() -> None:
     )
     # One sealed segment (k is 0) at 100 docs, plus the 100-row consuming charge.
     assert estimate.row_estimate == 100 + 100
+
+
+async def test_a_key_column_that_is_not_a_bare_name_forfeits_the_evidence() -> None:
+    """The key columns are interpolated into the ordinals EXPLAIN, so a name
+    carrying a comma or a comment marker costs this table its evidence rather
+    than reaching the broker as a second clause."""
+    asked: list[str] = []
+    injected = "Carrier, 1 FROM t --"
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                asked.append(sql)
+        if path in ("/tables/airlineStats/schema", "/schemas/airlineStats"):
+            schema = load("schema-airlineStats.json")
+            # The schema both names the column and calls it the primary key.
+            schema["primaryKeyColumns"] = [injected]
+            schema["dimensionFieldSpecs"].append(
+                {"name": injected, "dataType": "STRING"}
+            )
+            return httpx.Response(200, json=schema)
+        return _upsert_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert asked == []
+    assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
