@@ -1,0 +1,27 @@
+{
+  "schemaName": "u12plain",
+  "dimensionFieldSpecs": [
+    {
+      "name": "pk",
+      "dataType": "STRING"
+    },
+    {
+      "name": "label",
+      "dataType": "STRING"
+    }
+  ],
+  "metricFieldSpecs": [
+    {
+      "name": "val",
+      "dataType": "INT"
+    }
+  ],
+  "dateTimeFieldSpecs": [
+    {
+      "name": "ts",
+      "dataType": "LONG",
+      "format": "1:MILLISECONDS:EPOCH",
+      "granularity": "1:MILLISECONDS"
+    }
+  ]
+}
