@@ -581,6 +581,15 @@ def test_upsert_keys_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
     assert upsert_keys(body, body, body) == frozenset()
 
 
+def _size_naming(*names: str) -> dict[str, Any]:
+    """A minimal size report naming exactly the given segments as sealed."""
+    return {
+        "realtimeSegments": {
+            "segments": {name: {"reportedSizeInBytes": 100} for name in names}
+        }
+    }
+
+
 def test_no_column_on_the_single_segment_table_reaches_its_doc_count() -> None:
     """Sound, and it finds nothing: the best ratio is playerID at 0.185."""
     assert (
@@ -588,6 +597,7 @@ def test_no_column_on_the_single_segment_table_reaches_its_doc_count() -> None:
             load("seg-metadata-baseballStats-allcols.json"),
             load("tableconfig-baseballStats.json"),
             load("schema-baseballStats.json"),
+            load("size-baseballStats.json"),
         )
         == frozenset()
     )
@@ -604,20 +614,33 @@ def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
                     "columnName": "id",
                     "cardinality": 3,
                     "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
-                    "fieldSpec": {"name": "id", "notNull": True},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
                 },
                 {
                     "columnName": "city",
                     "cardinality": 2,
                     "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
-                    "fieldSpec": {"name": "city", "notNull": True},
+                    "fieldSpec": {
+                        "name": "city",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
                 },
             ],
         }
     }
-    assert single_segment_unique_columns(capture, {}, {}) == frozenset(
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
         {frozenset({"id"})}
     )
 
@@ -633,13 +656,20 @@ def test_a_nullable_column_yields_nothing_however_unique_it_looks() -> None:
                     "columnName": "id",
                     "cardinality": 3,
                     "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
-                    "fieldSpec": {"name": "id", "notNull": False},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": False,
+                        "singleValueField": True,
+                    },
                 }
             ],
         }
     }
-    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
 
 
 def test_null_handling_disabled_plus_a_non_nullable_schema_is_enough() -> None:
@@ -653,19 +683,26 @@ def test_null_handling_disabled_plus_a_non_nullable_schema_is_enough() -> None:
                     "columnName": "id",
                     "cardinality": 2,
                     "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
-                    "fieldSpec": {"name": "id", "notNull": False},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": False,
+                        "singleValueField": True,
+                    },
                 }
             ],
         }
     }
+    size = _size_naming("seg0")
     config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
     schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
-    assert single_segment_unique_columns(capture, config, schema) == frozenset(
+    assert single_segment_unique_columns(capture, config, schema, size) == frozenset(
         {frozenset({"id"})}
     )
     enabled = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": True}}}
-    assert single_segment_unique_columns(capture, enabled, schema) == frozenset()
+    assert single_segment_unique_columns(capture, enabled, schema, size) == frozenset()
 
 
 def test_more_than_one_sealed_segment_proves_nothing() -> None:
@@ -680,14 +717,21 @@ def test_more_than_one_sealed_segment_proves_nothing() -> None:
                     "columnName": "id",
                     "cardinality": 2,
                     "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
-                    "fieldSpec": {"name": "id", "notNull": True},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
                 }
             ],
         }
         for i in (0, 1)
     }
-    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+    size = _size_naming("seg0", "seg1")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
 
 
 def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
@@ -701,19 +745,199 @@ def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
                     "columnName": "id",
                     "cardinality": 2,
                     "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
-                    "fieldSpec": {"name": "id", "notNull": True},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
                 }
             ],
         },
         "seg1": {"segmentName": "seg1", "totalDocs": 0, "crc": -9223372036854775808},
     }
-    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
 
 
 @pytest.mark.parametrize("body", [None, {}, [], "junk"])
 def test_single_segment_unique_columns_never_raises(body: Any) -> None:
-    assert single_segment_unique_columns(body, body, body) == frozenset()
+    assert single_segment_unique_columns(body, body, body, body) == frozenset()
+
+
+def test_a_size_report_naming_two_sealed_segments_proves_nothing_f1() -> None:
+    """F1: the metadata response can be one server's half of a 2-segment table.
+
+    Metadata holds only one entry, matching seg0 exactly, but the size report
+    names a second sealed segment the metadata call never returned.
+    """
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    size = _size_naming("seg0", "seg1")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+
+
+def test_a_size_report_naming_one_sealed_segment_matching_metadata_is_evidence_f1() -> (
+    None
+):
+    """F1 happy path: size names exactly the one sealed segment metadata holds."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
+        {frozenset({"id"})}
+    )
+
+
+@pytest.mark.parametrize("size", [None, {}])
+def test_an_unreadable_size_report_proves_nothing_f1(size: Any) -> None:
+    """F1: size_json unreadable means the one-sealed-segment claim is unverifiable."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "totalNumberOfEntries": 2,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+
+
+def test_a_multi_value_column_is_never_a_key_f2() -> None:
+    """F2: MV cardinality counts entries, not rows; three docs, four entries."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "tags",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "totalNumberOfEntries": 4,
+                    "maxNumberOfMultiValues": 2,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "tags",
+                        "notNull": True,
+                        "singleValueField": False,
+                    },
+                }
+            ],
+        }
+    }
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+
+
+def test_the_same_column_single_valued_is_evidence_f2() -> None:
+    """F2 control: single-valued, entries == docs, no MV flag → still a key."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "tags",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "tags",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
+        {frozenset({"tags"})}
+    )
+
+
+def test_max_multivalues_one_alone_excludes_the_column_f2() -> None:
+    """F2: the maxNumberOfMultiValues flag alone is enough to exclude,
+    even though totalNumberOfEntries == totalDocs on this entry."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 5,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 5,
+                    "totalDocs": 5,
+                    "totalNumberOfEntries": 5,
+                    "maxNumberOfMultiValues": 1,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {
+                        "name": "id",
+                        "notNull": True,
+                        "singleValueField": True,
+                    },
+                }
+            ],
+        }
+    }
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
 
 
 def test_table_facts_carry_the_upsert_key() -> None:

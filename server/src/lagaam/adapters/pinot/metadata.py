@@ -404,7 +404,9 @@ def table_facts(
         flush_rows=flush_rows(config_json),
         complete=metadata_is_complete(seg_metadata_json, size_json),
         unique_keys=upsert_keys(config_json, schema_json, table_metadata_json)
-        or single_segment_unique_columns(seg_metadata_json, config_json, schema_json),
+        or single_segment_unique_columns(
+            seg_metadata_json, config_json, schema_json, size_json
+        ),
     )
 
 
@@ -503,7 +505,7 @@ def upsert_keys(
 
 
 def single_segment_unique_columns(
-    seg_metadata_json: Any, config_json: Any, schema_json: Any
+    seg_metadata_json: Any, config_json: Any, schema_json: Any, size_json: Any
 ) -> frozenset[frozenset[str]]:
     """Columns whose cardinality equals their docs, on a one-sealed-segment table.
 
@@ -513,16 +515,37 @@ def single_segment_unique_columns(
     argument is the segment's, and it is the table's only where the two are
     the same rows: one sealed segment and nothing consuming.
 
+    Measured: /segments/{t}/metadata on a multi-server table can return only
+    one server's half, so counting sealed segments in that response alone
+    lets a 2-segment table read as single-segment. The size report is the
+    independent count: it must name exactly one sealed segment (a
+    reportedSizeInBytes >= 0 entry), the metadata response must be complete
+    against it, and the one metadata entry must be that same segment.
+
     Gated on nullability because the null caveat is unclosed (log §6): if
     cardinality counts a null or a default as a distinct value, a column with
     one null could report cardinality == totalDocs while two rows share the
     default. Where nullability cannot be established, nothing is yielded.
+
+    A multi-value column's cardinality counts distinct entries, not rows —
+    totalNumberOfEntries and maxNumberOfMultiValues are reported separately —
+    so equality to totalDocs proves nothing there; such a column is never
+    evidence.
     """
     if not isinstance(seg_metadata_json, dict):
         return frozenset()
+    sealed_names = {
+        name
+        for name, size in _reported_sizes(size_json).items()
+        if size is not None and size >= 0
+    }
+    if len(sealed_names) != 1:
+        return frozenset()
+    if not metadata_is_complete(seg_metadata_json, size_json):
+        return frozenset()
     sealed = [
-        body
-        for body in seg_metadata_json.values()
+        (key, body)
+        for key, body in seg_metadata_json.items()
         if isinstance(body, dict) and isinstance(body.get("columns"), list)
     ]
     consuming = [
@@ -532,18 +555,27 @@ def single_segment_unique_columns(
     ]
     if len(sealed) != 1 or consuming:
         return frozenset()
-    docs = _positive_int(sealed[0].get("totalDocs"))
+    (sole_name,) = sealed_names
+    sole_key, sole_body = sealed[0]
+    name_candidate = sole_body.get("segmentName")
+    if not isinstance(name_candidate, str) or not name_candidate:
+        name_candidate = sole_key if isinstance(sole_key, str) else ""
+    if name_candidate != sole_name:
+        return frozenset()
+    docs = _positive_int(sole_body.get("totalDocs"))
     if docs is None:
         return frozenset()
     nullable_off = _null_handling_disabled(config_json)
     schema_nullable = _schema_nullable_columns(schema_json)
     keys: set[frozenset[str]] = set()
-    for column in sealed[0]["columns"]:
+    for column in sole_body["columns"]:
         if not isinstance(column, dict):
             continue
         name = column.get("columnName")
         cardinality = _positive_int(column.get("cardinality"))
         if not isinstance(name, str) or not name or cardinality != docs:
+            continue
+        if _is_multi_valued(column, docs):
             continue
         spec = column.get("fieldSpec")
         not_null = isinstance(spec, dict) and spec.get("notNull") is True
@@ -553,6 +585,23 @@ def single_segment_unique_columns(
             continue
         keys.add(frozenset({name.lower()}))
     return frozenset(keys)
+
+
+def _is_multi_valued(column: dict[str, Any], docs: int) -> bool:
+    """A column whose per-row value count is not knowable as exactly one.
+
+    `docs` is the segment's own validated totalDocs, not the column entry's
+    copy of it, so a column entry missing or lying about its own totalDocs
+    cannot dodge this gate.
+    """
+    spec = column.get("fieldSpec")
+    if isinstance(spec, dict) and spec.get("singleValueField") is False:
+        return True
+    entries = column.get("totalNumberOfEntries")
+    if isinstance(entries, int) and not isinstance(entries, bool) and entries != docs:
+        return True
+    max_mv = column.get("maxNumberOfMultiValues")
+    return isinstance(max_mv, int) and not isinstance(max_mv, bool) and max_mv > 0
 
 
 def _has_upsert_config(config_json: Any) -> bool:
