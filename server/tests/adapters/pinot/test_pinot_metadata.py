@@ -17,11 +17,13 @@ from lagaam.adapters.pinot.metadata import (
     metadata_is_complete,
     row_estimate,
     segment_facts,
+    single_segment_unique_columns,
     table_facts,
     table_names,
     table_schema,
     table_types,
     time_column,
+    upsert_keys,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -511,3 +513,219 @@ def test_table_facts_without_the_new_documents_are_the_pre_u12_facts() -> None:
     assert facts.flush_rows is None
     assert facts.complete is True
     assert len(facts.segments) == 31
+
+
+def test_an_upsert_tables_primary_key_is_evidence() -> None:
+    """upsertConfig on the config, primaryKeyColumns on the schema, PK map non-empty."""
+    assert upsert_keys(
+        load("tableconfig-u12upsert.json"),
+        load("schema-u12upsert.json"),
+        load("metadata-u12upsert.json"),
+    ) == frozenset({frozenset({"pk"})})
+
+
+def test_the_non_upsert_twin_yields_no_evidence() -> None:
+    assert (
+        upsert_keys(
+            load("tableconfig-u12plain.json"),
+            load("schema-u12plain.json"),
+            load("metadata-u12plain.json"),
+        )
+        == frozenset()
+    )
+
+
+def test_the_whole_primary_key_is_the_key_never_a_subset() -> None:
+    """A composite key is unique as a tuple; a proper subset need not be."""
+    schema = load("schema-u12upsert.json")
+    schema["primaryKeyColumns"] = ["Region", "pk"]
+    assert upsert_keys(
+        load("tableconfig-u12upsert.json"), schema, load("metadata-u12upsert.json")
+    ) == frozenset({frozenset({"region", "pk"})})
+
+
+def test_a_config_and_a_pk_map_that_disagree_withhold_the_evidence() -> None:
+    """Two documents disagreeing about what a table is, is not proof."""
+    assert (
+        upsert_keys(
+            load("tableconfig-u12upsert.json"),
+            load("schema-u12upsert.json"),
+            load("metadata-u12plain.json"),
+        )
+        == frozenset()
+    )
+    assert (
+        upsert_keys(
+            load("tableconfig-u12plain.json"),
+            load("schema-u12upsert.json"),
+            load("metadata-u12upsert.json"),
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("columns", [None, [], ["", "pk"], "pk", [1, 2], [None]])
+def test_a_primary_key_list_that_is_not_names_yields_nothing(columns: Any) -> None:
+    schema = load("schema-u12upsert.json")
+    schema["primaryKeyColumns"] = columns
+    assert (
+        upsert_keys(
+            load("tableconfig-u12upsert.json"), schema, load("metadata-u12upsert.json")
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk"])
+def test_upsert_keys_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
+    assert upsert_keys(body, body, body) == frozenset()
+
+
+def test_no_column_on_the_single_segment_table_reaches_its_doc_count() -> None:
+    """Sound, and it finds nothing: the best ratio is playerID at 0.185."""
+    assert (
+        single_segment_unique_columns(
+            load("seg-metadata-baseballStats-allcols.json"),
+            load("tableconfig-baseballStats.json"),
+            load("schema-baseballStats.json"),
+        )
+        == frozenset()
+    )
+
+
+def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
+    """Gated on notNull, because a null could collide on the default value."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "indexSizeMap": {"forward_index": 12},
+                    "fieldSpec": {"name": "id", "notNull": True},
+                },
+                {
+                    "columnName": "city",
+                    "cardinality": 2,
+                    "totalDocs": 3,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {"name": "city", "notNull": True},
+                },
+            ],
+        }
+    }
+    assert single_segment_unique_columns(capture, {}, {}) == frozenset(
+        {frozenset({"id"})}
+    )
+
+
+def test_a_nullable_column_yields_nothing_however_unique_it_looks() -> None:
+    """The null caveat is unclosed: cardinality may count a null as a value."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "indexSizeMap": {"forward_index": 12},
+                    "fieldSpec": {"name": "id", "notNull": False},
+                }
+            ],
+        }
+    }
+    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+
+
+def test_null_handling_disabled_plus_a_non_nullable_schema_is_enough() -> None:
+    """The second gate the spec allows: the table cannot store a null at all."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {"name": "id", "notNull": False},
+                }
+            ],
+        }
+    }
+    config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
+    schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
+    assert single_segment_unique_columns(capture, config, schema) == frozenset(
+        {frozenset({"id"})}
+    )
+    enabled = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": True}}}
+    assert single_segment_unique_columns(capture, enabled, schema) == frozenset()
+
+
+def test_more_than_one_sealed_segment_proves_nothing() -> None:
+    """Per-segment cardinality is the table's only where the two are one:
+    summing Carrier over 31 segments gave 432 against a true 14."""
+    capture = {
+        f"seg{i}": {
+            "segmentName": f"seg{i}",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {"name": "id", "notNull": True},
+                }
+            ],
+        }
+        for i in (0, 1)
+    }
+    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+
+
+def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
+    """The consuming segment's rows are not in any cardinality anyone can read."""
+    capture = {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 2,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 2,
+                    "totalDocs": 2,
+                    "indexSizeMap": {"forward_index": 8},
+                    "fieldSpec": {"name": "id", "notNull": True},
+                }
+            ],
+        },
+        "seg1": {"segmentName": "seg1", "totalDocs": 0, "crc": -9223372036854775808},
+    }
+    assert single_segment_unique_columns(capture, {}, {}) == frozenset()
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk"])
+def test_single_segment_unique_columns_never_raises(body: Any) -> None:
+    assert single_segment_unique_columns(body, body, body) == frozenset()
+
+
+def test_table_facts_carry_the_upsert_key() -> None:
+    facts = table_facts(
+        "u12upsert",
+        load("tableconfig-u12upsert.json"),
+        load("seg-metadata-u12upsert.json"),
+        load("size-u12upsert.json"),
+        schema_json=load("schema-u12upsert.json"),
+        table_metadata_json=load("metadata-u12upsert.json"),
+    )
+    assert facts.unique_keys == frozenset({frozenset({"pk"})})
+    assert facts.consuming == 2
+    assert facts.flush_rows == 200
+    assert facts.complete is False

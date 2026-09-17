@@ -403,9 +403,8 @@ def table_facts(
         consuming=consuming_count(externalview_json, size_json),
         flush_rows=flush_rows(config_json),
         complete=metadata_is_complete(seg_metadata_json, size_json),
-        # Task 2 replaces this literal with the two key-evidence sources; the
-        # keyword documents are already threaded so that task touches one line.
-        unique_keys=frozenset(),
+        unique_keys=upsert_keys(config_json, schema_json, table_metadata_json)
+        or single_segment_unique_columns(seg_metadata_json, config_json, schema_json),
     )
 
 
@@ -465,3 +464,150 @@ def _positive_int(value: Any, allow_zero: bool = False) -> int | None:
     if value < 0 or (value == 0 and not allow_zero):
         return None
     return value
+
+
+def upsert_keys(
+    config_json: Any, schema_json: Any, table_metadata_json: Any
+) -> frozenset[frozenset[str]]:
+    """An upsert table's primary key, as the one column set proved unique.
+
+    Measured: GROUP BY pk HAVING count(*) > 1 returns nothing on the upsert
+    table and 6-version rows on a byte-identical non-upsert table reading the
+    same topic, and the PK self-join returns exactly the distinct-key count
+    against 3,600 for the twin.
+
+    Three documents have to agree. The config's upsertConfig and the
+    metadata's PK map are each independently proof of an upsert table — the
+    map is {} on every non-upsert table — so a disagreement between them is
+    two documents contradicting each other about what this table is, which is
+    not a basis for admitting a join. The full column list is the key and
+    never a subset: a composite primary key is unique as a tuple.
+    """
+    if not isinstance(schema_json, dict):
+        return frozenset()
+    declared = _has_upsert_config(config_json)
+    counted = _has_primary_key_counts(table_metadata_json)
+    if not declared or not counted:
+        return frozenset()
+    columns = schema_json.get("primaryKeyColumns")
+    if not isinstance(columns, list) or not columns:
+        return frozenset()
+    names = {
+        column.lower()
+        for column in columns
+        if isinstance(column, str) and column and not isinstance(column, bool)
+    }
+    if len(names) != len(columns):
+        return frozenset()
+    return frozenset({frozenset(names)})
+
+
+def single_segment_unique_columns(
+    seg_metadata_json: Any, config_json: Any, schema_json: Any
+) -> frozenset[frozenset[str]]:
+    """Columns whose cardinality equals their docs, on a one-sealed-segment table.
+
+    cardinality is exactly count(DISTINCT col) — verified against the engine
+    on four columns — and count(DISTINCT col) <= count(col) <= totalDocs, so
+    equality forces every doc to be counted and every value to differ. That
+    argument is the segment's, and it is the table's only where the two are
+    the same rows: one sealed segment and nothing consuming.
+
+    Gated on nullability because the null caveat is unclosed (log §6): if
+    cardinality counts a null or a default as a distinct value, a column with
+    one null could report cardinality == totalDocs while two rows share the
+    default. Where nullability cannot be established, nothing is yielded.
+    """
+    if not isinstance(seg_metadata_json, dict):
+        return frozenset()
+    sealed = [
+        body
+        for body in seg_metadata_json.values()
+        if isinstance(body, dict) and isinstance(body.get("columns"), list)
+    ]
+    consuming = [
+        body
+        for body in seg_metadata_json.values()
+        if isinstance(body, dict) and not isinstance(body.get("columns"), list)
+    ]
+    if len(sealed) != 1 or consuming:
+        return frozenset()
+    docs = _positive_int(sealed[0].get("totalDocs"))
+    if docs is None:
+        return frozenset()
+    nullable_off = _null_handling_disabled(config_json)
+    schema_nullable = _schema_nullable_columns(schema_json)
+    keys: set[frozenset[str]] = set()
+    for column in sealed[0]["columns"]:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("columnName")
+        cardinality = _positive_int(column.get("cardinality"))
+        if not isinstance(name, str) or not name or cardinality != docs:
+            continue
+        spec = column.get("fieldSpec")
+        not_null = isinstance(spec, dict) and spec.get("notNull") is True
+        if not not_null and not (
+            nullable_off and name.lower() not in schema_nullable
+        ):
+            continue
+        keys.add(frozenset({name.lower()}))
+    return frozenset(keys)
+
+
+def _has_upsert_config(config_json: Any) -> bool:
+    """Does either half's config carry an upsertConfig object?"""
+    if not isinstance(config_json, dict):
+        return False
+    for key in ("REALTIME", "OFFLINE"):
+        half = config_json.get(key)
+        if isinstance(half, dict) and isinstance(half.get("upsertConfig"), dict):
+            return True
+    return False
+
+
+def _has_primary_key_counts(table_metadata_json: Any) -> bool:
+    """Is upsertPartitionToServerPrimaryKeyCountMap non-empty?
+
+    It is {} on every non-upsert table, so a non-empty map is itself proof.
+    It is never read as a count: it is per server, and replication > 1 is
+    unmeasured (spec decision 6).
+    """
+    if not isinstance(table_metadata_json, dict):
+        return False
+    counts = table_metadata_json.get("upsertPartitionToServerPrimaryKeyCountMap")
+    return isinstance(counts, dict) and bool(counts)
+
+
+def _null_handling_disabled(config_json: Any) -> bool:
+    """Is tableIndexConfig.nullHandlingEnabled explicitly false on a half?"""
+    if not isinstance(config_json, dict):
+        return False
+    for key in ("REALTIME", "OFFLINE"):
+        half = config_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        index_config = half.get("tableIndexConfig")
+        if isinstance(index_config, dict) and index_config.get(
+            "nullHandlingEnabled"
+        ) is False:
+            return True
+    return False
+
+
+def _schema_nullable_columns(schema_json: Any) -> frozenset[str]:
+    """Lowercase names the schema marks nullable, which no gate may pass."""
+    if not isinstance(schema_json, dict):
+        return frozenset()
+    nullable: set[str] = set()
+    for key in _FIELD_SPEC_KEYS:
+        specs = schema_json.get(key)
+        if not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
+            if isinstance(name, str) and name and spec.get("nullable") is True:
+                nullable.add(name.lower())
+    return frozenset(nullable)

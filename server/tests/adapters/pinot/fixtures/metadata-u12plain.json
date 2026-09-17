@@ -1,0 +1,11 @@
+{
+  "tableName" : "u12plain_REALTIME",
+  "diskSizeInBytes" : 14860,
+  "numSegments" : 4,
+  "numRows" : 400,
+  "columnLengthMap" : { },
+  "columnCardinalityMap" : { },
+  "maxNumMultiValuesMap" : { },
+  "columnIndexSizeMap" : { },
+  "upsertPartitionToServerPrimaryKeyCountMap" : { }
+}
