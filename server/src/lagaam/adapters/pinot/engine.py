@@ -148,6 +148,29 @@ def _is_bare_identifier(name: str) -> bool:
     return bool(name) and name.isascii() and name.replace("_", "").isalnum()
 
 
+def _resolved_columns(
+    schema_json: Any, columns: frozenset[str] | None
+) -> dict[str, str]:
+    """The referenced columns this table carries, lowercase to its spelling.
+
+    The controller's `?columns=` filter is case-sensitive and SQL is not,
+    so asking for `playerid` returns nothing at all and the segment reads
+    as though the column were free. A name the schema does not carry
+    belongs to another table (or to no table) and is not asked for.
+
+    Empty when there is nothing to resolve or no schema to resolve
+    against, which charges whole segments — the fail-safe side.
+    """
+    if not columns or schema_json is None:
+        return {}
+    spellings = schema_columns(schema_json)
+    return {
+        lowered: spelling
+        for lowered, spelling in spellings.items()
+        if lowered in columns
+    }
+
+
 def _schema_name(config_json: Any, resolved: str) -> str:
     """The schema document's own name for this table.
 
@@ -412,7 +435,17 @@ class PinotEngine:
             listings[database] = table_names(body)
         spelled = _spelled(self.CATALOG, database, table, listings[database])
         part = PinotClient.path_part(spelled)
-        resolved = await self._table_columns(part, database, columns)
+        # Fetched at most once: shared below with _record_keycols.
+        table_schema_json: Any = None
+        table_schema_fetched = False
+        if columns:
+            table_schema_json = await self._client.controller_get(
+                f"/tables/{part}/schema", database=database
+            )
+            table_schema_fetched = True
+            if table_schema_json is PinotClient.NotFound:
+                table_schema_json = None
+        resolved = _resolved_columns(table_schema_json, columns)
         params: dict[str, str | list[str]] | None = (
             {"columns": sorted(resolved.values())} if resolved else None
         )
@@ -465,7 +498,15 @@ class PinotEngine:
         )
         if facts.unique_keys:
             await self._record_keycols(
-                keycols, database, table, part, spelled, schema_json, facts
+                keycols,
+                database,
+                table,
+                part,
+                spelled,
+                schema_json,
+                table_schema_json,
+                table_schema_fetched,
+                facts,
             )
         return facts
 
@@ -477,6 +518,8 @@ class PinotEngine:
         part: str,
         spelled: str,
         schema_json: Any,
+        table_schema_json: Any,
+        table_schema_fetched: bool,
         facts: TableFacts,
     ) -> None:
         """Note what this table's key-ordinal EXPLAIN must be spelled with.
@@ -485,9 +528,17 @@ class PinotEngine:
         never paid for by a table it could tell nothing about. The column
         spellings come from the schema document — the plan names columns as
         the catalog does, and the agent's SQL reaches the broker in any case.
+
+        The schema document is fetched at most once per table per quotation:
+        an upsert table's own schema_json (fetched for its key evidence) and
+        a referenced-columns table's table_schema_json (fetched by
+        _table_facts for the ?columns= filter) are both reused here, and the
+        fetch below runs only when neither call already made one.
         """
         spellings = schema_columns(schema_json) if schema_json is not None else {}
-        if not spellings:
+        if not spellings and table_schema_json is not None:
+            spellings = schema_columns(table_schema_json)
+        if not spellings and not table_schema_fetched:
             body = await self._client.controller_get(
                 f"/tables/{part}/schema", database=database
             )
@@ -499,42 +550,15 @@ class PinotEngine:
         if not resolved or any(name is None for name in resolved):
             # A key column the schema does not name cannot be selected at all.
             return
-        if not all(_is_bare_identifier(name) for name in resolved if name):
-            # This name is interpolated into the ordinals EXPLAIN, so anything
-            # but a plain identifier forfeits the evidence rather than be sent.
+        subject_names = [database, spelled, *(name for name in resolved if name)]
+        if not all(_is_bare_identifier(name) for name in subject_names):
+            # Database, table and every key column reach the EXPLAIN raw.
             return
         keycols[f"{database}.{table}".lower()] = _Keycols(
             database=database,
             table=spelled,
             columns=tuple(name for name in resolved if name is not None),
         )
-
-    async def _table_columns(
-        self, part: str, database: str, columns: frozenset[str] | None
-    ) -> dict[str, str]:
-        """The referenced columns this table carries, lowercase to its spelling.
-
-        The controller's `?columns=` filter is case-sensitive and SQL is not,
-        so asking for `playerid` returns nothing at all and the segment reads
-        as though the column were free. A name the schema does not carry
-        belongs to another table (or to no table) and is not asked for.
-
-        Empty when there is nothing to resolve or no schema to resolve
-        against, which charges whole segments — the fail-safe side.
-        """
-        if not columns:
-            return {}
-        schema_json = await self._client.controller_get(
-            f"/tables/{part}/schema", database=database
-        )
-        if schema_json is PinotClient.NotFound:
-            return {}
-        spellings = schema_columns(schema_json)
-        return {
-            lowered: spelling
-            for lowered, spelling in spellings.items()
-            if lowered in columns
-        }
 
     async def _surviving(
         self, two_part: str, table_count: int, *, trust_limit_prune: bool

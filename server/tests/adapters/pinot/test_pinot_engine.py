@@ -1346,6 +1346,37 @@ async def test_the_schema_is_fetched_only_for_an_upsert_table() -> None:
     assert "/tables/airlineStats/metadata" not in seen
 
 
+async def test_the_schema_is_fetched_once_for_a_proven_non_upsert_key() -> None:
+    """A single-sealed-segment table proves a key via notNull, not upsert
+    config, so schema_json is None through table_facts and _record_keycols
+    would re-fetch /tables/{t}/schema — but _table_facts already fetched it
+    once, for the referenced-columns filter, and must not fetch it twice."""
+    seg_metadata = load("seg-metadata-baseballStats-columns.json")
+    (segment,) = seg_metadata.values()
+    for column in segment["columns"]:
+        if column["columnName"] == "playerID":
+            column["cardinality"] = segment["totalDocs"]
+            column["fieldSpec"]["notNull"] = True
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/baseballStats/metadata":
+            return httpx.Response(200, json=seg_metadata)
+        return _baseball_routes(request)
+
+    seen: list[str] = []
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(counting))
+    estimate = await engine.estimate_cost(
+        "SELECT playerID FROM pinot.default.baseballStats LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert seen.count("/tables/baseballStats/schema") == 1
+
+
 async def test_an_upsert_table_pays_for_its_schema_and_its_metadata() -> None:
     """The two extra documents are fetched exactly where the config says
     they say something, and the schema path is the listing spelling — the
@@ -1573,3 +1604,89 @@ async def test_a_key_column_that_is_not_a_bare_name_forfeits_the_evidence() -> N
     )
     assert asked == []
     assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
+
+
+async def test_a_quoted_database_name_forfeits_the_keycols_evidence() -> None:
+    """The database name is interpolated into the ordinals EXPLAIN exactly as
+    the key columns are: a listing spelling carrying a comma and a comment
+    marker must not reach the broker unquoted, so the table forfeits its
+    evidence instead and the self-join is charged the product."""
+    asked: list[str] = []
+    injected_db = "d, 1 FROM x --"
+    selfjoin_plan = json.loads(
+        json.dumps(load("explain-mse-selfjoin.json")).replace("default", injected_db)
+    )
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                asked.append(sql)
+            elif "AS JSON" in sql:
+                return httpx.Response(200, json=selfjoin_plan)
+        return _upsert_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        f'SELECT a.Carrier FROM pinot."{injected_db}".airlineStats a '
+        f'JOIN pinot."{injected_db}".airlineStats b ON a.Carrier = b.Carrier LIMIT 10'
+    )
+    assert asked == []
+    assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
+
+
+async def test_a_listing_spelling_with_a_comma_forfeits_the_keycols_evidence() -> None:
+    """Same guard, from the table side: the controller's own listing spelling
+    of the table is what reaches the ordinals EXPLAIN. No space, so the
+    spelling still clears path_part and reaches _record_keycols rather than
+    being refused earlier as an unusable REST path segment; the agent names
+    the table with this exact spelling so _spelled resolves it without help.
+    The shape-plan fixture is respelled to match, so the only thing under
+    test is whether the keycols EXPLAIN is issued with this table name."""
+    asked: list[str] = []
+    injected_table = "airlineStats,1FROMx--"
+    encoded_table = engine_module.PinotClient.path_part(injected_table)
+    selfjoin_plan = json.loads(
+        json.dumps(load("explain-mse-selfjoin.json")).replace(
+            "airlineStats", injected_table
+        )
+    )
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables":
+            return httpx.Response(200, json={"tables": [injected_table]})
+        if path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                asked.append(sql)
+            elif "AS JSON" in sql:
+                return httpx.Response(200, json=selfjoin_plan)
+        if injected_table in path:
+            rewritten = httpx.Request(
+                request.method,
+                str(request.url).replace(encoded_table, "airlineStats"),
+                headers=request.headers,
+                content=request.content,
+            )
+            return _upsert_selfjoin_routes(rewritten)
+        return _upsert_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        f'SELECT a.Carrier FROM pinot.default."{injected_table}" a '
+        f'JOIN pinot.default."{injected_table}" b ON a.Carrier = b.Carrier LIMIT 10'
+    )
+    assert asked == []
+    assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
+
+
+async def test_the_honest_spelling_still_learns_ordinals() -> None:
+    """The new database/table guard must not reject an ordinary spelling."""
+    engine = PinotEngine(transport=httpx.MockTransport(_upsert_selfjoin_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
