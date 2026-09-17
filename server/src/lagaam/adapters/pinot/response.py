@@ -1,9 +1,12 @@
-"""Broker JSON to a QueryResult, or the failure it carries. PURE, no I/O.
+"""Broker JSON to a QueryResult, its failure, or its pruning counters. PURE.
 
 Every Pinot query error is an HTTP 200 with a populated exceptions[], so the
 body is the only signal there is. An incomplete result is a failure and not a
 warning: measured, numGroupsLimit=2 returned 22 groups as though they were all
 of them, with HTTP 200 and plausible-looking aggregates.
+
+The pruning oracle reads an EXPLAIN envelope rather than a result one, but it
+is the same broker answer parsed the same way, so it lives here too.
 """
 
 from typing import Any
@@ -87,3 +90,64 @@ def parse_query_result(body: Any, max_rows: int) -> QueryResult:
         truncated=truncated,
         warnings=warnings,
     )
+
+
+# Only the counters measured to nest with numSegmentsQueried on 1.5.1. They
+# are not additive: the server-side total and its by-value / by-limit
+# breakdowns all appear at once, so the largest is read, not the sum.
+_PRUNED_COUNTERS = (
+    "numSegmentsPrunedByServer",
+    "numSegmentsPrunedByValue",
+    "numSegmentsPrunedByLimit",
+)
+
+# The counters left once the limit prune is not believed. ByServer is the
+# server-side total that ByLimit breaks down, so it cannot be read either:
+# measured, the limit-pruned EXPLAIN reports ByServer 30 and ByLimit 30 of
+# 31 segments, and crediting ByServer would keep the very prune being
+# distrusted. ByValue carries a predicate's own pruning independently.
+_UNLIMITED_PRUNED_COUNTERS = ("numSegmentsPrunedByValue",)
+
+
+def surviving_segments(
+    explain_json: Any, *, trust_limit_prune: bool = True
+) -> int | None:
+    """How many segments survive the predicate, from a single-stage EXPLAIN.
+
+    Only ByServer, ByValue and ByLimit are read, and the largest is taken
+    rather than the sum: measured on 1.5.1 they nest, so a time filter
+    reporting ByServer 28 with ByValue 28 of 31 segments would otherwise
+    claim 56 pruned and quote a negative scan. ByBroker and Invalid are
+    excluded because every fixture reports them 0, so neither is known to
+    behave as a breakdown of numSegmentsQueried — and if the broker already
+    reports numSegmentsQueried net of its own pruning, subtracting ByBroker
+    again would under-count survivors. Leaving a counter unread can only
+    charge more segments, never fewer, which is the fail-safe side.
+
+    `trust_limit_prune` is False when the statement carries an OFFSET, which
+    the planner prices as though it were absent: measured, `LIMIT 10 OFFSET
+    9000` reports the same 30-of-31 limit prune as the bare `LIMIT 10` and
+    then walks 9,117 docs over 29 segments. The caller decides, because only
+    it has the SQL; this module sees a broker answer and nothing else.
+
+    None means "no oracle" — the caller then charges every segment.
+    """
+    if not isinstance(explain_json, dict):
+        return None
+    if explain_json.get("exceptions"):
+        return None
+    # EXPLAIN must plan without running; anything scanned means we misread it.
+    scanned = explain_json.get("numDocsScanned")
+    if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned != 0:
+        return None
+    queried = explain_json.get("numSegmentsQueried")
+    if isinstance(queried, bool) or not isinstance(queried, int) or queried <= 0:
+        return None
+    pruned = 0
+    counters = _PRUNED_COUNTERS if trust_limit_prune else _UNLIMITED_PRUNED_COUNTERS
+    for key in counters:
+        value = explain_json.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        pruned = max(pruned, value)
+    return max(1, queried - min(pruned, queried))

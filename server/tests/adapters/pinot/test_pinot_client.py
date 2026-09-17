@@ -61,6 +61,19 @@ async def test_controller_get_sends_params_and_the_database_header() -> None:
     assert seen["database"] == "analytics"
 
 
+async def test_controller_get_repeats_a_list_param_as_the_query_parameter() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json=[])
+
+    await make_client(handler).controller_get(
+        "/segments/t/metadata", params={"columns": ["A", "B"]}
+    )
+    assert seen["url"] == "http://controller:9000/segments/t/metadata?columns=A&columns=B"
+
+
 async def test_controller_404_returns_the_not_found_sentinel() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"code": 404, "error": "Table not found"})

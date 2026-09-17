@@ -59,3 +59,71 @@ def two_part_sql(sql: str, catalog: str = "pinot") -> str:
         column.set("catalog", None)
 
     return tree.sql(dialect=_DIALECT, comments=False)
+
+
+def referenced_tables(sql: str, catalog: str = "pinot") -> list[tuple[str, str]] | None:
+    """Every (database, table) this SQL reads, folded case-insensitively and sorted.
+
+    Folding keeps the first spelling encountered: the controller listing and
+    core's scan-count keys are already case-folded, so two spellings of the
+    same table must count as one entry, not two.
+
+    None means the SQL did not re-parse, which charges the whole table rather
+    than quoting a query nobody read.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_DIALECT)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return None
+    found: dict[tuple[str, str], tuple[str, str]] = {}
+    for table in tree.find_all(exp.Table):
+        if not table.name:
+            continue
+        table_catalog = table.catalog
+        if table_catalog and table_catalog.lower() != catalog.lower():
+            raise TableNotFoundError(
+                catalog=table_catalog, schema=table.db, table=table.name
+            )
+        # A bare name is a CTE the allowlist already vouched for, not a table.
+        if not table.db:
+            continue
+        key = (table.db.lower(), table.name.lower())
+        found.setdefault(key, (table.db, table.name))
+    return sorted(found.values(), key=lambda pair: (pair[0].lower(), pair[1].lower()))
+
+
+def has_offset(sql: str) -> bool:
+    """Does this statement carry an OFFSET anywhere?
+
+    True is the safe answer: a statement nobody could re-parse is treated as
+    though it had one, which only ever charges more segments.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_DIALECT)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return True
+    return any(True for _ in tree.find_all(exp.Offset))
+
+
+def referenced_columns(sql: str) -> frozenset[str] | None:
+    """Lowercase bare names of every column this SQL mentions.
+
+    None means a reference nobody can resolve to a column list — a star, or
+    SQL that did not re-parse — and the caller charges whole segments for it.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_DIALECT)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return None
+    for star in tree.find_all(exp.Star):
+        # count(*) names no column; a projected star names all of them.
+        if not isinstance(star.parent, exp.Count):
+            return None
+    for column in tree.find_all(exp.Column):
+        if isinstance(column.this, exp.Star):
+            return None
+    return frozenset(
+        column.name.lower()
+        for column in tree.find_all(exp.Column)
+        if column.name
+    )

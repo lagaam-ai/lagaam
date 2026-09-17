@@ -14,7 +14,19 @@ import pytest
 
 from lagaam.adapters.pinot import engine as engine_module
 from lagaam.adapters.pinot.engine import PinotEngine
-from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
+from lagaam.core.budget import (
+    DEFAULT_MAX_INTERMEDIATE_ROWS,
+    DEFAULT_MAX_SCAN_BYTES,
+    DEFAULT_TIMEOUT_SECONDS,
+    QueryBudget,
+    enforce_budget,
+)
+from lagaam.core.errors import (
+    BudgetExceededError,
+    EngineError,
+    QueryFailedError,
+    TableNotFoundError,
+)
 from lagaam.core.ports import QueryEngine
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -347,29 +359,6 @@ async def test_describe_table_sends_the_database_as_the_header() -> None:
     await make_engine(handler).describe_table("pinot", "default", "airlineStats")
     # The listing that resolves the spelling, then schema, metadata and config.
     assert seen == ["default", "default", "default", "default"]
-
-
-async def test_estimate_cost_is_honest_that_it_cannot_price_yet() -> None:
-    # U11 builds the quotation from segment metadata. Until then there is no
-    # number, so confidence is low and the default budget denies the query.
-    estimate = await make_engine().estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
-    )
-    assert estimate.confidence == "low"
-    assert estimate.scanned_bytes is None
-    assert estimate.row_estimate is None
-    assert estimate.max_intermediate_rows is None
-
-
-async def test_the_interim_estimate_is_denied_by_the_default_budget() -> None:
-    from lagaam.core.budget import QueryBudget, enforce_budget
-    from lagaam.core.errors import BudgetExceededError
-
-    estimate = await make_engine().estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
-    )
-    with pytest.raises(BudgetExceededError, match="could not be estimated"):
-        enforce_budget(estimate, QueryBudget.from_env())
 
 
 async def test_from_env_reads_the_pinot_variables(
@@ -783,3 +772,470 @@ async def test_another_catalog_is_refused_before_the_broker_is_called() -> None:
             "SELECT a FROM hive.default.airlineStats LIMIT 5", max_rows=10
         )
     assert called == []
+
+
+def _quote_routes(request: httpx.Request) -> httpx.Response:
+    """Controller and broker answers for a quotation, from captured JSON."""
+    path = request.url.path
+    if path == "/tables":
+        # The quotation resolves the controller's own spelling first.
+        return httpx.Response(200, json={"tables": ["airlineStats", "baseballStats"]})
+    if path == "/query/sql":
+        body = json.loads(request.content)
+        sql = body["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-timefilter.json"))
+    if path.endswith("/size"):
+        return httpx.Response(200, json=load("size-airlineStats.json"))
+    if path.startswith("/segments/"):
+        return httpx.Response(200, json=load("seg-metadata-airlineStats-columns.json"))
+    if path == "/tables/airlineStats":
+        return httpx.Response(200, json=load("tableconfig-airlineStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_estimate_cost_quotes_the_surviving_segments() -> None:
+    engine = PinotEngine(transport=httpx.MockTransport(_quote_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, count(*) FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 10"
+    )
+    assert estimate.row_estimate == 1234
+    assert estimate.scanned_bytes is not None
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == 1234
+
+
+async def test_the_pruning_oracle_asks_only_the_single_stage_engine() -> None:
+    """A multi-stage EXPLAIN would return no pruning counters at all."""
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            body = json.loads(request.content)
+            seen.append(body.get("queryOptions", ""))
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch > 16090 LIMIT 10"
+    )
+    assert any("useMultistageEngine=true" not in o for o in seen)
+    assert any("useMultistageEngine=true" in o for o in seen)
+
+
+async def test_the_oracle_sends_a_two_part_name() -> None:
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            seen.append(json.loads(request.content)["sql"])
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert seen
+    assert all("pinot.default" not in sql for sql in seen)
+    assert all(sql.startswith("EXPLAIN") for sql in seen)
+
+
+async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
+    """Single-stage EXPLAIN refuses a join outright, so k is all."""
+    asked: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables":
+            return httpx.Response(
+                200, json={"tables": ["airlineStats", "baseballStats"]}
+            )
+        if path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            asked.append(sql)
+            if "AS JSON" in sql:
+                return httpx.Response(200, json=load("explain-mse-crossjoin.json"))
+            return httpx.Response(
+                200,
+                json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
+            )
+        if path.endswith("/size"):
+            name = path.split("/")[2]
+            return httpx.Response(200, json=load(f"size-{name}.json"))
+        if path.startswith("/segments/"):
+            name = path.split("/")[2]
+            return httpx.Response(
+                200, json=load(f"seg-metadata-{name}-columns.json")
+            )
+        name = path.split("/")[-1]
+        return httpx.Response(200, json=load(f"tableconfig-{name}.json"))
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT count(*) FROM pinot.default.airlineStats a, "
+        "pinot.default.baseballStats b LIMIT 10"
+    )
+    assert estimate.row_estimate == 9746 + 97889
+    assert estimate.max_intermediate_rows == 9746 * 97889 + 9746 + 97889
+    # The oracle is asked at most once, and never for a two-table query.
+    assert sum(1 for sql in asked if "AS JSON" not in sql) == 0
+
+
+def _baseball_routes(request: httpx.Request) -> httpx.Response:
+    """The baseballStats quotation, schema included, from captured JSON."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-nofilter.json"))
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["baseballStats"]})
+    if path == "/tables/baseballStats/schema":
+        return httpx.Response(200, json=load("schema-baseballStats.json"))
+    if path.endswith("/size"):
+        return httpx.Response(200, json=load("size-baseballStats.json"))
+    if path.startswith("/segments/"):
+        return httpx.Response(200, json=load("seg-metadata-baseballStats-columns.json"))
+    if path == "/tables/baseballStats":
+        return httpx.Response(200, json=load("tableconfig-baseballStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_the_controller_is_asked_for_columns_in_its_own_spelling() -> None:
+    """Measured: ?columns=playerid returns nothing, because the controller's
+    column filter is case-sensitive while referenced_columns lowercases."""
+    asked: list[httpx.URL] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/segments/"):
+            asked.append(request.url)
+        return _baseball_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT league, playerID FROM pinot.default.baseballStats LIMIT 10"
+    )
+    assert asked
+    assert sorted(asked[0].params.get_list("columns")) == ["league", "playerID"]
+
+
+async def test_a_column_belonging_to_no_table_is_not_asked_for() -> None:
+    """A name the schema does not carry is another table's, or a literal."""
+    asked: list[httpx.URL] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/segments/"):
+            asked.append(request.url)
+        return _baseball_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT league FROM pinot.default.baseballStats WHERE nosuchcolumn > 1 LIMIT 10"
+    )
+    assert asked
+    assert asked[0].params.get_list("columns") == ["league"]
+
+
+async def test_a_lowercase_table_is_quoted_on_the_controllers_spelling() -> None:
+    """The broker executes any casing; the controller's REST paths are
+    case-sensitive, so the raw spelling 404'd and quoted low — a valid query
+    denied for nothing but the shape of its name."""
+    asked: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        asked.append(request.url.path)
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    lowered = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlinestats LIMIT 5"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"
+    )
+    assert lowered.confidence == "high"
+    assert lowered.row_estimate == canonical.row_estimate
+    assert lowered.scanned_bytes == canonical.scanned_bytes
+    assert "/tables/airlineStats" in asked
+    assert not any("airlinestats" in path for path in asked)
+
+
+async def test_a_quotation_lists_the_tables_once_however_many_it_reads() -> None:
+    """One listing per quotation, not one per table."""
+    listings = 0
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        nonlocal listings
+        if request.url.path == "/tables":
+            listings += 1
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        return _selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlinestats a "
+        "JOIN pinot.default.airlinestats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert listings == 1
+
+
+async def test_a_mixed_case_self_join_is_charged_the_same_as_the_canonical_spelling() -> None:
+    engine = PinotEngine(transport=httpx.MockTransport(_selfjoin_routes))
+    mixed = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.AIRLINESTATS b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert mixed.row_estimate == canonical.row_estimate
+    assert mixed.scanned_bytes == canonical.scanned_bytes
+    assert mixed.max_intermediate_rows == canonical.max_intermediate_rows
+
+
+async def test_a_table_the_controller_does_not_list_is_not_found() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables":
+            return httpx.Response(200, json={"tables": ["airlineStats"]})
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(TableNotFoundError):
+        await engine.estimate_cost(
+            "SELECT x FROM pinot.default.nosuchtable LIMIT 5"
+        )
+
+
+def _limitpruned_routes(request: httpx.Request) -> httpx.Response:
+    """The oracle answering with a limit prune, whatever the statement."""
+    if request.url.path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-limitpruned.json"))
+    return _quote_routes(request)
+
+
+async def test_an_offset_does_not_get_to_keep_the_limit_prune() -> None:
+    """Measured: the EXPLAIN prunes 30 of 31 either way, but the OFFSET query
+    then scans 9,117 docs over 29 segments — the counter is offset-blind."""
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10 OFFSET 9000"
+    )
+    assert estimate.row_estimate == 9746
+
+
+async def test_without_an_offset_the_limit_prune_is_still_the_oracle() -> None:
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate < 9746
+
+
+async def test_an_unpriceable_shape_is_refused_before_any_request() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no request should be made, got {request.url}")
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT x FROM UNNEST(SEQUENCE(1, 100000)) AS t(x) LIMIT 10"
+    )
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+
+
+async def test_a_foreign_catalog_is_refused_before_any_request() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no request should be made, got {request.url}")
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(TableNotFoundError):
+        await engine.estimate_cost("SELECT x FROM other.default.t LIMIT 10")
+
+
+async def test_a_controller_that_cannot_be_reached_quotes_low_not_an_outage() -> None:
+    """A quotation nobody could build is a denial, not an engine failure."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("nope")
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+
+
+async def test_refused_credentials_stop_a_quotation_too() -> None:
+    """A 401/403 is an operator fault, not an unpriceable query."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables/airlineStats":
+            return httpx.Response(403, text="Permission denied for table airlineStats")
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(EngineError, match="credentials were refused"):
+        await engine.estimate_cost(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+        )
+
+
+async def test_a_realtime_half_is_quoted_low_and_denied() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables/airlineStats":
+            config = load("tableconfig-airlineStats.json")
+            config["REALTIME"] = config["OFFLINE"]
+            return httpx.Response(200, json=config)
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+
+    budget = QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
+    with pytest.raises(BudgetExceededError, match="could not be estimated"):
+        enforce_budget(estimate, budget)
+
+
+async def test_a_table_name_no_path_can_carry_is_not_found_before_any_request() -> (
+    None
+):
+    def routes(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"no request should be made, got {request.url}")
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(TableNotFoundError):
+        await engine.estimate_cost(
+            'SELECT x FROM pinot.default."we%ird" LIMIT 10'
+        )
+
+
+async def test_the_explains_carry_their_own_deadline() -> None:
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            body = json.loads(request.content)
+            seen.append(body.get("queryOptions", ""))
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch > 16090 LIMIT 10"
+    )
+    assert seen
+    assert all("timeoutMs=10000" in options for options in seen)
+    single_stage = [o for o in seen if "useMultistageEngine=true" not in o]
+    multi_stage = [o for o in seen if "useMultistageEngine=true" in o]
+    assert single_stage
+    assert multi_stage
+
+
+async def test_a_broker_that_hangs_on_explain_degrades_to_low() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            raise httpx.ReadTimeout("slow")
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    # The oracle degrades to None (charge every segment) and the multi-stage
+    # plan is unreadable, but table facts alone still bound rows and bytes —
+    # only the join-shape signal is lost, and estimate_cost does not raise.
+    assert estimate.max_intermediate_rows is None
+
+
+async def test_an_explain_that_trickles_past_the_deadline_degrades_to_low(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """httpx's timeout is a read-gap timeout, so a body arriving in slow
+    chunks outlasts it: measured, a 1s timeout returned after 3.51s. The
+    quotation's EXPLAINs need the same total deadline execute() uses."""
+    monkeypatch.setattr(engine_module, "_EXPLAIN_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(engine_module, "_TIMEOUT_GRACE_SECONDS", 0.3)
+
+    async def chunks() -> Any:
+        raw = json.dumps(load("explain-v1-nofilter.json")).encode()
+        size = len(raw) // 4 + 1
+        for start in range(0, len(raw), size):
+            # No single gap trips the per-operation timeout; only the total.
+            await anyio.sleep(0.25)
+            yield raw[start : start + size]
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            return httpx.Response(200, stream=_AsyncStream(chunks()))
+        return _quote_routes(request)
+
+    started = time.monotonic()
+    estimate = await make_engine(routes).estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    # Both EXPLAINs give up at their 0.5s deadline, not after ~1s of body each.
+    assert time.monotonic() - started < 2.0
+    # A timeout degrades exactly like a transport failure: no plan, no oracle.
+    assert estimate.max_intermediate_rows is None
+    assert estimate.row_estimate == 9746
+
+
+def _selfjoin_routes(request: httpx.Request) -> httpx.Response:
+    """One table, read twice by a self-join, with the joins-refusing oracle."""
+    path = request.url.path
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["airlineStats"]})
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-selfjoin.json"))
+        # 1.5.1's single-stage engine refuses a join outright, so no oracle.
+        return httpx.Response(
+            200,
+            json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
+        )
+    if path.endswith("/size"):
+        return httpx.Response(200, json=load("size-airlineStats.json"))
+    if path.startswith("/segments/"):
+        return httpx.Response(200, json=load("seg-metadata-airlineStats-columns.json"))
+    if path == "/tables/airlineStats":
+        return httpx.Response(200, json=load("tableconfig-airlineStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_a_self_join_is_charged_two_reads_and_the_product() -> None:
+    """Calcite folds the repeated scan into one node; the SQL still reads twice."""
+    engine = PinotEngine(transport=httpx.MockTransport(_selfjoin_routes))
+    self_join = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    # The single-read figure for the same column, from the same fixtures.
+    single = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert single.scanned_bytes is not None
+    assert self_join.row_estimate == 2 * 9746
+    assert self_join.scanned_bytes == 2 * single.scanned_bytes
+    assert self_join.max_intermediate_rows == 9746 * 9746 + 2 * 9746
+    assert self_join.confidence == "high"

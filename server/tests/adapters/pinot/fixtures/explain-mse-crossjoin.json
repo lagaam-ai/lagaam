@@ -1,0 +1,72 @@
+{
+    "resultTable": {
+        "dataSchema": {
+            "columnNames": [
+                "SQL",
+                "PLAN",
+                "RULE_TIMINGS"
+            ],
+            "columnDataTypes": [
+                "STRING",
+                "STRING",
+                "STRING"
+            ]
+        },
+        "rows": [
+            [
+                "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT count(*) FROM default.airlineStats a, default.baseballStats b",
+                "{\n  \"rels\": [\n    {\n      \"id\": \"0\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"airlineStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"1\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"DUMMY\"\n      ],\n      \"exprs\": [\n        {\n          \"literal\": 0,\n          \"type\": {\n            \"type\": \"INTEGER\",\n            \"nullable\": false\n          }\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"2\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"RANDOM_DISTRIBUTED\"\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"3\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"baseballStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"4\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"DUMMY\"\n      ],\n      \"exprs\": [\n        {\n          \"literal\": 0,\n          \"type\": {\n            \"type\": \"INTEGER\",\n            \"nullable\": false\n          }\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"5\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"BROADCAST_DISTRIBUTED\"\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"6\",\n      \"relOp\": \"LogicalJoin\",\n      \"condition\": {\n        \"literal\": true,\n        \"type\": {\n          \"type\": \"BOOLEAN\",\n          \"nullable\": false\n        }\n      },\n      \"joinType\": \"inner\",\n      \"inputs\": [\n        \"2\",\n        \"5\"\n      ],\n      \"type\": \"LogicalJoin\"\n    },\n    {\n      \"id\": \"7\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalAggregate\",\n      \"group\": [],\n      \"aggs\": [\n        {\n          \"agg\": {\n            \"name\": \"COUNT\",\n            \"kind\": \"COUNT\",\n            \"syntax\": \"FUNCTION\"\n          },\n          \"type\": {\n            \"type\": \"BIGINT\",\n            \"nullable\": false\n          },\n          \"distinct\": false,\n          \"operands\": [],\n          \"name\": null\n        }\n      ],\n      \"aggType\": \"LEAF\",\n      \"type\": \"PinotLogicalAggregate\"\n    },\n    {\n      \"id\": \"8\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\"\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"9\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalAggregate\",\n      \"group\": [],\n      \"aggs\": [\n        {\n          \"agg\": {\n            \"name\": \"COUNT\",\n            \"kind\": \"COUNT\",\n            \"syntax\": \"FUNCTION\"\n          },\n          \"type\": {\n            \"type\": \"BIGINT\",\n            \"nullable\": false\n          },\n          \"distinct\": false,\n          \"operands\": [],\n          \"name\": null\n        }\n      ],\n      \"aggType\": \"FINAL\",\n      \"type\": \"PinotLogicalAggregate\"\n    }\n  ]\n}",
+                "{\n  \"ruleExecutionTimes\": [\n    {\n      \"rule\": \"ProjectJoinTranspose\", \n      \"time\": 0.19\n    },\n    {\n      \"rule\": \"AggregateProjectMerge\", \n      \"time\": 0.03\n    },\n    {\n      \"rule\": \"JoinPushExpressions\", \n      \"time\": 0.01\n    },\n    {\n      \"rule\": \"JoinConditionPush\", \n      \"time\": 0.02\n    },\n    {\n      \"rule\": \"EvaluateProjectLiteral\", \n      \"time\": 0.00\n    }  ]\n}\n"
+            ]
+        ]
+    },
+    "numRowsResultSet": 1,
+    "partialResult": false,
+    "exceptions": [],
+    "numGroupsLimitReached": false,
+    "numGroupsWarningLimitReached": false,
+    "timeUsedMs": 0,
+    "requestId": "1146010015000001728",
+    "clientRequestId": null,
+    "brokerId": "Broker_172.17.0.2_8000",
+    "numDocsScanned": 0,
+    "totalDocs": 0,
+    "numEntriesScannedInFilter": 0,
+    "numEntriesScannedPostFilter": 0,
+    "numServersQueried": 0,
+    "numServersResponded": 0,
+    "numSegmentsQueried": 0,
+    "numSegmentsProcessed": 0,
+    "numSegmentsMatched": 0,
+    "numConsumingSegmentsQueried": 0,
+    "numConsumingSegmentsProcessed": 0,
+    "numConsumingSegmentsMatched": 0,
+    "minConsumingFreshnessTimeMs": 0,
+    "numSegmentsPrunedByBroker": 0,
+    "numSegmentsPrunedByServer": 0,
+    "numSegmentsPrunedInvalid": 0,
+    "numSegmentsPrunedByLimit": 0,
+    "numSegmentsPrunedByValue": 0,
+    "brokerReduceTimeMs": 0,
+    "offlineThreadCpuTimeNs": 0,
+    "realtimeThreadCpuTimeNs": 0,
+    "offlineSystemActivitiesCpuTimeNs": 0,
+    "realtimeSystemActivitiesCpuTimeNs": 0,
+    "offlineResponseSerializationCpuTimeNs": 0,
+    "realtimeResponseSerializationCpuTimeNs": 0,
+    "offlineTotalCpuTimeNs": 0,
+    "realtimeTotalCpuTimeNs": 0,
+    "explainPlanNumEmptyFilterSegments": 0,
+    "explainPlanNumMatchAllFilterSegments": 0,
+    "traceInfo": {},
+    "tablesQueried": [],
+    "offlineThreadMemAllocatedBytes": 0,
+    "realtimeThreadMemAllocatedBytes": 0,
+    "offlineResponseSerMemAllocatedBytes": 0,
+    "realtimeResponseSerMemAllocatedBytes": 0,
+    "offlineTotalMemAllocatedBytes": 0,
+    "realtimeTotalMemAllocatedBytes": 0,
+    "pools": [],
+    "rlsFiltersApplied": false,
+    "groupsTrimmed": false
+}

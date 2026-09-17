@@ -92,27 +92,66 @@ async def test_the_grant_hides_every_pinot_table_it_does_not_name(
         assert "is not permitted" in text
 
 
-async def test_query_data_on_pinot_is_denied_until_the_quotation_lands(
-    pinot_ready: None,
-) -> None:
-    """U11 builds the Pinot quotation; until then the default budget denies query_data."""
-    budget = QueryBudget(
+_PINOT_TWO_TABLE_GRANT = AgentIdentity(
+    name="lagaam-e2e",
+    allowed_tables=frozenset(
+        {"pinot.default.airlinestats", "pinot.default.baseballstats"}
+    ),
+)
+
+
+def _default_budget() -> QueryBudget:
+    return QueryBudget(
         max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
         max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
         timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     )
+
+
+async def test_a_filtered_pinot_query_clears_the_default_budget_and_runs(
+    pinot_ready: None,
+) -> None:
+    """U11's demo: the quotation is what lets a real query through the gate."""
     async with lagaam_client(
-        _pinot_engine(), budget=budget, identity=_PINOT_GRANT
+        _pinot_engine(), budget=_default_budget(), identity=_PINOT_GRANT
     ) as client:
         answer = await client.call_tool(
             "query_data",
-            {"sql": "SELECT Carrier FROM pinot.default.airlineStats LIMIT 5"},
+            {
+                "sql": "SELECT Carrier, count(*) AS flights "
+                "FROM pinot.default.airlineStats "
+                "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 "
+                "GROUP BY Carrier LIMIT 5"
+            },
+        )
+        assert not answer.isError
+        assert answer.structuredContent is not None
+        assert answer.structuredContent["row_count"] > 0
+        assert "Carrier" in answer.structuredContent["columns"]
+
+
+async def test_an_unbounded_pinot_cross_join_is_denied_on_row_work(
+    pinot_ready: None,
+) -> None:
+    """954 million rows built at the widest step, and a LIMIT does not help."""
+    async with lagaam_client(
+        _pinot_engine(),
+        budget=_default_budget(),
+        identity=_PINOT_TWO_TABLE_GRANT,
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": "SELECT count(*) FROM pinot.default.airlineStats a, "
+                "pinot.default.baseballStats b LIMIT 10"
+            },
         )
         assert answer.isError
         text = " ".join(
             block.text for block in answer.content if hasattr(block, "text")
         )
-        assert "could not be estimated" in text
+        assert "rows at its widest step" in text
+        assert "LIMIT will not help" in text
 
 
 async def test_a_later_cte_cannot_smuggle_an_ungranted_pinot_table(

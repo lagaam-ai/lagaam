@@ -94,7 +94,7 @@ class PinotClient:
     async def controller_get(
         self,
         path: str,
-        params: dict[str, str] | None = None,
+        params: dict[str, str | list[str]] | None = None,
         database: str | None = None,
     ) -> Any:
         """GET one controller path. Returns parsed JSON, or NotFound on 404."""

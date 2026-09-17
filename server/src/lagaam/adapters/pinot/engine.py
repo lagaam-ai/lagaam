@@ -21,9 +21,26 @@ from lagaam.adapters.pinot.client import (
     PinotTransportError,
 )
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
-from lagaam.adapters.pinot.metadata import table_names, table_schema
-from lagaam.adapters.pinot.names import two_part_sql
-from lagaam.adapters.pinot.response import parse_query_result, result_failure
+from lagaam.adapters.pinot.metadata import (
+    TableFacts,
+    schema_columns,
+    table_facts,
+    table_names,
+    table_schema,
+)
+from lagaam.adapters.pinot.names import (
+    has_offset,
+    referenced_columns,
+    referenced_tables,
+    two_part_sql,
+)
+from lagaam.adapters.pinot.plan import max_intermediate_rows
+from lagaam.adapters.pinot.quote import quote, surviving_docs
+from lagaam.adapters.pinot.response import (
+    parse_query_result,
+    result_failure,
+    surviving_segments,
+)
 from lagaam.core.errors import EngineError, QueryFailedError, TableNotFoundError
 from lagaam.core.models import (
     CatalogInfo,
@@ -35,6 +52,12 @@ from lagaam.core.models import (
     TableSchema,
 )
 from lagaam.core.query_errors import hint_for_engine_error, is_self_correctable
+from lagaam.core.scans import (
+    generator_fanout,
+    has_unpriceable_shape,
+    scan_counts_saturated,
+    table_scan_counts,
+)
 
 _UNREACHABLE = "the query engine is not reachable right now"
 
@@ -55,9 +78,45 @@ _OPT_MAX_ROWS_IN_JOIN = "maxRowsInJoin"
 _OPT_MAX_ROWS_IN_WINDOW = "maxRowsInWindow"
 _OPT_MAX_RESPONSE_BYTES = "maxQueryResponseSizeBytes"
 
+# The pruning oracle. Single-stage only: the multi-stage engine reports no
+# pruning counters, and it refuses nothing that would reveal them.
+_EXPLAIN_PRUNING = "EXPLAIN PLAN FOR "
+_EXPLAIN_SHAPE = "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR "
+
 # Backstop only: the broker must hit its own timeoutMs and answer first. Now
 # also the total deadline, so a body arriving in slow chunks cannot outlast it.
 _TIMEOUT_GRACE_SECONDS = 5.0
+
+# Advisory, so a wedged broker must not hold the gate for execute()'s default.
+_EXPLAIN_TIMEOUT_SECONDS = 10.0
+_EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
+
+
+def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
+    """The controller's own spelling of a table, from its listing."""
+    if table in listed:
+        return table
+    matches = [name for name in listed if name.lower() == table.lower()]
+    if len(matches) != 1:
+        # None is a missing table; more than one, and nothing says which.
+        raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
+    return matches[0]
+
+
+def _plan_cell(body: object) -> str | None:
+    """The PLAN column of a multi-stage EXPLAIN answer: one row, one string."""
+    if not isinstance(body, dict) or body.get("exceptions"):
+        return None
+    result = body.get("resultTable")
+    if not isinstance(result, dict):
+        return None
+    rows = result.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+    first = rows[0]
+    if not isinstance(first, list) or len(first) < 2:
+        return None
+    return first[1] if isinstance(first[1], str) else None
 
 
 class PinotEngine:
@@ -203,24 +262,208 @@ class PinotEngine:
         body = await self._client.controller_get("/tables", database=schema)
         if body is PinotClient.NotFound:
             raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
-        listed = table_names(body)
-        if table in listed:
-            return table
-        matches = [name for name in listed if name.lower() == table.lower()]
-        if len(matches) != 1:
-            # None is a missing table; more than one, and nothing says which.
-            raise TableNotFoundError(catalog=catalog, schema=schema, table=table)
-        return matches[0]
+        return _spelled(catalog, schema, table, table_names(body))
 
     async def estimate_cost(self, sql: str) -> CostEstimate:
-        """No quotation exists yet — U11 builds it from segment metadata.
+        """An upper bound on what this SQL would scan, synthesised here.
 
-        Pinot 1.5.1 reports no bytes anywhere and a constant rowcount of 100
-        per table scan, so there is nothing honest to return but "unknown",
-        which the default budget denies. Guessing here would admit a query
-        the gate exists to stop.
+        Pinot reports no bytes and a constant rowcount of 100 per scan, so
+        every number below comes from segment metadata plus one honest
+        engine signal: how many segments survive the predicate. A number
+        that cannot be bounded is withheld, and the gate denies on that.
         """
-        return CostEstimate(confidence="low")
+        dialect = PINOT_DIALECT_CARD.sqlglot_dialect
+        # Generators and a saturated read count both break the byte sum in
+        # ways no scaling repairs — don't vouch for a quote at all.
+        if has_unpriceable_shape(sql, dialect) or scan_counts_saturated(sql, dialect):
+            return CostEstimate(confidence="low")
+        two_part = two_part_sql(sql, self.CATALOG)
+        tables = referenced_tables(sql, self.CATALOG)
+        if not tables:
+            return CostEstimate(confidence="low")
+        columns = referenced_columns(sql)
+        # One /tables listing per quotation, not one per table: every table
+        # here shares a database, and a self-join reads the same name twice.
+        listings: dict[str, list[str]] = {}
+        try:
+            facts = [
+                (database, await self._table_facts(database, table, columns, listings))
+                for database, table in tables
+            ]
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except PinotTransportError:
+            # A quotation nobody could build is a denial at the gate, which
+            # is the safe answer; an EngineError would read as an outage.
+            return CostEstimate(confidence="low")
+        surviving = await self._surviving(
+            two_part, len(tables), trust_limit_prune=not has_offset(sql)
+        )
+        located = [(database, fact, surviving) for database, fact in facts]
+        widest = await self._widest_rows(two_part, located)
+        # The plan folds a repeated scan into one node and referenced_tables
+        # dedupes, so a table read N times would be charged once: measured,
+        # a self-join quoted 9,746 rows against 19,492 scanned, and UNION ALL
+        # of 60 identical arms quoted 1/60th of the bytes at high confidence.
+        # Charging the table's facts once per read scales both dimensions.
+        reads = table_scan_counts(sql, dialect)
+        charged = [
+            pair
+            for database, fact, k in located
+            for pair in [(fact, k)]
+            * max(1, reads.get(f"{self.CATALOG}.{database}.{fact.table}".lower(), 1))
+        ]
+        estimate = quote(charged, columns, widest)
+        if estimate.max_intermediate_rows is None:
+            return estimate
+        fanout = generator_fanout(sql, dialect)
+        return estimate.model_copy(
+            update={"max_intermediate_rows": estimate.max_intermediate_rows * fanout}
+        )
+
+    async def _table_facts(
+        self,
+        database: str,
+        table: str,
+        columns: frozenset[str] | None,
+        listings: dict[str, list[str]],
+    ) -> TableFacts:
+        """One table's config, segment metadata and size, from the controller.
+
+        The agent's spelling is a request, not an address, exactly as in
+        describe_table: broker SQL is case-insensitive and controller REST
+        paths are not, so an unresolved name 404s on a table that plainly
+        exists and quotes low — denying a query the broker would run.
+        """
+        try:
+            PinotClient.path_part(table)
+        except ValueError as exc:
+            # No URL path can carry this name, so the table it would name
+            # cannot be reached either — decided before any request.
+            raise TableNotFoundError(
+                catalog=self.CATALOG, schema=database, table=table
+            ) from exc
+        if database not in listings:
+            body = await self._client.controller_get("/tables", database=database)
+            if body is PinotClient.NotFound:
+                raise TableNotFoundError(
+                    catalog=self.CATALOG, schema=database, table=table
+                )
+            listings[database] = table_names(body)
+        part = PinotClient.path_part(
+            _spelled(self.CATALOG, database, table, listings[database])
+        )
+        resolved = await self._table_columns(part, database, columns)
+        params: dict[str, str | list[str]] | None = (
+            {"columns": sorted(resolved.values())} if resolved else None
+        )
+        config_json = await self._client.controller_get(
+            f"/tables/{part}", database=database
+        )
+        seg_json = await self._client.controller_get(
+            f"/segments/{part}/metadata", params=params, database=database
+        )
+        size_json = await self._client.controller_get(
+            f"/tables/{part}/size", database=database
+        )
+        return table_facts(
+            table,
+            None if config_json is PinotClient.NotFound else config_json,
+            None if seg_json is PinotClient.NotFound else seg_json,
+            None if size_json is PinotClient.NotFound else size_json,
+            frozenset(resolved),
+        )
+
+    async def _table_columns(
+        self, part: str, database: str, columns: frozenset[str] | None
+    ) -> dict[str, str]:
+        """The referenced columns this table carries, lowercase to its spelling.
+
+        The controller's `?columns=` filter is case-sensitive and SQL is not,
+        so asking for `playerid` returns nothing at all and the segment reads
+        as though the column were free. A name the schema does not carry
+        belongs to another table (or to no table) and is not asked for.
+
+        Empty when there is nothing to resolve or no schema to resolve
+        against, which charges whole segments — the fail-safe side.
+        """
+        if not columns:
+            return {}
+        schema_json = await self._client.controller_get(
+            f"/tables/{part}/schema", database=database
+        )
+        if schema_json is PinotClient.NotFound:
+            return {}
+        spellings = schema_columns(schema_json)
+        return {
+            lowered: spelling
+            for lowered, spelling in spellings.items()
+            if lowered in columns
+        }
+
+    async def _surviving(
+        self, two_part: str, table_count: int, *, trust_limit_prune: bool
+    ) -> int | None:
+        """Segments surviving the predicate, or None meaning "charge them all".
+
+        Only ever asked for a single-table query: the single-stage engine
+        refuses a join outright, and it is the only engine that prunes.
+
+        The SQL is known here and not in the parser, so whether the limit
+        prune may be believed is decided here and passed down.
+        """
+        if table_count != 1:
+            return None
+        try:
+            body = await self._explain(
+                f"{_EXPLAIN_PRUNING}{two_part}",
+                f"{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+            )
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
+            return None
+        return surviving_segments(body, trust_limit_prune=trust_limit_prune)
+
+    async def _explain(self, sql: str, options: str) -> Any:
+        """One quotation EXPLAIN, bounded end to end rather than per operation.
+
+        The same deadline execute() carries, for the same reason: httpx's
+        timeout resets on every read, so a body trickling in chunks outlives
+        it — measured, a 1s timeout returned a result after 3.51s. The
+        quotation is advisory, so a wedged broker must not hold the gate.
+        """
+        deadline = _EXPLAIN_TIMEOUT_SECONDS + _TIMEOUT_GRACE_SECONDS
+        with anyio.fail_after(deadline):
+            return await self._client.broker_query(
+                sql, options, timeout_seconds=deadline
+            )
+
+    async def _widest_rows(
+        self, two_part: str, tables: list[tuple[str, TableFacts, int | None]]
+    ) -> int | None:
+        """Rows the widest plan node would build, or None if unreadable.
+
+        Keyed as the plan spells a scan's table: [database, table], lowered.
+        """
+        leaves: dict[str, int | None] = {}
+        for database, facts, surviving in tables:
+            leaves[f"{database}.{facts.table}".lower()] = surviving_docs(
+                facts, surviving
+            )
+        try:
+            body = await self._explain(
+                f"{_EXPLAIN_SHAPE}{two_part}",
+                f"{_OPT_MULTISTAGE}=true;{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+            )
+        except PinotForbidden as exc:
+            raise EngineError(_CREDENTIALS_REFUSED) from exc
+        except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
+            return None
+        cell = _plan_cell(body)
+        if cell is None:
+            return None
+        return max_intermediate_rows(cell, leaves)
 
     async def execute(
         self, sql: str, max_rows: int, timeout_seconds: float | None = None

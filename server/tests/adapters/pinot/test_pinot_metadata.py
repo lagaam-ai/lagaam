@@ -13,9 +13,12 @@ import pytest
 
 from lagaam.adapters.pinot.metadata import (
     row_estimate,
+    segment_facts,
+    table_facts,
     table_names,
     table_schema,
     table_types,
+    time_column,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -233,3 +236,87 @@ def test_table_schema_with_an_unreadable_schema_body_has_no_columns() -> None:
     card = table_schema("pinot", "default", "t", {"nonsense": 1}, {}, {})
     assert card.columns == []
     assert card.row_estimate is None
+
+
+def test_segment_facts_carry_docs_bytes_time_and_per_column_bytes() -> None:
+    facts = segment_facts(
+        load("seg-metadata-airlineStats-columns.json"),
+        load("size-airlineStats.json"),
+    )
+    assert len(facts) == 31
+    one = next(f for f in facts if f.name == "airlineStats_OFFLINE_16071_16071_0")
+    assert one.docs == 289
+    assert one.total_bytes == 152577
+    assert one.start_ms == 1388534400000
+    assert one.end_ms == 1388534400000
+    assert one.column_bytes == {"Carrier": 189, "DaysSinceEpoch": 28}
+    assert sum(f.docs or 0 for f in facts) == 9746
+    assert sum(f.total_bytes or 0 for f in facts) == 4861355
+
+
+def test_segment_facts_sum_every_index_entry_not_a_fixed_set() -> None:
+    """playerID is RAW-encoded: forward_index only, no dictionary."""
+    facts = segment_facts(
+        load("seg-metadata-baseballStats-columns.json"),
+        load("size-baseballStats.json"),
+    )
+    assert len(facts) == 1
+    only = facts[0]
+    assert only.docs == 97889
+    assert only.total_bytes == 3342450
+    assert only.column_bytes["playerID"] == 542226
+    assert only.column_bytes["teamID"] == 455 + 173683 + 97897
+
+
+def test_a_segment_without_a_time_column_has_no_time_range() -> None:
+    only = segment_facts(
+        load("seg-metadata-baseballStats-columns.json"),
+        load("size-baseballStats.json"),
+    )[0]
+    assert only.start_ms is None
+    assert only.end_ms is None
+
+
+def test_a_segment_the_size_report_never_mentions_has_no_bytes() -> None:
+    facts = segment_facts(
+        load("seg-metadata-airlineStats-columns.json"), {"offlineSegments": None}
+    )
+    assert len(facts) == 31
+    assert all(f.total_bytes is None for f in facts)
+    assert all(f.docs is not None for f in facts)
+
+
+def test_a_consuming_segments_negative_size_is_no_fact_not_a_credit() -> None:
+    facts = segment_facts(
+        {"seg0": {"segmentName": "seg0", "totalDocs": 0}},
+        {"offlineSegments": {"segments": {"seg0": {"reportedSizeInBytes": -1}}}},
+    )
+    assert facts[0].total_bytes is None
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"a": "b"}])
+def test_segment_facts_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
+    assert segment_facts(body, body) == []
+
+
+def test_time_column_comes_from_the_offline_segments_config() -> None:
+    assert time_column(load("tableconfig-airlineStats.json")) == "DaysSinceEpoch"
+    assert time_column(load("tableconfig-baseballStats.json")) is None
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"OFFLINE": "nope"}])
+def test_time_column_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
+    assert time_column(body) is None
+
+
+def test_table_facts_gather_type_time_column_and_segments() -> None:
+    facts = table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats.json"),
+        load("seg-metadata-airlineStats-columns.json"),
+        load("size-airlineStats.json"),
+    )
+    assert facts.table == "airlineStats"
+    assert facts.types == frozenset({"OFFLINE"})
+    assert facts.time_column == "DaysSinceEpoch"
+    assert len(facts.segments) == 31
