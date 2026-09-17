@@ -1092,30 +1092,6 @@ async def test_refused_credentials_stop_a_quotation_too() -> None:
         )
 
 
-async def test_a_realtime_half_is_quoted_low_and_denied() -> None:
-    def routes(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/tables/airlineStats":
-            config = load("tableconfig-airlineStats.json")
-            config["REALTIME"] = config["OFFLINE"]
-            return httpx.Response(200, json=config)
-        return _quote_routes(request)
-
-    engine = PinotEngine(transport=httpx.MockTransport(routes))
-    estimate = await engine.estimate_cost(
-        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
-    )
-    assert estimate.confidence == "low"
-    assert estimate.scanned_bytes is None
-
-    budget = QueryBudget(
-        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
-        max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
-        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
-    )
-    with pytest.raises(BudgetExceededError, match="could not be estimated"):
-        enforce_budget(estimate, budget)
-
-
 async def test_a_table_name_no_path_can_carry_is_not_found_before_any_request() -> (
     None
 ):

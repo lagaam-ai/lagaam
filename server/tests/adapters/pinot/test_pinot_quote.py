@@ -35,6 +35,9 @@ def facts(
     *segments: SegmentFact,
     types: frozenset[str] = frozenset({"OFFLINE"}),
     columns: frozenset[str] = frozenset(),
+    consuming: int = 0,
+    flush_rows: int | None = None,
+    complete: bool = True,
 ) -> TableFacts:
     return TableFacts(
         table="t",
@@ -42,6 +45,20 @@ def facts(
         time_column=None,
         segments=segments,
         columns=columns,
+        consuming=consuming,
+        flush_rows=flush_rows,
+        complete=complete,
+    )
+
+
+def realtime() -> TableFacts:
+    return table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats-realtime.json"),
+        load("seg-metadata-airlineStats-realtime-columns.json"),
+        load("size-airlineStats-realtime.json"),
+        frozenset({"carrier", "dayssinceepoch"}),
+        externalview_json=load("externalview-airlineStats-realtime.json"),
     )
 
 
@@ -170,12 +187,146 @@ def test_quote_sums_over_tables_and_is_high_confidence_with_bytes() -> None:
     assert estimate.max_intermediate_rows == 1234
 
 
-def test_a_realtime_half_is_quoted_low_however_good_the_numbers_look() -> None:
-    """U12 charges consuming segments; until then a REALTIME half is unknown."""
-    table = facts(seg("a", 10, 100, x=5), types=frozenset({"OFFLINE", "REALTIME"}))
-    estimate = quote([(table, None)], frozenset({"x"}), max_intermediate_rows=10)
-    assert estimate.confidence == "low"
+def test_the_consuming_segment_is_charged_at_the_flush_threshold() -> None:
+    """Six sealed at 100 docs, one consuming bounded at 100 by the config."""
+    table = realtime()
+    assert table.consuming == 1
+    assert table.flush_rows == 100
+    assert surviving_docs(table, None) == 700
+
+
+def test_the_consuming_charge_survives_a_filter_that_prunes_every_sealed_segment(
+) -> None:
+    """Measured: a time filter can never remove a consuming segment's cost."""
+    table = realtime()
+    # Sealed k floors at one segment; the consuming charge is added outside it.
+    assert surviving_docs(table, 0) == 100 + 100
+
+
+def test_the_consuming_bytes_are_the_worst_sealed_ratio_ceiling_divided() -> None:
+    table = realtime()
+    assert surviving_bytes(table, None, None) == 517035 + 87136
+    assert (
+        surviving_bytes(table, None, frozenset({"carrier", "dayssinceepoch"}))
+        == 548 + 114
+    )
+
+
+def test_the_ratio_is_per_segment_and_maximised_never_averaged() -> None:
+    """A 10-doc 1000-byte segment beside a 1000-doc 1000-byte one bounds at 100/doc."""
+    table = facts(
+        seg("small", 10, 1000),
+        seg("big", 1000, 1000),
+        types=frozenset({"REALTIME"}),
+        consuming=1,
+        flush_rows=5,
+    )
+    assert surviving_bytes(table, None, None) == 2000 + 500
+
+
+def test_the_bytes_product_is_ceiling_divided_in_integer_arithmetic() -> None:
+    """3 x 7 / 2 is 10.5, and a bound may not be shaved to 10."""
+    table = facts(
+        seg("a", 2, 7), types=frozenset({"REALTIME"}), consuming=1, flush_rows=3
+    )
+    assert surviving_bytes(table, None, None) == 7 + 11
+
+
+def test_more_than_one_consuming_segment_is_charged_once_each() -> None:
+    table = facts(
+        seg("a", 100, 1000),
+        types=frozenset({"REALTIME"}),
+        consuming=2,
+        flush_rows=50,
+    )
+    assert surviving_docs(table, None) == 100 + 100
+    assert surviving_bytes(table, None, None) == 1000 + 1000
+
+
+def test_no_flush_threshold_makes_both_numbers_unknown() -> None:
+    """Rule 7: nothing else in the catalog bounds a consuming segment."""
+    table = facts(
+        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming=1
+    )
+    assert surviving_docs(table, None) is None
+    assert surviving_bytes(table, None, None) is None
+
+
+def test_no_consuming_segment_makes_the_threshold_irrelevant() -> None:
+    table = facts(seg("a", 100, 1000), types=frozenset({"REALTIME"}))
+    assert surviving_docs(table, None) == 100
+    assert surviving_bytes(table, None, None) == 1000
+
+
+def test_an_all_consuming_table_has_no_ratio_to_take() -> None:
+    """Bytes only. Rows still hold: the threshold bounds them without a ratio."""
+    table = facts(types=frozenset({"REALTIME"}), consuming=1, flush_rows=100)
+    assert surviving_bytes(table, None, None) is None
+    assert surviving_docs(table, None) == 100
+
+
+def test_a_sealed_segment_with_zero_docs_is_no_basis_for_a_ratio() -> None:
+    """Dividing by its docs is not a bound, it is a crash."""
+    table = facts(
+        seg("empty", 0, 900), types=frozenset({"REALTIME"}), consuming=1, flush_rows=10
+    )
+    assert surviving_bytes(table, None, None) is None
+
+
+def test_incomplete_metadata_withholds_both_numbers() -> None:
+    """A confident sum over half a table is the failure the gate exists to stop."""
+    table = facts(seg("a", 100, 1000), complete=False)
+    assert surviving_docs(table, None) is None
+    assert surviving_bytes(table, None, None) is None
+
+
+def test_a_realtime_table_now_quotes_at_high_confidence() -> None:
+    """Replaces the blanket REALTIME guard: the type is no longer a reason."""
+    table = realtime()
+    estimate = quote(
+        [(table, None)], frozenset({"carrier", "dayssinceepoch"}), 700
+    )
+    assert estimate.row_estimate == 700
+    assert estimate.scanned_bytes == 662
+    assert estimate.confidence == "high"
+
+
+def test_a_realtime_table_nobody_can_bound_still_quotes_low() -> None:
+    table = facts(
+        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming=1
+    )
+    estimate = quote([(table, None)], None, 100)
     assert estimate.scanned_bytes is None
+    assert estimate.row_estimate is None
+    assert estimate.confidence == "low"
+
+
+def test_a_hybrid_table_is_charged_as_one_segment_set() -> None:
+    """Both halves' sealed segments come from the same two documents; there is
+    no per-half arithmetic. Not measurable live: -type HYBRID cannot run in a
+    container on 1.5.1, so this is the unit test that stands for it."""
+    offline = load("size-airlineStats.json")
+    realtime_size = load("size-airlineStats-realtime.json")
+    merged = {
+        "offlineSegments": offline["offlineSegments"],
+        "realtimeSegments": realtime_size["realtimeSegments"],
+    }
+    merged_metadata = {
+        **load("seg-metadata-airlineStats-columns.json"),
+        **load("seg-metadata-airlineStats-realtime-columns.json"),
+    }
+    table = table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats-realtime.json"),
+        merged_metadata,
+        merged,
+        frozenset({"carrier", "dayssinceepoch"}),
+        externalview_json=load("externalview-airlineStats-realtime.json"),
+    )
+    assert table.types == frozenset({"REALTIME"})
+    assert len(table.segments) == 31 + 6
+    assert table.consuming == 1
+    assert surviving_docs(table, None) == 9746 + 600 + 100
 
 
 def test_one_unpriceable_table_costs_the_whole_byte_quote() -> None:

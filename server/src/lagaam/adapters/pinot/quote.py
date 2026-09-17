@@ -10,7 +10,10 @@ take their own k largest, because the segment with the most rows is not
 always the one with the most bytes.
 
 A number that cannot be bounded is None, which the budget gate denies. That
-is the whole contract: this module never returns a figure it cannot defend.
+is the whole contract: this module never returns a figure it cannot defend —
+with one named exception, the consuming segments' bytes, which no endpoint
+reports and which are projected from the worst bytes-per-doc ratio among
+this table's own sealed segments (ADR 0009).
 """
 
 from collections.abc import Iterable, Sequence
@@ -21,32 +24,58 @@ from lagaam.core.models import CostEstimate
 
 
 def surviving_docs(facts: TableFacts, surviving: int | None) -> int | None:
-    """Docs in the k largest segments by docs, or None if any is unknown.
+    """Docs in the k largest sealed segments, plus the consuming charge.
 
-    One unknown segment poisons the sum: the others do not bound it.
+    One unknown segment poisons the sum: the others do not bound it. So does
+    incomplete metadata, which means the segments in hand are not the table.
+
+    The consuming term is added outside the k-largest logic and is never
+    pruned: measured, numConsumingSegmentsQueried stayed 1 under filters
+    excluding every possible value while the broker pruned 6 of 7 segments.
     """
+    if not facts.complete:
+        return None
+    consuming = _consuming_docs(facts)
+    if consuming is None:
+        return None
     counts = [segment.docs for segment in facts.segments]
-    if not counts or any(count is None for count in counts):
+    if any(count is None for count in counts):
         return None
     known = sorted((count for count in counts if count is not None), reverse=True)
-    return sum(known[: _k(surviving, len(known))])
+    if not known:
+        return consuming if facts.consuming else None
+    return sum(known[: _k(surviving, len(known))]) + consuming
 
 
 def surviving_bytes(
     facts: TableFacts, surviving: int | None, columns: frozenset[str] | None
 ) -> int | None:
-    """Bytes in the k largest segments, charging only referenced columns.
+    """Bytes in the k largest sealed segments, plus the consuming projection.
 
     A segment matching none of the referenced columns is charged whole,
     and unresolvable columns fall back to whole segments table-wide.
+
+    The consuming term is the one projected number in a Lagaam quotation: a
+    consuming segment reports -1 bytes on every probe, so its bytes are
+    flush_rows times the worst bytes-per-doc ratio observed on this table's
+    own sealed segments, taken per segment and maximised, never averaged. No
+    sealed segment with docs > 0 leaves nothing to take a ratio from, and
+    inventing one would be a guess.
     """
+    if not facts.complete:
+        return None
     sizes = _column_sizes(facts, columns)
     if sizes is None:
         sizes = [segment.total_bytes for segment in facts.segments]
-    if not sizes or any(size is None for size in sizes):
+    if any(size is None for size in sizes):
+        return None
+    consuming = _consuming_bytes(facts, sizes)
+    if consuming is None:
         return None
     known = sorted((size for size in sizes if size is not None), reverse=True)
-    return sum(known[: _k(surviving, len(known))])
+    if not known:
+        return None
+    return sum(known[: _k(surviving, len(known))]) + consuming
 
 
 def quote(
@@ -63,15 +92,8 @@ def quote(
         return CostEstimate(
             max_intermediate_rows=max_intermediate_rows, confidence="low"
         )
-    # A consuming segment reports zero docs and -1 bytes, so a REALTIME half
-    # is an unbounded unknown until U12 charges it at its flush threshold.
-    realtime = any("REALTIME" in facts.types for facts, _ in tables)
     rows = _total(surviving_docs(facts, k) for facts, k in tables)
-    total_bytes = (
-        None
-        if realtime
-        else _total(surviving_bytes(facts, k, columns) for facts, k in tables)
-    )
+    total_bytes = _total(surviving_bytes(facts, k, columns) for facts, k in tables)
     return CostEstimate(
         scanned_bytes=total_bytes,
         row_estimate=rows,
@@ -120,6 +142,36 @@ def _column_sizes(
                 matched = True
         sizes.append(total if matched else segment.total_bytes)
     return sizes
+
+
+def _consuming_docs(facts: TableFacts) -> int | None:
+    """Rows the consuming segments may hold, or None if nothing bounds them."""
+    if facts.consuming <= 0:
+        return 0
+    if facts.flush_rows is None:
+        return None
+    return facts.consuming * facts.flush_rows
+
+
+def _consuming_bytes(facts: TableFacts, sizes: list[int | None]) -> int | None:
+    """Bytes the consuming segments may hold, projected from sealed ratios.
+
+    `sizes` is per segment in facts.segments order and carries the same
+    per-segment column-or-whole choice the sealed charge made, so the ratio
+    is taken over exactly the bytes being charged.
+    """
+    if facts.consuming <= 0:
+        return 0
+    if facts.flush_rows is None:
+        return None
+    bounds = [
+        (facts.flush_rows * size + segment.docs - 1) // segment.docs
+        for segment, size in zip(facts.segments, sizes)
+        if segment.docs and size is not None
+    ]
+    if not bounds:
+        return None
+    return facts.consuming * max(bounds)
 
 
 def _total(values: Iterable[int | None]) -> int | None:
