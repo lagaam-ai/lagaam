@@ -504,6 +504,15 @@ def upsert_keys(
     return frozenset({frozenset(names)})
 
 
+def upsert_config_present(config_json: Any) -> bool:
+    """Does either half of this table config carry an upsertConfig object?
+
+    The caller fetches two more documents on the strength of this, so it is
+    public: an adapter that guessed would pay two controller calls per table.
+    """
+    return _has_upsert_config(config_json)
+
+
 def single_segment_unique_columns(
     seg_metadata_json: Any, config_json: Any, schema_json: Any, size_json: Any
 ) -> frozenset[frozenset[str]]:

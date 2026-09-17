@@ -862,6 +862,8 @@ async def test_a_join_skips_the_oracle_and_charges_every_segment() -> None:
                 200,
                 json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
             )
+        if path.endswith("/externalview"):
+            return httpx.Response(200, json={"OFFLINE": None, "REALTIME": None})
         if path.endswith("/size"):
             name = path.split("/")[2]
             return httpx.Response(200, json=load(f"size-{name}.json"))
@@ -1215,3 +1217,327 @@ async def test_a_self_join_is_charged_two_reads_and_the_product() -> None:
     assert self_join.scanned_bytes == 2 * single.scanned_bytes
     assert self_join.max_intermediate_rows == 9746 * 9746 + 2 * 9746
     assert self_join.confidence == "high"
+
+
+def _is_keycols_explain(sql: str) -> bool:
+    """The key-ordinal EXPLAIN: bare projection, no filter, no LIMIT, no join."""
+    if "AS JSON FOR SELECT" not in sql:
+        return False
+    tail = sql.split("AS JSON FOR SELECT", 1)[1].upper()
+    return not any(word in tail for word in (" JOIN ", " WHERE ", " LIMIT ", "("))
+
+
+def _realtime_routes(request: httpx.Request) -> httpx.Response:
+    """The realtime airlineStats table, from the U12 captures."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-singletable.json"))
+        return httpx.Response(200, json=load("explain-v1-realtime-nofilter.json"))
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["airlineStats"]})
+    if path == "/tables/airlineStats/externalview":
+        return httpx.Response(200, json=load("externalview-airlineStats-realtime.json"))
+    if path == "/tables/airlineStats/size":
+        return httpx.Response(200, json=load("size-airlineStats-realtime.json"))
+    if path == "/tables/airlineStats/schema":
+        return httpx.Response(200, json=load("schema-airlineStats.json"))
+    if path == "/segments/airlineStats/metadata":
+        return httpx.Response(
+            200, json=load("seg-metadata-airlineStats-realtime-columns.json")
+        )
+    if path == "/tables/airlineStats":
+        return httpx.Response(200, json=load("tableconfig-airlineStats-realtime.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_a_realtime_table_is_quoted_with_its_consuming_segment_charged() -> None:
+    """The no-filter EXPLAIN prunes to 1 queried segment, of which 1 is the
+    consuming one, so the sealed k is 0 and _k charges one sealed segment of
+    100 docs plus the 100-row consuming charge (ruling 3.1)."""
+    engine = PinotEngine(transport=httpx.MockTransport(_realtime_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.row_estimate == 100 + 100
+    assert estimate.scanned_bytes == 114 + 114
+    assert estimate.confidence == "high"
+
+
+async def test_the_whole_realtime_table_is_charged_when_no_prune_is_believed() -> None:
+    """An OFFSET voids the limit prune: 26 queried less the 1 consuming leaves
+    a sealed k of 25, which is every sealed segment the metadata carries."""
+    engine = PinotEngine(transport=httpx.MockTransport(_realtime_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats "
+        "LIMIT 10 OFFSET 20"
+    )
+    assert estimate.row_estimate == 6 * 100 + 100
+    assert estimate.scanned_bytes == 548 + 114
+    assert estimate.confidence == "high"
+
+
+async def test_the_sealed_k_is_queried_minus_the_consuming_counter() -> None:
+    """The future-time EXPLAIN reports 1 queried, 1 consuming: k is 0 sealed,
+    so one sealed segment at 100 docs plus the 100-row consuming charge."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if "AS JSON" in sql:
+                return httpx.Response(200, json=load("explain-mse-singletable.json"))
+            return httpx.Response(200, json=load("explain-v1-realtime-futuretime.json"))
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch > 99999 LIMIT 10"
+    )
+    assert estimate.row_estimate == 100 + 100
+    assert estimate.confidence == "high"
+
+
+async def test_incomplete_segment_metadata_quotes_low() -> None:
+    """The two-of-four u12upsert capture: a sum over half a table is no quote."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/query/sql":
+            return httpx.Response(200, json=load("explain-v1-realtime-nofilter.json"))
+        if path == "/tables":
+            return httpx.Response(200, json={"tables": ["u12upsert"]})
+        if path == "/tables/u12upsert/externalview":
+            return httpx.Response(200, json={"REALTIME": {}})
+        if path == "/tables/u12upsert/size":
+            return httpx.Response(200, json=load("size-u12upsert.json"))
+        if path == "/tables/u12upsert/metadata":
+            return httpx.Response(200, json=load("metadata-u12upsert.json"))
+        if path == "/schemas/u12upsert":
+            return httpx.Response(200, json=load("schema-u12upsert.json"))
+        if path == "/tables/u12upsert/schema":
+            return httpx.Response(200, json=load("schema-u12upsert.json"))
+        if path == "/segments/u12upsert/metadata":
+            return httpx.Response(200, json=load("seg-metadata-u12upsert.json"))
+        if path == "/tables/u12upsert":
+            return httpx.Response(200, json=load("tableconfig-u12upsert.json"))
+        return httpx.Response(404, json={})
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost("SELECT pk FROM pinot.default.u12upsert LIMIT 10")
+    assert estimate.row_estimate is None
+    assert estimate.scanned_bytes is None
+    assert estimate.confidence == "low"
+
+
+async def test_the_schema_is_fetched_only_for_an_upsert_table() -> None:
+    """A non-upsert table pays one extra call, not three."""
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost("SELECT Carrier FROM pinot.default.airlineStats LIMIT 10")
+    assert "/tables/airlineStats/externalview" in seen
+    assert not any(path.startswith("/schemas/") for path in seen)
+    assert "/tables/airlineStats/metadata" not in seen
+
+
+async def test_an_upsert_table_pays_for_its_schema_and_its_metadata() -> None:
+    """The two extra documents are fetched exactly where the config says
+    they say something, and the schema path is the listing spelling — the
+    config's own tableName is u12upsert_REALTIME and would 404."""
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        path = request.url.path
+        if path == "/query/sql":
+            return httpx.Response(200, json=load("explain-v1-realtime-nofilter.json"))
+        if path == "/tables":
+            return httpx.Response(200, json={"tables": ["u12upsert"]})
+        if path == "/tables/u12upsert":
+            return httpx.Response(200, json=load("tableconfig-u12upsert.json"))
+        if path == "/schemas/u12upsert":
+            return httpx.Response(200, json=load("schema-u12upsert.json"))
+        if path == "/tables/u12upsert/metadata":
+            return httpx.Response(200, json=load("metadata-u12upsert.json"))
+        return httpx.Response(404, json={})
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost("SELECT pk FROM pinot.default.u12upsert LIMIT 10")
+    assert "/schemas/u12upsert" in seen
+    assert "/tables/u12upsert/metadata" in seen
+    assert not any("u12upsert_REALTIME" in path for path in seen)
+
+
+def _upsert_selfjoin_routes(request: httpx.Request) -> httpx.Response:
+    """airlineStats' own captures, with the config and schema of an upsert
+    table keyed on Carrier: the one shape that proves a join bound here."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if _is_keycols_explain(sql):
+            return httpx.Response(200, json=load("explain-mse-keycols-airlineStats.json"))
+        if "AS JSON" in sql:
+            return httpx.Response(200, json=load("explain-mse-selfjoin.json"))
+        return httpx.Response(
+            200,
+            json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
+        )
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["airlineStats"]})
+    if path == "/tables/airlineStats/externalview":
+        return httpx.Response(200, json={"OFFLINE": None, "REALTIME": None})
+    if path == "/tables/airlineStats/size":
+        return httpx.Response(200, json=load("size-airlineStats.json"))
+    if path in ("/tables/airlineStats/schema", "/schemas/airlineStats"):
+        schema = load("schema-airlineStats.json")
+        schema["primaryKeyColumns"] = ["Carrier"]
+        return httpx.Response(200, json=schema)
+    if path == "/tables/airlineStats/metadata":
+        metadata = load("metadata-airlineStats.json")
+        metadata["upsertPartitionToServerPrimaryKeyCountMap"] = {"0": {"Server_0": 50}}
+        return httpx.Response(200, json=metadata)
+    if path == "/segments/airlineStats/metadata":
+        return httpx.Response(200, json=load("seg-metadata-airlineStats-columns.json"))
+    if path == "/tables/airlineStats":
+        config = load("tableconfig-airlineStats.json")
+        config["OFFLINE"]["upsertConfig"] = {"mode": "FULL"}
+        return httpx.Response(200, json=config)
+    return httpx.Response(404, json={})
+
+
+async def test_an_upsert_self_join_is_bounded_once_the_ordinals_are_learned() -> None:
+    """Carrier is the proven key and the keycols EXPLAIN puts it at ordinal 18,
+    which both operands compose down to: min plus the two inputs, not the product."""
+    engine = PinotEngine(transport=httpx.MockTransport(_upsert_selfjoin_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
+
+
+async def test_a_key_whose_ordinals_never_arrived_is_charged_the_product() -> None:
+    """A keycols EXPLAIN that errors leaves the table with no evidence at all."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                return httpx.Response(
+                    200,
+                    json={"exceptions": [{"errorCode": 200, "message": "no"}]},
+                )
+        return _upsert_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
+
+
+async def test_the_keycols_explain_carries_no_limit_and_no_order_by() -> None:
+    """A Sort above the project would make key_ordinals return None."""
+    asked: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                asked.append(sql)
+        return _upsert_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert asked
+    for sql in asked:
+        assert "LIMIT" not in sql.upper()
+        assert "ORDER BY" not in sql.upper()
+        assert sql.startswith("EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT")
+        # The schema's spelling, never the agent's, and the two-part name.
+        assert "Carrier FROM default.airlineStats" in sql
+
+
+async def test_a_table_without_keys_is_never_asked_for_its_ordinals() -> None:
+    """The extra EXPLAIN is paid for only where a key was actually proven."""
+    asked: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if _is_keycols_explain(sql):
+                asked.append(sql)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost("SELECT Carrier FROM pinot.default.airlineStats LIMIT 10")
+    assert asked == []
+
+
+async def test_a_realtime_table_nobody_can_bound_is_quoted_low_and_denied() -> None:
+    """A consuming segment with no flush threshold bounds nothing, and the
+    gate denies the query rather than letting an unquotable scan through."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables/airlineStats":
+            config = load("tableconfig-airlineStats-realtime.json")
+            maps = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
+                "streamConfigMaps"
+            ]
+            for stream in maps:
+                for key in list(stream):
+                    if key.startswith("realtime.segment.flush.threshold"):
+                        del stream[key]
+            return httpx.Response(200, json=config)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.confidence == "low"
+    with pytest.raises(BudgetExceededError, match="could not be estimated"):
+        enforce_budget(
+            estimate,
+            QueryBudget(
+                max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+                max_intermediate_rows=DEFAULT_MAX_INTERMEDIATE_ROWS,
+                timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            ),
+        )
+
+
+async def test_the_externalview_is_what_tells_consuming_from_online() -> None:
+    """The size report names no missing segment here, so the consuming charge
+    exists only because the externalview reports one CONSUMING replica."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables/airlineStats/size":
+            size = load("size-airlineStats-realtime.json")
+            segments = size["realtimeSegments"]
+            segments["missingSegments"] = 0
+            del segments["segments"]["airlineStats__0__6__20260917T1214Z"]
+            return httpx.Response(200, json=size)
+        if path == "/segments/airlineStats/metadata":
+            seg = load("seg-metadata-airlineStats-realtime-columns.json")
+            del seg["airlineStats__0__6__20260917T1214Z"]
+            return httpx.Response(200, json=seg)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 10"
+    )
+    # One sealed segment (k is 0) at 100 docs, plus the 100-row consuming charge.
+    assert estimate.row_estimate == 100 + 100
