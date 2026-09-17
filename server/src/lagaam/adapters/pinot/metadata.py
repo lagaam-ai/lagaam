@@ -138,6 +138,29 @@ class TableFacts:
     # empty when none was asked for or the schema could not be read. A
     # segment missing any of them is priced whole rather than per column.
     columns: frozenset[str] = frozenset()
+    # How many CONSUMING segments this table has, and the row bound on one of
+    # them. A consuming segment reports nothing (0 docs, -1 bytes) until it
+    # seals, so it is charged from the config or the quote goes low.
+    consuming: int = 0
+    flush_rows: int | None = None
+    # False when the metadata response did not cover every sealed segment the
+    # size report names: a confident sum over half a table is the one failure
+    # the gate exists to prevent.
+    complete: bool = True
+    # Column sets proved unique on this table, lowercase. Empty is "no
+    # evidence", which charges a join the product exactly as before.
+    unique_keys: frozenset[frozenset[str]] = frozenset()
+
+
+# Long.MIN_VALUE: what a consuming segment reports where a CRC would be.
+_CONSUMING_CRC = -9223372036854775808
+
+# The flush threshold, most specific location first. `.size` is the deprecated
+# spelling of `.rows` and is what the bundled quickstart config actually uses.
+_FLUSH_KEYS = (
+    "realtime.segment.flush.threshold.rows",
+    "realtime.segment.flush.threshold.size",
+)
 
 
 def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
@@ -145,10 +168,17 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
 
     Bytes come from a different endpoint than docs, keyed by segment name, so
     a segment missing from the size report keeps its docs and loses its bytes.
+
+    A consuming segment is dropped rather than kept as a zero: it reports 0
+    docs and -1 bytes permanently, and one None bytes makes the whole table's
+    byte sum unknown. Only all four markers together identify it — an
+    unreadable sealed segment keeps its Nones and poisons the sum, because an
+    unreadable segment is not a free one.
     """
     if not isinstance(seg_metadata_json, dict):
         return []
     sizes = _segment_sizes(size_json)
+    reported = _reported_sizes(size_json)
     facts: list[SegmentFact] = []
     for key, body in seg_metadata_json.items():
         if not isinstance(body, dict):
@@ -157,6 +187,8 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
         if not isinstance(name, str) or not name:
             name = key if isinstance(key, str) else ""
         if not name:
+            continue
+        if _is_consuming(body, reported.get(name)):
             continue
         facts.append(
             SegmentFact(
@@ -169,6 +201,152 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
             )
         )
     return facts
+
+
+def consuming_count(externalview_json: Any, size_json: Any) -> int:
+    """How many CONSUMING segments this table has, charged at the larger count.
+
+    Externalview is the state of record but can lag, and missingSegments also
+    counts a segment a server failed to report, so neither is authoritative
+    and only the larger cannot under-charge. Neither readable is 0, which is
+    the pre-U12 behaviour and is caught by the completeness check where it
+    matters.
+    """
+    return max(_externalview_consuming(externalview_json), _missing_segments(size_json))
+
+
+def flush_rows(config_json: Any) -> int | None:
+    """The row bound on one consuming segment, from the REALTIME stream config.
+
+    Values are JSON strings in every config measured. Anything that is not a
+    positive int — a float, a byte-suffixed size, a negative, zero, absent —
+    is None, and a None here takes the whole quote low rather than guessing.
+    """
+    if not isinstance(config_json, dict):
+        return None
+    half = config_json.get("REALTIME")
+    if not isinstance(half, dict):
+        return None
+    for source in _stream_config_maps(half):
+        for key in _FLUSH_KEYS:
+            bound = _positive_int_or_digits(source.get(key))
+            if bound is not None:
+                return bound
+    return None
+
+
+def metadata_is_complete(seg_metadata_json: Any, size_json: Any) -> bool:
+    """Does the metadata response cover every sealed segment the size report names?
+
+    Measured: on a 2-server table /segments/{t}/metadata returns one server's
+    half and alternates which half between identical calls, so a sum over it
+    is a confident sum over a subset — an under-quote at confidence="high",
+    the one failure mode the gate exists to prevent. A segment reporting -1
+    bytes is consuming and is expected to carry no useful entry, so it is
+    exempt.
+    """
+    named = {
+        name
+        for name, size in _reported_sizes(size_json).items()
+        if size is not None and size >= 0
+    }
+    if not named:
+        return True
+    if not isinstance(seg_metadata_json, dict):
+        return False
+    present: set[str] = set()
+    for key, body in seg_metadata_json.items():
+        if isinstance(key, str):
+            present.add(key)
+        if isinstance(body, dict) and isinstance(body.get("segmentName"), str):
+            present.add(body["segmentName"])
+    return named <= present
+
+
+def _is_consuming(body: dict[str, Any], reported: int | None) -> bool:
+    """Rule 5's conjunction, all four markers together and never fewer."""
+    return (
+        body.get("totalDocs") == 0
+        and "columns" not in body
+        and body.get("crc") == _CONSUMING_CRC
+        and reported == -1
+    )
+
+
+def _stream_config_maps(half: dict[str, Any]) -> list[dict[str, Any]]:
+    """The stream config maps of one table half, current location first."""
+    maps: list[dict[str, Any]] = []
+    ingestion = half.get("ingestionConfig")
+    if isinstance(ingestion, dict):
+        stream = ingestion.get("streamIngestionConfig")
+        if isinstance(stream, dict):
+            configs = stream.get("streamConfigMaps")
+            if isinstance(configs, list):
+                maps.extend(entry for entry in configs if isinstance(entry, dict))
+    index_config = half.get("tableIndexConfig")
+    if isinstance(index_config, dict):
+        legacy = index_config.get("streamConfigs")
+        if isinstance(legacy, dict):
+            maps.append(legacy)
+    return maps
+
+
+def _externalview_consuming(externalview_json: Any) -> int:
+    """Segments of the REALTIME map any server calls CONSUMING."""
+    if not isinstance(externalview_json, dict):
+        return 0
+    half = externalview_json.get("REALTIME")
+    if not isinstance(half, dict):
+        return 0
+    return sum(
+        1
+        for states in half.values()
+        if isinstance(states, dict) and "CONSUMING" in states.values()
+    )
+
+
+def _missing_segments(size_json: Any) -> int:
+    """realtimeSegments.missingSegments, measured to equal the consuming count."""
+    if not isinstance(size_json, dict):
+        return 0
+    half = size_json.get("realtimeSegments")
+    if not isinstance(half, dict):
+        return 0
+    missing = _positive_int(half.get("missingSegments"), allow_zero=True)
+    return missing or 0
+
+
+def _reported_sizes(size_json: Any) -> dict[str, int]:
+    """Segment name to reportedSizeInBytes verbatim, -1 included.
+
+    _segment_sizes drops the -1 as "unknown"; this keeps it, because -1 is
+    how a consuming segment is recognised and how a sealed one is named.
+    """
+    if not isinstance(size_json, dict):
+        return {}
+    reported: dict[str, int] = {}
+    for key in ("offlineSegments", "realtimeSegments"):
+        half = size_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        segments = half.get("segments")
+        if not isinstance(segments, dict):
+            continue
+        for name, body in segments.items():
+            if not isinstance(name, str) or not isinstance(body, dict):
+                continue
+            value = body.get("reportedSizeInBytes")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            reported[name] = value
+    return reported
+
+
+def _positive_int_or_digits(value: Any) -> int | None:
+    """A positive int, or a string of digits meaning one. Nothing else."""
+    if isinstance(value, str):
+        return int(value) if value.isdigit() and int(value) > 0 else None
+    return _positive_int(value)
 
 
 def time_column(config_json: Any) -> str | None:
@@ -205,14 +383,29 @@ def table_facts(
     seg_metadata_json: Any,
     size_json: Any,
     columns: frozenset[str] = frozenset(),
+    *,
+    externalview_json: Any = None,
+    schema_json: Any = None,
+    table_metadata_json: Any = None,
 ) -> TableFacts:
-    """One table's type, time column and segments, from three documents."""
+    """One table's type, time column, segments and realtime facts.
+
+    The three keyword documents are the U12 additions and default to None, so
+    an OFFLINE caller that fetches none of them gets exactly the pre-U12
+    facts: no consuming segments, no threshold, complete, no key evidence.
+    """
     return TableFacts(
         table=table,
         types=table_types(config_json),
         time_column=time_column(config_json),
         segments=tuple(segment_facts(seg_metadata_json, size_json)),
         columns=columns,
+        consuming=consuming_count(externalview_json, size_json),
+        flush_rows=flush_rows(config_json),
+        complete=metadata_is_complete(seg_metadata_json, size_json),
+        # Task 2 replaces this literal with the two key-evidence sources; the
+        # keyword documents are already threaded so that task touches one line.
+        unique_keys=frozenset(),
     )
 
 

@@ -12,6 +12,9 @@ from typing import Any
 import pytest
 
 from lagaam.adapters.pinot.metadata import (
+    consuming_count,
+    flush_rows,
+    metadata_is_complete,
     row_estimate,
     segment_facts,
     table_facts,
@@ -319,4 +322,192 @@ def test_table_facts_gather_type_time_column_and_segments() -> None:
     assert facts.table == "airlineStats"
     assert facts.types == frozenset({"OFFLINE"})
     assert facts.time_column == "DaysSinceEpoch"
+    assert len(facts.segments) == 31
+
+
+def test_consuming_count_reads_externalview_and_the_size_report_together() -> None:
+    """6 ONLINE + 1 CONSUMING in externalview, missingSegments 1 in size."""
+    assert (
+        consuming_count(
+            load("externalview-airlineStats-realtime.json"),
+            load("size-airlineStats-realtime.json"),
+        )
+        == 1
+    )
+
+
+def test_consuming_count_reads_a_two_partition_size_report() -> None:
+    assert consuming_count(None, load("size-u12upsert.json")) == 2
+
+
+def test_a_disagreement_between_the_two_charges_the_larger() -> None:
+    """Neither document is authoritative, so the larger cannot under-charge."""
+    externalview = load("externalview-airlineStats-realtime.json")
+    size = load("size-airlineStats-realtime.json")
+    size["realtimeSegments"]["missingSegments"] = 4
+    assert consuming_count(externalview, size) == 4
+    size["realtimeSegments"]["missingSegments"] = 0
+    assert consuming_count(externalview, size) == 1
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"REALTIME": "nope"}])
+def test_consuming_count_is_zero_when_neither_document_can_be_read(
+    body: Any,
+) -> None:
+    assert consuming_count(body, body) == 0
+
+
+def test_flush_rows_accepts_the_deprecated_size_spelling() -> None:
+    """The .size spelling is the deprecated one; a minimal hand-built config."""
+    assert (
+        flush_rows(
+            {
+                "REALTIME": {
+                    "ingestionConfig": {
+                        "streamIngestionConfig": {
+                            "streamConfigMaps": [
+                                {"realtime.segment.flush.threshold.size": "50000"}
+                            ]
+                        }
+                    }
+                }
+            }
+        )
+        == 50000
+    )
+
+
+def test_flush_rows_reads_the_rows_spelling_as_a_string() -> None:
+    assert flush_rows(load("tableconfig-airlineStats-realtime.json")) == 100
+    assert flush_rows(load("tableconfig-u12upsert.json")) == 200
+
+
+def test_flush_rows_falls_back_to_the_legacy_stream_config_location() -> None:
+    """Absent on every config measured; read so an older cluster is not unbounded."""
+    assert (
+        flush_rows(
+            {
+                "REALTIME": {
+                    "tableIndexConfig": {
+                        "streamConfigs": {
+                            "realtime.segment.flush.threshold.rows": "250"
+                        }
+                    }
+                }
+            }
+        )
+        == 250
+    )
+
+
+@pytest.mark.parametrize(
+    "value", ["", "10.5", "500M", "-100", "0", "abc", None, True, 4.0]
+)
+def test_a_threshold_that_is_not_a_positive_int_is_no_bound(value: Any) -> None:
+    assert (
+        flush_rows(
+            {
+                "REALTIME": {
+                    "ingestionConfig": {
+                        "streamIngestionConfig": {
+                            "streamConfigMaps": [
+                                {"realtime.segment.flush.threshold.rows": value}
+                            ]
+                        }
+                    }
+                }
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"OFFLINE": {}}])
+def test_flush_rows_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
+    assert flush_rows(body) is None
+
+
+def test_the_consuming_entry_is_not_a_sealed_fact() -> None:
+    """totalDocs 0, no columns, Long.MIN_VALUE crc and -1 bytes, all four."""
+    facts = segment_facts(
+        load("seg-metadata-airlineStats-realtime-columns.json"),
+        load("size-airlineStats-realtime.json"),
+    )
+    assert len(facts) == 6
+    assert all(fact.docs == 100 for fact in facts)
+    assert all(fact.total_bytes is not None for fact in facts)
+    assert sum(fact.total_bytes or 0 for fact in facts) == 517035
+    assert not any("__0__6__" in fact.name for fact in facts)
+
+
+def test_an_unreadable_sealed_segment_is_kept_and_still_poisons_the_sum() -> None:
+    """Three of rule 5's four markers is not a consuming segment."""
+    facts = segment_facts(
+        {"seg0": {"segmentName": "seg0", "totalDocs": 0, "crc": 12345}},
+        {"realtimeSegments": {"segments": {"seg0": {"reportedSizeInBytes": -1}}}},
+    )
+    assert len(facts) == 1
+    assert facts[0].total_bytes is None
+
+
+def test_metadata_is_complete_when_every_sealed_segment_is_present() -> None:
+    assert metadata_is_complete(
+        load("seg-metadata-airlineStats-realtime.json"),
+        load("size-airlineStats-realtime.json"),
+    )
+
+
+def test_a_truncated_metadata_response_is_incomplete() -> None:
+    """Measured: a 2-server table returns one server's half and alternates."""
+    assert not metadata_is_complete(
+        load("seg-metadata-u12upsert.json"), load("size-u12upsert.json")
+    )
+
+
+def test_a_consuming_segment_missing_from_metadata_does_not_make_it_incomplete() -> (
+    None
+):
+    """A -1 in the size report is consuming, and is exempt by definition."""
+    size = load("size-u12upsert.json")
+    size["realtimeSegments"]["segments"] = {
+        name: body
+        for name, body in size["realtimeSegments"]["segments"].items()
+        if body["reportedSizeInBytes"] != -1 and name.startswith("u12upsert__0__")
+    }
+    assert metadata_is_complete(load("seg-metadata-u12upsert.json"), size)
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk"])
+def test_completeness_is_true_when_the_size_report_names_nothing(body: Any) -> None:
+    """No named sealed segment is nothing to be missing — the pre-U12 behaviour."""
+    assert metadata_is_complete(body, body)
+
+
+def test_table_facts_carry_the_realtime_numbers() -> None:
+    facts = table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats-realtime.json"),
+        load("seg-metadata-airlineStats-realtime.json"),
+        load("size-airlineStats-realtime.json"),
+        externalview_json=load("externalview-airlineStats-realtime.json"),
+    )
+    assert facts.types == frozenset({"REALTIME"})
+    assert len(facts.segments) == 6
+    assert facts.consuming == 1
+    assert facts.flush_rows == 100
+    assert facts.complete is True
+    assert facts.unique_keys == frozenset()
+
+
+def test_table_facts_without_the_new_documents_are_the_pre_u12_facts() -> None:
+    """Every existing call site passes four positional arguments and no more."""
+    facts = table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats.json"),
+        load("seg-metadata-airlineStats-columns.json"),
+        load("size-airlineStats.json"),
+    )
+    assert facts.consuming == 0
+    assert facts.flush_rows is None
+    assert facts.complete is True
     assert len(facts.segments) == 31
