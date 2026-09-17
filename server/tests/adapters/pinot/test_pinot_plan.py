@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from lagaam.adapters.pinot.plan import max_intermediate_rows
+from lagaam.adapters.pinot.plan import join_key_pairs, max_intermediate_rows
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -27,6 +27,19 @@ def plan_cell(name: str) -> str:
     cell = body["resultTable"]["rows"][0][1]
     assert isinstance(cell, str)
     return cell
+
+
+def join_pairs(name: str) -> list[tuple[str | None, str | None]]:
+    """The resolved equality pairs of the one join node in this plan."""
+    rels = json.loads(plan_cell(name))["rels"]
+    by_id = {rel["id"]: rel for rel in rels}
+    previous: dict[str, str | None] = {}
+    last: str | None = None
+    for rel in rels:
+        previous[rel["id"]] = last
+        last = rel["id"]
+    join = next(rel for rel in rels if rel.get("joinType") or "Join" in rel["relOp"])
+    return join_key_pairs(join["id"], by_id, previous, join["inputs"])
 
 
 def test_a_cross_join_is_charged_the_product_plus_its_children() -> None:
@@ -252,3 +265,230 @@ def test_a_cycle_in_the_inputs_does_not_hang() -> None:
         }
     )
     assert max_intermediate_rows(plan, LEAVES) is None
+
+
+UPSERT_KEYS = {"default.airlinestats": frozenset({frozenset({"carrier"})})}
+BOTH_KEYS = {
+    "default.airlinestats": frozenset({frozenset({"carrier"})}),
+    "default.baseballstats": frozenset({frozenset({"teamid"})}),
+}
+
+
+def test_a_plain_equi_join_resolves_both_operands_to_column_names() -> None:
+    assert join_pairs("explain-mse-join-plain.json") == [("carrier", "teamid")]
+
+
+def test_an_operand_index_counts_over_left_fields_then_right() -> None:
+    """Right teamID at right-index 1 is global 3 = 2 left fields + 1."""
+    assert join_pairs("explain-mse-join-twokeys.json") == [
+        ("carrier", "teamid"),
+        ("origin", "league"),
+    ]
+
+
+def test_an_expression_operand_is_no_evidence() -> None:
+    """upper(a.Carrier) became $f85 with an op of UPPER.
+
+    The operand resolves to None — that side has no column here, so no key
+    of it can be covered — while the other side's column still resolves.
+    """
+    assert join_pairs("explain-mse-join-expr.json") == [(None, "teamid")]
+
+
+def test_a_left_join_resolves_exactly_as_an_inner_one_does() -> None:
+    """joinType is not read: the rule is about the key, not the join kind."""
+    assert join_pairs("explain-mse-join-left.json") == [("carrier", "teamid")]
+
+
+def test_an_or_condition_is_no_evidence() -> None:
+    """ADR 0008's OR case stands: an OR of equalities is not a key."""
+    assert join_pairs("explain-mse-orjoin.json") == []
+
+
+def test_a_cross_join_has_no_operands_to_resolve() -> None:
+    assert join_pairs("explain-mse-crossjoin.json") == []
+
+
+def test_a_left_unique_key_charges_the_right_side_plus_the_inputs() -> None:
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-plain.json"), LEAVES, UPSERT_KEYS
+    ) == BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_right_unique_key_charges_the_left_side_plus_the_inputs() -> None:
+    keys = {"default.baseballstats": frozenset({frozenset({"teamid"})})}
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-plain.json"), LEAVES, keys
+    ) == AIRLINE_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_both_sides_unique_charge_the_smaller_one_plus_the_inputs() -> None:
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-plain.json"), LEAVES, BOTH_KEYS
+    ) == min(AIRLINE_DOCS, BASEBALL_DOCS) + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_no_evidence_is_still_the_product() -> None:
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-plain.json"), LEAVES
+    ) == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_key_on_a_column_the_join_does_not_equate_is_not_covered() -> None:
+    keys = {"default.airlinestats": frozenset({frozenset({"origin"})})}
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-plain.json"), LEAVES, keys
+    ) == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_join_equating_more_columns_than_the_key_still_covers_it() -> None:
+    """Cover is subset, not equality: more equalities cannot mean more matches."""
+    keys = {"default.airlinestats": frozenset({frozenset({"carrier"})})}
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-twokeys.json"), LEAVES, keys
+    ) == BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_composite_key_needs_every_one_of_its_columns_equated() -> None:
+    keys = {
+        "default.airlinestats": frozenset({frozenset({"carrier", "dayssinceepoch"})})
+    }
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-twokeys.json"), LEAVES, keys
+    ) == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_composite_key_fully_equated_is_covered() -> None:
+    keys = {"default.airlinestats": frozenset({frozenset({"carrier", "origin"})})}
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-twokeys.json"), LEAVES, keys
+    ) == BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_an_expression_key_cannot_be_covered_however_unique_the_column() -> None:
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-expr.json"), LEAVES, UPSERT_KEYS
+    ) == AIRLINE_DOCS * BASEBALL_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_an_expression_on_one_side_still_lets_the_other_sides_key_bound_it() -> None:
+    """upper(a.Carrier) = b.teamID still matches one b row per left row."""
+    keys = {"default.baseballstats": frozenset({frozenset({"teamid"})})}
+    assert max_intermediate_rows(
+        plan_cell("explain-mse-join-expr.json"), LEAVES, keys
+    ) == AIRLINE_DOCS + AIRLINE_DOCS + BASEBALL_DOCS
+
+
+def test_a_self_join_on_a_unique_key_is_charged_the_bound_not_the_product() -> None:
+    """The shipped self-join plan names the same node id as both inputs."""
+    keys = {"default.airlinestats": frozenset({frozenset({"carrier"})})}
+    product = max_intermediate_rows(plan_cell("explain-mse-selfjoin.json"), LEAVES)
+    bounded = max_intermediate_rows(
+        plan_cell("explain-mse-selfjoin.json"), LEAVES, keys
+    )
+    assert product is not None and bounded is not None
+    assert bounded < product
+
+
+ABC_LEAVES = {"default.a": 10, "default.b": 500, "default.c": 7}
+
+# The inner cross join of A and B: 10 * 500 + 10 + 500.
+INNER_ROWS = 5510
+
+
+def _scan(rel_id: str, table: str) -> dict[str, object]:
+    return {
+        "id": rel_id,
+        "relOp": "org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan",
+        "table": ["default", table],
+        "inputs": [],
+    }
+
+
+def _project(rel_id: str, source: str, fields: list[str]) -> dict[str, object]:
+    return {
+        "id": rel_id,
+        "relOp": "org.apache.calcite.rel.logical.LogicalProject",
+        "inputs": [source],
+        "fields": fields,
+        "exprs": [{"input": index} for index in range(len(fields))],
+    }
+
+
+def _equals(first: int, second: int) -> dict[str, object]:
+    return {
+        "op": {"name": "=", "kind": "EQUALS"},
+        "operands": [{"input": first}, {"input": second}],
+    }
+
+
+def _join(
+    rel_id: str, inputs: list[str], condition: dict[str, object] | None
+) -> dict[str, object]:
+    rel: dict[str, object] = {
+        "id": rel_id,
+        "relOp": "org.apache.calcite.rel.logical.LogicalJoin",
+        "inputs": inputs,
+        "joinType": "inner",
+    }
+    if condition is not None:
+        rel["condition"] = condition
+    return rel
+
+
+def _join_beside_a_chain(
+    left_input: str, condition: dict[str, object] | None
+) -> str:
+    """A ⨯ B under an outer join with C, the outer left input chosen by id.
+
+    `left_input` is "5" for the project over the inner join — a straight
+    left column list over rows that are not one table's — or "4" for the
+    inner join node itself, which carries no fields at all.
+    """
+    rels = [
+        _scan("0", "a"),
+        _project("1", "0", ["k"]),
+        _scan("2", "b"),
+        _project("3", "2", ["x"]),
+        _join("4", ["1", "3"], None),
+        _project("5", "4", ["k", "x"]),
+        _scan("6", "c"),
+        _project("7", "6", ["k"]),
+        _join("8", [left_input, "7"], condition),
+    ]
+    return json.dumps({"rels": rels})
+
+
+def test_a_side_that_is_a_join_is_no_evidence_but_does_not_silence_the_other() -> None:
+    """A's key cannot cover: the outer join's left side is a join, not A."""
+    plan = _join_beside_a_chain("5", _equals(0, 2))
+    no_evidence = INNER_ROWS * 7 + INNER_ROWS + 7
+    assert max_intermediate_rows(plan, ABC_LEAVES) == no_evidence
+    a_keys = {"default.a": frozenset({frozenset({"k"})})}
+    assert max_intermediate_rows(plan, ABC_LEAVES, a_keys) == no_evidence
+
+
+def test_a_keyed_table_beside_a_join_still_bounds_that_join() -> None:
+    """C's side is a straight chain: its key bounds the outer join."""
+    plan = _join_beside_a_chain("5", _equals(0, 2))
+    c_keys = {"default.c": frozenset({frozenset({"k"})})}
+    assert (
+        max_intermediate_rows(plan, ABC_LEAVES, c_keys) == INNER_ROWS + INNER_ROWS + 7
+    )
+
+
+def test_a_left_side_without_fields_resolves_no_pairs() -> None:
+    """A bare join at the top of the left side gives no split to number by."""
+    plan = _join_beside_a_chain("4", _equals(0, 2))
+    c_keys = {"default.c": frozenset({frozenset({"k"})})}
+    unbounded = max_intermediate_rows(plan, ABC_LEAVES)
+    assert unbounded == INNER_ROWS * 7 + INNER_ROWS + 7
+    assert max_intermediate_rows(plan, ABC_LEAVES, c_keys) == unbounded
+
+
+def test_an_operand_index_past_the_last_field_resolves_no_pairs() -> None:
+    """Three fields in all, so global index 3 is nobody's column."""
+    plan = _join_beside_a_chain("5", _equals(0, 3))
+    c_keys = {"default.c": frozenset({frozenset({"k"})})}
+    unbounded = max_intermediate_rows(plan, ABC_LEAVES)
+    assert max_intermediate_rows(plan, ABC_LEAVES, c_keys) == unbounded
