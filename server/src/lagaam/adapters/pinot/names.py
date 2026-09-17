@@ -62,7 +62,11 @@ def two_part_sql(sql: str, catalog: str = "pinot") -> str:
 
 
 def referenced_tables(sql: str, catalog: str = "pinot") -> list[tuple[str, str]] | None:
-    """Every (database, table) this SQL reads, deduplicated and sorted.
+    """Every (database, table) this SQL reads, folded case-insensitively and sorted.
+
+    Folding keeps the first spelling encountered: the controller listing and
+    core's scan-count keys are already case-folded, so two spellings of the
+    same table must count as one entry, not two.
 
     None means the SQL did not re-parse, which charges the whole table rather
     than quoting a query nobody read.
@@ -71,7 +75,7 @@ def referenced_tables(sql: str, catalog: str = "pinot") -> list[tuple[str, str]]
         tree = sqlglot.parse_one(sql, dialect=_DIALECT)
     except (sqlglot.errors.SqlglotError, RecursionError):
         return None
-    found: set[tuple[str, str]] = set()
+    found: dict[tuple[str, str], tuple[str, str]] = {}
     for table in tree.find_all(exp.Table):
         if not table.name:
             continue
@@ -83,8 +87,9 @@ def referenced_tables(sql: str, catalog: str = "pinot") -> list[tuple[str, str]]
         # A bare name is a CTE the allowlist already vouched for, not a table.
         if not table.db:
             continue
-        found.add((table.db, table.name))
-    return sorted(found)
+        key = (table.db.lower(), table.name.lower())
+        found.setdefault(key, (table.db, table.name))
+    return sorted(found.values(), key=lambda pair: (pair[0].lower(), pair[1].lower()))
 
 
 def has_offset(sql: str) -> bool:

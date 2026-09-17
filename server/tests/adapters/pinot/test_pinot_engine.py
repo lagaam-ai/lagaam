@@ -985,6 +985,21 @@ async def test_a_quotation_lists_the_tables_once_however_many_it_reads() -> None
     assert listings == 1
 
 
+async def test_a_mixed_case_self_join_is_charged_the_same_as_the_canonical_spelling() -> None:
+    engine = PinotEngine(transport=httpx.MockTransport(_selfjoin_routes))
+    mixed = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.AIRLINESTATS b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert mixed.row_estimate == canonical.row_estimate
+    assert mixed.scanned_bytes == canonical.scanned_bytes
+    assert mixed.max_intermediate_rows == canonical.max_intermediate_rows
+
+
 async def test_a_table_the_controller_does_not_list_is_not_found() -> None:
     def routes(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/tables":

@@ -146,6 +146,16 @@ def test_referenced_tables_deduplicate_and_sort() -> None:
     ) == [("default", "airlineStats"), ("default", "baseballStats")]
 
 
+def test_referenced_tables_fold_case_into_one_entry() -> None:
+    assert referenced_tables(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.AIRLINESTATS b ON a.Carrier = b.Carrier LIMIT 1"
+    ) == [("default", "airlineStats")]
+    assert referenced_tables(
+        "SELECT a.x FROM pinot.Default.t a JOIN pinot.default.T b ON a.x = b.x LIMIT 1"
+    ) == [("Default", "t")]
+
+
 def test_referenced_tables_refuse_a_foreign_catalog() -> None:
     with pytest.raises(TableNotFoundError):
         referenced_tables("SELECT x FROM other.default.t LIMIT 1")

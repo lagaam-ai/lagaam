@@ -451,6 +451,24 @@ async def test_a_self_join_quote_is_never_under_what_execution_scanned(
     assert estimate.max_intermediate_rows == 9746 * 9746 + 2 * 9746
 
 
+async def test_a_mixed_case_self_join_quotes_as_the_canonical_spelling(
+    pinot_ready: None,
+) -> None:
+    engine = _engine()
+    mixed = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.AIRLINESTATS b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT a.Carrier FROM pinot.default.airlineStats a "
+        "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
+    )
+    assert mixed.row_estimate == canonical.row_estimate
+    assert mixed.scanned_bytes == canonical.scanned_bytes
+    assert mixed.max_intermediate_rows == canonical.max_intermediate_rows
+    assert mixed.row_estimate == 2 * 9746
+
+
 async def test_an_offset_is_quoted_above_what_it_really_scans(
     pinot_ready: None,
 ) -> None:
