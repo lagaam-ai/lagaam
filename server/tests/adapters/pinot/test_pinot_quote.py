@@ -340,3 +340,18 @@ def test_one_unpriceable_table_costs_the_whole_byte_quote() -> None:
 
 def test_quote_with_no_tables_is_low_confidence() -> None:
     assert quote([], frozenset(), None).confidence == "low"
+
+
+def test_a_consuming_byte_bound_needs_every_sealed_segments_doc_count() -> None:
+    """The ratio is taken over the segments whose docs are known, so a sealed
+    segment with no doc count silently leaves itself out of the worst case —
+    a segment that could be the densest on the table. The row path denies on
+    the same segment today, but the byte bound has to stand on its own."""
+    table = facts(
+        seg("counted", 1000, 1000),
+        seg("uncounted", None, 5000),
+        types=frozenset({"REALTIME"}),
+        consuming=1,
+        flush_rows=5,
+    )
+    assert surviving_bytes(table, None, None) is None

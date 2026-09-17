@@ -159,10 +159,17 @@ def _consuming_bytes(facts: TableFacts, sizes: list[int | None]) -> int | None:
     `sizes` is per segment in facts.segments order and carries the same
     per-segment column-or-whole choice the sealed charge made, so the ratio
     is taken over exactly the bytes being charged.
+
+    A sealed segment with no doc count takes the whole bound down rather
+    than dropping out of the maximum: the segment nobody counted could be
+    the densest one, and the ratio would then bound nothing.
     """
     if facts.consuming <= 0:
         return 0
     if facts.flush_rows is None:
+        return None
+    if any(segment.docs is None for segment in facts.segments):
+        # A segment left out of the ratio could be the densest on the table.
         return None
     bounds = [
         (facts.flush_rows * size + segment.docs - 1) // segment.docs
