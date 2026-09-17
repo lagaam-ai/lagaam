@@ -151,3 +151,28 @@ def surviving_segments(
             continue
         pruned = max(pruned, value)
     return max(1, queried - min(pruned, queried))
+
+
+def consuming_segments_queried(explain_json: Any) -> int:
+    """How many of the queried segments were CONSUMING, from the same EXPLAIN.
+
+    numSegmentsQueried includes consuming segments, so this is what has to be
+    subtracted before the k-largest charge is applied to the sealed ones.
+
+    Unreadable is 0 rather than None, deliberately: 0 leaves the sealed k
+    larger and charges more segments, and the consuming segments themselves
+    are charged unconditionally elsewhere — measured against the live
+    instance, this counter stayed 1 both with no filter (26 segments queried,
+    25 pruned ByServer, 24 ByLimit) and under a filter excluding every value
+    (1 segment queried, the other 25 broker-pruned), so no predicate may ever
+    reduce it.
+    """
+    if not isinstance(explain_json, dict) or explain_json.get("exceptions"):
+        return 0
+    scanned = explain_json.get("numDocsScanned")
+    if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned != 0:
+        return 0
+    consuming = explain_json.get("numConsumingSegmentsQueried")
+    if isinstance(consuming, bool) or not isinstance(consuming, int):
+        return 0
+    return max(0, consuming)

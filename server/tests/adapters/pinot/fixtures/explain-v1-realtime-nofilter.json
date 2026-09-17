@@ -1,0 +1,106 @@
+{
+    "resultTable": {
+        "dataSchema": {
+            "columnNames": [
+                "Operator",
+                "Operator_Id",
+                "Parent_Id"
+            ],
+            "columnDataTypes": [
+                "STRING",
+                "INT",
+                "INT"
+            ]
+        },
+        "rows": [
+            [
+                "BROKER_REDUCE(limit:10)",
+                1,
+                0
+            ],
+            [
+                "COMBINE_SELECT",
+                2,
+                1
+            ],
+            [
+                "PLAN_START(numSegmentsForThisPlan:1)",
+                -1,
+                -1
+            ],
+            [
+                "SELECT(selectList:Carrier)",
+                3,
+                2
+            ],
+            [
+                "PROJECT(Carrier)",
+                4,
+                3
+            ],
+            [
+                "DOC_ID_SET",
+                5,
+                4
+            ],
+            [
+                "FILTER_MATCH_ENTIRE_SEGMENT(docs:100)",
+                6,
+                5
+            ]
+        ]
+    },
+    "numRowsResultSet": 7,
+    "partialResult": false,
+    "exceptions": [],
+    "numGroupsLimitReached": false,
+    "numGroupsWarningLimitReached": false,
+    "timeUsedMs": 7,
+    "requestId": "900059261000000032",
+    "clientRequestId": null,
+    "brokerId": "Broker_172.19.0.3_8000",
+    "numDocsScanned": 0,
+    "totalDocs": 2500,
+    "numEntriesScannedInFilter": 0,
+    "numEntriesScannedPostFilter": 0,
+    "numServersQueried": 1,
+    "numServersResponded": 1,
+    "numSegmentsQueried": 26,
+    "numSegmentsProcessed": 0,
+    "numSegmentsMatched": 0,
+    "numConsumingSegmentsQueried": 1,
+    "numConsumingSegmentsProcessed": 0,
+    "numConsumingSegmentsMatched": 0,
+    "minConsumingFreshnessTimeMs": 1789657306860,
+    "numSegmentsPrunedByBroker": 0,
+    "numSegmentsPrunedByServer": 25,
+    "numSegmentsPrunedInvalid": 0,
+    "numSegmentsPrunedByLimit": 24,
+    "numSegmentsPrunedByValue": 0,
+    "brokerReduceTimeMs": 0,
+    "offlineThreadCpuTimeNs": 0,
+    "realtimeThreadCpuTimeNs": 0,
+    "offlineSystemActivitiesCpuTimeNs": 0,
+    "realtimeSystemActivitiesCpuTimeNs": 0,
+    "offlineResponseSerializationCpuTimeNs": 0,
+    "realtimeResponseSerializationCpuTimeNs": 24250,
+    "offlineTotalCpuTimeNs": 0,
+    "realtimeTotalCpuTimeNs": 24250,
+    "explainPlanNumEmptyFilterSegments": 0,
+    "explainPlanNumMatchAllFilterSegments": 1,
+    "traceInfo": {},
+    "tablesQueried": [
+        "airlineStats"
+    ],
+    "offlineThreadMemAllocatedBytes": 0,
+    "realtimeThreadMemAllocatedBytes": 0,
+    "offlineResponseSerMemAllocatedBytes": 0,
+    "realtimeResponseSerMemAllocatedBytes": 0,
+    "offlineTotalMemAllocatedBytes": 0,
+    "realtimeTotalMemAllocatedBytes": 0,
+    "pools": [
+        -1
+    ],
+    "rlsFiltersApplied": false,
+    "groupsTrimmed": false
+}

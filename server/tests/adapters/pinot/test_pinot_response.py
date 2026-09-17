@@ -15,6 +15,7 @@ import pytest
 from lagaam.adapters.pinot.response import (
     ENGINE_FAULT,
     INCOMPLETE_RESULT,
+    consuming_segments_queried,
     parse_query_result,
     result_failure,
     surviving_segments,
@@ -277,3 +278,41 @@ def test_an_explain_carrying_an_exception_is_no_oracle() -> None:
 )
 def test_surviving_segments_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
     assert surviving_segments(body) is None
+
+
+def test_the_consuming_counter_is_read_from_the_same_explain_body() -> None:
+    """Fixture (live, 26 queried / 25 ByServer / 24 ByLimit): consuming stays 1."""
+    assert consuming_segments_queried(load("explain-v1-realtime-nofilter.json")) == 1
+    assert surviving_segments(load("explain-v1-realtime-nofilter.json")) == 1
+
+
+def test_a_filter_excluding_every_value_cannot_prune_the_consuming_segment() -> None:
+    """Measured: every sealed segment was broker-pruned and the consuming counter stayed 1."""
+    body = load("explain-v1-realtime-futuretime.json")
+    assert consuming_segments_queried(body) == 1
+    assert body["numSegmentsQueried"] == 1
+
+
+def test_an_offline_explain_reports_no_consuming_segments() -> None:
+    """The shipped OFFLINE fixtures are untouched by this counter."""
+    assert consuming_segments_queried(load("explain-v1-timefilter.json")) == 0
+    assert consuming_segments_queried(load("explain-v1-nofilter.json")) == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {},
+        [],
+        "junk",
+        {"numConsumingSegmentsQueried": "1", "numDocsScanned": 0},
+        {"numConsumingSegmentsQueried": -1, "numDocsScanned": 0},
+        {"numConsumingSegmentsQueried": True, "numDocsScanned": 0},
+        {"numConsumingSegmentsQueried": 1, "exceptions": [{"errorCode": 150}]},
+        {"numConsumingSegmentsQueried": 1, "numDocsScanned": 5},
+    ],
+)
+def test_an_unreadable_consuming_counter_is_zero(body: Any) -> None:
+    """Zero leaves the sealed k larger, which charges more segments."""
+    assert consuming_segments_queried(body) == 0
