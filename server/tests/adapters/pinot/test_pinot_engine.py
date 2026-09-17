@@ -1044,6 +1044,34 @@ async def test_without_an_offset_the_limit_prune_is_still_the_oracle() -> None:
     assert estimate.row_estimate < 9746
 
 
+async def test_a_statement_with_no_limit_does_not_get_to_keep_the_prune() -> None:
+    """Ruling 8.1. The single-stage EXPLAIN plans a LIMIT-less statement under
+    Pinot's implicit default LIMIT 10 and reports numSegmentsPrunedByLimit for
+    it; the multi-stage engine that runs the query has no such default and
+    scans everything. Measured live: this shape quoted 422 against 9,746 docs
+    scanned at high confidence. The port must not depend on its caller having
+    injected a bound, so with no LIMIT every segment is charged."""
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats"
+    )
+    assert estimate.row_estimate == 9746
+    bounded = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert bounded.row_estimate == 422
+
+
+async def test_a_fetch_first_bound_keeps_the_prune() -> None:
+    """validate_query leaves FETCH FIRST n ROWS ONLY spelled as a FETCH, and
+    it reaches the broker that way: a real bound, so the prune stands."""
+    engine = PinotEngine(transport=httpx.MockTransport(_limitpruned_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats FETCH FIRST 10 ROWS ONLY"
+    )
+    assert estimate.row_estimate == 422
+
+
 async def test_an_unpriceable_shape_is_refused_before_any_request() -> None:
     def routes(request: httpx.Request) -> httpx.Response:
         raise AssertionError(f"no request should be made, got {request.url}")
@@ -1262,6 +1290,19 @@ async def test_a_realtime_table_is_quoted_with_its_consuming_segment_charged() -
     )
     assert estimate.row_estimate == 100 + 100
     assert estimate.scanned_bytes == 114 + 114
+    assert estimate.confidence == "high"
+
+
+async def test_a_realtime_statement_with_no_limit_is_charged_in_full() -> None:
+    """The same ruling on the realtime shape: with no LIMIT the prune is not
+    read, so 26 queried less 1 consuming leaves every sealed segment charged,
+    exactly as the OFFSET case below."""
+    engine = PinotEngine(transport=httpx.MockTransport(_realtime_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats"
+    )
+    assert estimate.row_estimate == 6 * 100 + 100
+    assert estimate.scanned_bytes == 548 + 114
     assert estimate.confidence == "high"
 
 

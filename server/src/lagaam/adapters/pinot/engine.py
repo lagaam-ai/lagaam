@@ -31,6 +31,7 @@ from lagaam.adapters.pinot.metadata import (
     upsert_config_present,
 )
 from lagaam.adapters.pinot.names import (
+    has_limit,
     has_offset,
     referenced_columns,
     referenced_tables,
@@ -378,8 +379,13 @@ class PinotEngine:
             # A quotation nobody could build is a denial at the gate, which
             # is the safe answer; an EngineError would read as an outage.
             return CostEstimate(confidence="low")
+        # The planner prices a limit the execution may not have: an OFFSET it
+        # ignores, and a missing LIMIT it supplies itself. Either way the
+        # prune describes a query that will never run (ruling 8.1).
         surviving = await self._surviving(
-            two_part, len(tables), trust_limit_prune=not has_offset(sql)
+            two_part,
+            len(tables),
+            trust_limit_prune=has_limit(sql) and not has_offset(sql),
         )
         located = [(database, fact, surviving) for database, fact in facts]
         widest = await self._widest_rows(two_part, located, keycols)

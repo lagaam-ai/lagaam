@@ -870,22 +870,16 @@ async def test_realtime_the_upsert_pk_is_the_schema_s_primary_key(
     assert keys < versions
 
 
-@pytest.mark.xfail(
-    reason="live defect: a statement with no LIMIT is EXPLAINed under Pinot's "
-    "implicit default LIMIT 10, so numSegmentsPrunedByLimit describes a query "
-    "that will never run and the quote under-bounds the real multi-stage scan",
-    strict=True,
-)
 async def test_realtime_a_bare_select_bounds_its_own_execution(
     pinot_realtime_ready: None,
 ) -> None:
-    """The soundness rule, on the one shape that breaks it.
+    """The soundness rule, on the shape that used to break it (ruling 8.1).
 
-    `trust_limit_prune` is switched off for OFFSET but not for a statement
-    with no LIMIT at all. Measured on this instance: the pruning EXPLAIN of
-    the bare select reports numSegmentsPrunedByLimit 5 of 7 queried, so k=1
-    and the quote is one sealed segment plus the consuming charge, while
+    The pruning EXPLAIN of a bare select reports numSegmentsPrunedByLimit 5
+    of 7 queried — Pinot planned it under its own implicit LIMIT 10 — while
     executing the same SQL on the multi-stage engine scans the whole table.
+    `trust_limit_prune` now requires an explicit LIMIT, so the prune is not
+    read and every sealed segment is charged.
     """
     engine = _realtime_engine()
     sql = "SELECT Carrier FROM pinot.default.airlineStats"
@@ -893,3 +887,21 @@ async def test_realtime_a_bare_select_bounds_its_own_execution(
     assert estimate.confidence == "high"
     assert estimate.row_estimate is not None
     assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+
+async def test_a_bare_select_bounds_its_own_execution_on_the_batch_instance(
+    pinot_ready: None,
+) -> None:
+    """The same shape on the OFFLINE quickstart, where the under-quote was
+    worst: 422 against 9,746 docs scanned, a 23x breach at high confidence."""
+    engine = _engine()
+    sql = "SELECT Carrier FROM pinot.default.airlineStats"
+    estimate = await engine.estimate_cost(sql)
+    body = await engine._client.broker_query(
+        two_part_sql(sql, PinotEngine.CATALOG), "useMultistageEngine=true"
+    )
+    scanned = body["numDocsScanned"]
+    assert scanned >= 9746
+    assert estimate.confidence == "high"
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate >= scanned

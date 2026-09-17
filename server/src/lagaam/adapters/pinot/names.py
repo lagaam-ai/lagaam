@@ -105,6 +105,48 @@ def has_offset(sql: str) -> bool:
     return any(True for _ in tree.find_all(exp.Offset))
 
 
+def has_limit(sql: str) -> bool:
+    """Does the outermost query carry an explicit integer row bound?
+
+    The single-stage EXPLAIN plans a statement with no LIMIT under Pinot's
+    own implicit default (`BROKER_REDUCE(limit:10)` appears in the plan) and
+    reports `numSegmentsPrunedByLimit` for it, but the multi-stage engine
+    that runs the query has no such default and scans everything. Measured:
+    a bare `SELECT Carrier FROM airlineStats` quoted 200 against 600 docs
+    scanned on the realtime instance and 422 against 9,746 on the batch one,
+    both at high confidence. So the prune may only be believed when the
+    statement itself carries the bound.
+
+    `validate_query` injects a LIMIT before the port is ever called, but the
+    port must not depend on its caller for a bound.
+
+    `FETCH FIRST n ROWS ONLY` counts: sqlglot parses it as `exp.Fetch`
+    rather than `exp.Limit`, and `validate_query` leaves it spelled that
+    way, so it reaches the broker as a FETCH and bounds the execution just
+    as a LIMIT does. Both spellings park the node on the outermost query's
+    own `limit` argument, which is why a subquery's LIMIT — no bound on the
+    rows the outer query walks — does not answer True.
+
+    False is the safe answer: a statement nobody could re-parse, or a bound
+    nobody can read as an integer (`LIMIT ALL`), charges every segment.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, dialect=_DIALECT)
+    except (sqlglot.errors.SqlglotError, RecursionError):
+        return False
+    if not isinstance(tree, exp.Query):
+        return False
+    bound = tree.args.get("limit")
+    # Fetch keeps its count under a different key than Limit's expression.
+    if isinstance(bound, exp.Fetch):
+        rows = bound.args.get("count")
+    elif isinstance(bound, exp.Limit):
+        rows = bound.args.get("expression")
+    else:
+        return False
+    return isinstance(rows, exp.Literal) and not rows.is_string and rows.is_int
+
+
 def referenced_columns(sql: str) -> frozenset[str] | None:
     """Lowercase bare names of every column this SQL mentions.
 

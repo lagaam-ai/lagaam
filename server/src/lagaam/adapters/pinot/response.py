@@ -124,11 +124,15 @@ def surviving_segments(
     again would under-count survivors. Leaving a counter unread can only
     charge more segments, never fewer, which is the fail-safe side.
 
-    `trust_limit_prune` is False when the statement carries an OFFSET, which
-    the planner prices as though it were absent: measured, `LIMIT 10 OFFSET
+    `trust_limit_prune` is False whenever the limit the planner priced is not
+    the one the execution will honour. Two shapes: an OFFSET, which the
+    planner prices as though it were absent — measured, `LIMIT 10 OFFSET
     9000` reports the same 30-of-31 limit prune as the bare `LIMIT 10` and
-    then walks 9,117 docs over 29 segments. The caller decides, because only
-    it has the SQL; this module sees a broker answer and nothing else.
+    then walks 9,117 docs over 29 segments — and a statement with no LIMIT at
+    all, which is EXPLAINed under Pinot's own implicit default while the
+    multi-stage engine that runs it scans every segment. The caller decides,
+    because only it has the SQL; this module sees a broker answer and nothing
+    else.
 
     None means "no oracle" — the caller then charges every segment.
     """

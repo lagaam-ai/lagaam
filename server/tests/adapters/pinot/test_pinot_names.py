@@ -8,6 +8,7 @@ SQL that has already been validated and allowlisted.
 import pytest
 
 from lagaam.adapters.pinot.names import (
+    has_limit,
     referenced_columns,
     referenced_tables,
     two_part_sql,
@@ -188,3 +189,47 @@ def test_a_count_star_is_not_an_unresolvable_column() -> None:
 
 def test_referenced_columns_are_none_when_the_sql_cannot_be_read() -> None:
     assert referenced_columns("SELECT FROM WHERE ((((") is None
+
+
+def test_an_explicit_limit_is_a_limit() -> None:
+    assert has_limit("SELECT Carrier FROM pinot.default.airlineStats LIMIT 10")
+
+
+def test_no_limit_at_all_is_not_a_limit() -> None:
+    """The defect this guards: EXPLAIN plans this under an implicit LIMIT 10
+    the multi-stage engine that runs it does not have."""
+    assert not has_limit("SELECT Carrier FROM pinot.default.airlineStats")
+
+
+def test_a_limit_with_an_offset_still_carries_its_limit() -> None:
+    """has_limit answers only about the LIMIT; the OFFSET is has_offset's
+    business, and the caller requires both answers."""
+    assert has_limit(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10 OFFSET 5"
+    )
+
+
+def test_fetch_first_rows_only_is_a_limit() -> None:
+    """validate_query leaves FETCH FIRST n ROWS ONLY as an exp.Fetch, not an
+    exp.Limit, and it reaches the broker spelled that way — it is still a
+    bound the planner and the execution both honour."""
+    assert has_limit(
+        "SELECT Carrier FROM pinot.default.airlineStats FETCH FIRST 10 ROWS ONLY"
+    )
+
+
+def test_a_limit_that_is_not_an_integer_count_is_not_a_limit() -> None:
+    """LIMIT ALL parses as a Limit whose expression is a column named ALL:
+    a bound nobody can compare is no bound."""
+    assert not has_limit("SELECT Carrier FROM pinot.default.airlineStats LIMIT ALL")
+
+
+def test_a_subquery_limit_does_not_bound_the_outer_query() -> None:
+    assert not has_limit(
+        "SELECT x FROM (SELECT x FROM pinot.default.t LIMIT 5) sub"
+    )
+
+
+def test_an_unreadable_statement_has_no_limit() -> None:
+    """Fail-safe: no trusted prune, so every segment is charged."""
+    assert not has_limit("SELECT FROM WHERE ((((")
