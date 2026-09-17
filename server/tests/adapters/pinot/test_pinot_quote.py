@@ -315,15 +315,22 @@ def test_a_hybrid_table_is_charged_as_one_segment_set() -> None:
         **load("seg-metadata-airlineStats-columns.json"),
         **load("seg-metadata-airlineStats-realtime-columns.json"),
     }
+    # A hybrid table's config carries both halves, and the fixtures hold one
+    # half each: a REALTIME-only config would have made this a realtime table
+    # with an offline table's segments, which is not the shape under test.
+    merged_config = {
+        "OFFLINE": load("tableconfig-airlineStats.json")["OFFLINE"],
+        "REALTIME": load("tableconfig-airlineStats-realtime.json")["REALTIME"],
+    }
     table = table_facts(
         "airlineStats",
-        load("tableconfig-airlineStats-realtime.json"),
+        merged_config,
         merged_metadata,
         merged,
         frozenset({"carrier", "dayssinceepoch"}),
         externalview_json=load("externalview-airlineStats-realtime.json"),
     )
-    assert table.types == frozenset({"REALTIME"})
+    assert table.types == frozenset({"OFFLINE", "REALTIME"})
     assert len(table.segments) == 31 + 6
     assert table.consuming == 1
     assert surviving_docs(table, None) == 9746 + 600 + 100
