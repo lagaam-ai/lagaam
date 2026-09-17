@@ -38,12 +38,16 @@ The pruned counters nest rather than add: measured, a time filter reports
 `numSegmentsPrunedByServer: 28` and `numSegmentsPrunedByValue: 28` of 31
 segments at once, so the surviving count is queried minus the *largest*
 counter, floored at 1. Only `ByServer`, `ByValue` and `ByLimit` are read —
-the three measured to nest on 1.5.1. `ByBroker` and `Invalid` are not:
-neither was observed non-zero and neither is known to be a breakdown of
-`numSegmentsQueried` (a broker that reports `numSegmentsQueried` already
-net of its own pruning would be under-counted by subtracting `ByBroker`
-again). A counter left unread can only leave more segments charged, never
-fewer.
+the three measured to nest on 1.5.1. `ByBroker` and `Invalid` are not, and
+`ByBroker`'s reason is now measured rather than assumed: on a REALTIME
+table with `routing.segmentPrunerTypes: ["time"]` it reaches 3 and 6 of 7
+segments and is the only non-zero pruning counter in those rows — but
+`numSegmentsQueried` there is already **net of** it (4 = 7−3, 1 = 7−6), so
+it is not a breakdown of that number but a deduction already applied to it,
+and subtracting it again would under-charge. `Invalid` was never observed
+non-zero. Not reading either stays correct, on the stronger ground
+(ADR 0009). A counter left unread can only leave more segments charged,
+never fewer.
 
 Column attribution is decided per segment, not per table: a segment in
 which none of the query's columns are found is charged its whole size, and
@@ -85,9 +89,10 @@ denies exactly as it denies any other unbounded number.
 A star-tree-answered aggregation reads a pre-aggregated tree and is
 over-charged by a doc-count quote. A table under row-level security is
 over-charged because the agent sees a filtered subset. A broker-pruned
-partitioned table is over-charged too, until `numSegmentsPrunedByBroker`
-is measured against a table that actually trips it and re-added with a
-fixture. All three are denials an operator can raise a budget for, never
+table is over-charged too, permanently and intentionally:
+`numSegmentsPrunedByBroker` has now been measured on a table that trips it,
+and `numSegmentsQueried` is already net of it, so there is nothing left to
+subtract. All three are denials an operator can raise a budget for, never
 admissions.
 
 A join of two real-sized tables is denied under the default budget until
@@ -96,6 +101,7 @@ docs, or an upsert table's primary key, both U12 or later. That is a denial
 an operator can raise a budget for, and Pinot's own `maxRowsInJoin` backstop
 remains as the second line. An admitted join was never bounded by us anyway.
 
-A REALTIME half is quoted `"low"` until U12 charges consuming segments at
-the stream's flush threshold: a consuming segment reports 0 docs and -1
-bytes, and charging those as written would quote it free.
+A REALTIME half was quoted `"low"` here; ADR 0009 replaces that with the
+flush-threshold charge, and supersedes the "until key evidence exists"
+clause above with the two catalog sources that now exist — each one proved
+by scan ordinal rather than by column name.

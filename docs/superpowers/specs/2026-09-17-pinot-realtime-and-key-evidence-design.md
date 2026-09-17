@@ -79,7 +79,11 @@ conflict that cannot occur; it exists to pick a location, not a winner.
 **Sealed realtime segments are priced exactly like OFFLINE ones.** Their
 metadata is complete and shape-identical — `totalDocs`, `startTimeMillis`,
 `endTimeMillis`, and a `columns[]` carrying `indexSizeMap` (rule 1, log
-§1.3). `segment_facts` already parses them correctly.
+§1.3). `segment_facts` already parses them correctly. Exactly one of the
+seven captured entries — the consuming segment — lacks `columns`; the
+other six carry it. `_segment_sizes` likewise already merged both
+`offlineSegments` and `realtimeSegments` before this unit, so sealed
+realtime bytes needed no new reader.
 
 **The consuming segment's own metadata entry is dropped from the sealed
 set.** Today `segment_facts` turns it into a `SegmentFact(docs=0,
@@ -117,6 +121,22 @@ logic. Measured, `numConsumingSegmentsQueried` stayed 1 under both
 possible value — while the broker pruned 6 of 7 segments (rule 8). A time
 predicate can never remove a consuming segment's cost, so the oracle must
 never be allowed to prune it away.
+
+**The limit prune is trusted only under an explicit outermost LIMIT and no
+OFFSET.** `numSegmentsPrunedByLimit` is computed by the single-stage
+EXPLAIN under Pinot's *own* implicit `LIMIT 10` when the statement carries
+none, while the multi-stage engine that runs the query scans everything:
+measured, a LIMIT-less select quoted 200 against 600 rows scanned on the
+realtime table and 422 against 9,746 on the batch one — a 23x breach at
+`confidence="high"`. `names.has_offset` gains a sibling `has_limit`, and
+`trust_limit_prune = has_limit(sql) and not has_offset(sql)`. Where the
+prune is not believed, both `ByLimit` and `ByServer` are ignored —
+`ByServer` is the server-side total `ByLimit` breaks down (measured, 30 and
+30 of 31 together), so crediting it would reinstate the prune being
+distrusted — leaving `ByValue` alone. In production
+`validate_query` always injects a LIMIT before the port is called, so the
+pipeline was never exposed — but a port must not depend on its caller for
+a bound.
 
 **`flush_rows` is `None` while `consuming > 0` → rows are `None` → the
 quote is low.** There is no fallback: rule 7 is that a consuming segment
@@ -162,7 +182,11 @@ candidate segment, so no float rounding can shave a byte off the bound.
 
 **No sealed segment with `docs > 0` → bytes are `None` → the quote is
 low.** A table that is all-consuming has no ratio to take, and inventing one
-would be a guess.
+would be a guess. **So does any sealed segment whose doc count is missing
+while `consuming > 0`**: a segment left out of the maximum could be the
+densest on the table, and the ratio would then bound nothing. Today the row
+path denies on the same segment, but the byte bound has to be defensible on
+its own.
 
 **`quote.quote`'s blanket REALTIME guard goes.** The shipped line — `None if
 realtime else …`, which withholds `scanned_bytes` the moment any table has a
@@ -233,6 +257,16 @@ partition 1's two, then partition 0's again. The captured
 0, against four in `02-upsert-size.json` and `numSegments: 4` in the table
 metadata.
 
+**A table whose segments span servers is therefore denied**, and the fix is
+not to relax the check but to remove the cause: the `pinot-realtime`
+profile's tables use a single-partition topic and a single replica group,
+so each lives on one server and its metadata response is complete. The
+STREAM quickstart runs four servers, and a two-partition topic put the
+upsert pair's segments on two of them — both tables denied, correctly, and
+the join demo unobservable until they were pinned. Fetching each segment's
+metadata individually is what would lift the denial for a genuinely
+multi-server table, and that is U13.
+
 **This fixes a latent under-quote on the OFFLINE path too**, and that is the
 more important half of this decision. The shipped `surviving_docs` sums
 `totalDocs` over whatever segments it was handed and returns a confident
@@ -275,9 +309,54 @@ names, and knowing which column sets are unique.
   expression and yields nothing** (rule 17: `upper(a.Carrier)` became
   `$f85` with an `op` of `UPPER`). Both markers are checked; either one
   disqualifies the operand.
-- Each surviving equality contributes an ordered pair (left column name,
-  right column name), lowercased. Names that cannot be resolved by index —
-  index out of range, a missing `fields` list — contribute nothing.
+- Each surviving equality contributes an ordered pair of **scan ordinals**,
+  one per side. Ordinals that cannot be resolved — index out of range, a
+  missing `fields` list, a non-bare `exprs` entry — contribute nothing.
+
+**A projected name proves nothing; only the ordinal does.** This is the
+correction the implementation forced. A `LogicalProject`'s field names are
+whatever the SQL called the columns, so `SELECT Origin AS Carrier` projects
+a field named `Carrier` reading ordinal 62 while the real `Carrier` is 18 —
+indistinguishable by name, and with the `Carrier` key it quoted 205,524
+against a true 954,133,829 (live capture). Nor is the ordinal the schema
+position: `Carrier` is ordinal 18 and schema column 14 of 81, and
+`baseballStats`' `teamID` is ordinal 26 on a 25-column schema, so no static
+mapping exists.
+
+So the engine **learns each keyed table's key-column ordinals from the
+engine itself**, with one extra multi-stage EXPLAIN per keyed table:
+`EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT <key columns>
+FROM db.t`, parsed by a pure `plan.key_ordinals(plan_json) -> dict[str,
+int] | None` reading its top project (fields → bare `exprs[i].input`, on a
+straight chain to exactly one scan; anything else `None`). Every identifier
+that EXPLAIN interpolates — database, table and each column — must be a
+bare identifier, and any that is not forfeits that table's evidence.
+`max_intermediate_rows` gains `key_ordinals: Mapping[str, Mapping[str,
+int]] | None`, keyed lowercase table → lowercase column → ordinal.
+
+In the query plan the walker composes each operand's index **down** the
+side's chain — a project maps an index to its bare `exprs[index].input`,
+filters and exchanges pass it through — to the scan ordinal, and the
+operand names key column `c` only when that ordinal equals
+`key_ordinals[table][c]`. The equated column set is built from those
+matches and never from field names. No ordinals for a table → no evidence
+for it. Fail-closed on every doubt: a non-bare expr, a missing or non-list
+`exprs`, a length mismatch, an index out of range. The alias spoof composes
+to 62 ≠ 18 and is refused.
+
+**Evidence is one-sided.** Each side is judged alone. The operand split
+index comes from the **left** side's top node when that node is a
+`LogicalProject` — its `fields` are the join's left column list whatever
+lies beneath — and when the left top node carries no `fields` at all (a
+bare join or exchange at the top), there are no pairs. A side that is not a
+straight chain to exactly one scan has no table and can never be covered,
+but it does not silence the other side: a keyed table joined to a join is
+still evidence about the keyed table's own matches.
+
+**An expression operand likewise silences only its own side.**
+`upper(a.Carrier) = b.teamID`, with `teamID` a proven key on `b`, still
+bounds the join to left + inputs: each left row matches at most one right
+row whatever its expression value.
 
 **Unique-key evidence** (`engine.py` gathers, `plan.py` consumes).
 `max_intermediate_rows` gains a parameter
@@ -320,6 +399,30 @@ one sealed segment and no consuming segment**, any column whose per-segment
 `cardinality` equals that segment's `totalDocs` is a single-column unique
 key.
 
+**The metadata response alone cannot establish "exactly one sealed
+segment"** — it is the document decision 4 documents as truncated on a
+multi-server table, so a 2-segment table would read as single-segment. The
+**size report** is the independent count: source (b) yields nothing unless
+`metadata_is_complete(seg_metadata_json, size_json)` holds, the size report
+names exactly one sealed (non `-1`) segment, and that segment is the one
+sealed metadata entry. Source (b) therefore takes `size_json` as a fourth
+document.
+
+**Any `-1` entry in the size report voids source (b) outright.** A
+consuming segment can be invisible to the metadata response entirely —
+named only by its `-1` size entry, with no body on the metadata side — and
+`metadata_is_complete` does not catch that, since it only requires every
+*sealed* name to be present. Such a segment means the table holds rows the
+one sealed segment does not, so the column is not a table key whatever the
+metadata says.
+
+**A multi-value column is never evidence.** Its `cardinality` counts
+distinct *entries*, not rows, so equality with `totalDocs` proves nothing —
+and `airlineStats` carries nine such columns. A column is excluded when its
+`fieldSpec.singleValueField` is `false`, or its segment entry's
+`totalNumberOfEntries` differs from `totalDocs`, or its
+`maxNumberOfMultiValues` is above 0.
+
 *Measured (rule 14, log §3.1): `cardinality` is exactly
 `count(DISTINCT col)` — 18,107 / 149 / 7 / 67 against the engine, all
 exact.* Equality with `totalDocs` can only hold when every doc carries a
@@ -349,7 +452,8 @@ entries).
 
 - If the **left** side's equalities cover a unique key set of the left
   side's table — i.e. some key set in `unique_keys[left_table]` is a subset
-  of the left column names appearing in the pairs — then each right row
+  of the columns the left ordinals in the pairs resolve to, by ordinal
+  match against `key_ordinals[left_table]` — then each right row
   matches at most one left row, so the join emits at most `right` rows:
   charge **`right + left + right`** (the inputs added on top, for the same
   reason ADR 0008 adds them: an outer join emits unmatched rows above the
@@ -430,16 +534,23 @@ all-consuming table exercises the `None` path rather than the charge.
 
 **E2E demo**, three assertions:
 
-1. A query over rows that landed seconds ago — a filter on the newest time
-   value — is quoted and **runs under the default budget**. Today it is
+1. A query over rows that landed seconds ago is quoted and **runs under the
+   default budget** — 600 rows quoted against 600 scanned. Today it is
    denied.
 2. The upsert-PK self-join `u12upsert a JOIN u12upsert b ON a.pk = b.pk` is
-   **admitted**.
+   **admitted**, quoted 2,400.
 3. The same join on the non-upsert twin `u12plain` is **denied** — same
-   topic, same rows, same shape, no key evidence.
+   topic, same rows, same shape, no key evidence — quoted 641,600 on "rows
+   at its widest step", where the engine builds 100 true pairs.
 
 Assertion 3 is the one that shows the evidence is doing the work and not the
-shape.
+shape, and it **cannot be shown under the default budget**: the twin's
+product on these 800-doc tables is 641,600, far below the 50,000,000
+default, so the default would admit it. The join pair therefore runs under
+an explicit `QueryBudget` with `max_intermediate_rows=10_000` and scan
+bytes and timeout left at their default constants — the row ceiling is the
+only dimension key evidence moves, so it is the only one narrowed.
+Assertion 1 keeps the default budget throughout.
 
 ### 8. ADR 0009, and a correction to ADR 0008
 
@@ -481,39 +592,60 @@ budget gate denies. ADR 0001 holds.
 metadata.py   PURE, +
                 consuming_count(externalview_json, size_json) -> int
                 flush_rows(config_json) -> int | None
-                upsert_keys(config_json, schema_json) -> frozenset[frozenset[str]]
-                single_segment_unique_columns(seg_metadata_json, config_json)
+                upsert_keys(config_json, schema_json, table_metadata_json)
+                                             -> frozenset[frozenset[str]]
+                single_segment_unique_columns(seg_metadata_json, config_json,
+                                              schema_json, size_json)
                                              -> frozenset[frozenset[str]]
                 metadata_is_complete(seg_metadata_json, size_json) -> bool
+                upsert_config_present(config_json) -> bool
               TableFacts gains: consuming, flush_rows, complete, unique_keys
 
 response.py   PURE, + consuming_segments_queried(explain_json) -> int
                 reads numConsumingSegmentsQueried beside the pruning
                 counters it already reads, from the same response;
-                surviving_segments() is unchanged
+                surviving_segments() gains trust_limit_prune
+
+names.py      PURE, + has_limit(sql) -> bool, beside has_offset
 
 quote.py      PURE, + the consuming charge in surviving_docs/surviving_bytes
                 and the bytes-per-doc ratio; the completeness gate in quote()
 
-plan.py       PURE, + operand resolution (join condition -> column-name
-                pairs per side) and the unique_keys parameter on
-                max_intermediate_rows(); the join arithmetic of decision 5
+plan.py       PURE, + operand resolution (join condition -> scan-ordinal
+                pairs per side), the unique_keys and key_ordinals
+                parameters on max_intermediate_rows(), and
+                key_ordinals(plan_json) -> dict[str, int] | None;
+                the join arithmetic of decision 5
 
-engine.py     + two controller documents per table, fetched once each:
-                /tables/{t}/externalview, and /schemas/{schemaName} only
-                when the config shows an upsertConfig; composition of the
-                above; passes unique_keys and leaf_docs into the plan walk
+engine.py     + controller documents per table, fetched once each:
+                /tables/{t}/externalview, and /schemas/{schemaName} and
+                /tables/{t}/metadata for the key evidence (the schema is
+                memoised, so it is read once per table per quotation);
+                one extra keycols EXPLAIN per table with proven keys;
+                composition of the above; passes unique_keys, key_ordinals
+                and leaf_docs into the plan walk
 
 client.py     unchanged
 ```
 
+`upsert_keys` takes three documents rather than two: the PK-count map in
+the table metadata is the second document that has to agree that the table
+is an upsert table. `single_segment_unique_columns` takes four: the schema
+is what the nullability gate reads, and the size report is the independent
+segment count decision 4 showed the metadata response cannot supply.
+
 **Purity is unchanged.** Only `engine.py` and `client.py` touch the network;
 every module above takes parsed JSON and returns domain values, and is unit
-tested against the spike's captures. The two new fetches are per table per
+tested against the spike's captures. The new fetches are per table per
 quotation, alongside the four already made (`/tables/{t}`,
-`/tables/{t}/schema`, `/segments/{t}/metadata`, `/tables/{t}/size`), and the
-schema fetch is conditional, so a pure-OFFLINE non-upsert table pays one
-extra call and an upsert table two.
+`/tables/{t}/schema`, `/segments/{t}/metadata`, `/tables/{t}/size`).
+`/tables/{t}/externalview` is unconditional; `/schemas/{schemaName}` and
+`/tables/{t}/metadata` are fetched only where the config already shows an
+`upsertConfig`. So a non-upsert table pays one extra call and an upsert
+table three. Source (b) adds none: it reads the `/tables/{t}/schema`
+document the column resolution already fetched, which is memoised so it is
+read once per table per quotation. A table with proven keys pays one
+further broker EXPLAIN, for its key-column ordinals.
 
 `consuming_count` needs both documents, so `engine.py` passes the size JSON
 it already fetches into it rather than re-reading. `metadata_is_complete`
@@ -529,11 +661,13 @@ input is missing or unreadable?
 | `consuming` | the larger of externalview and `missingSegments`; neither readable → 0 | a larger count charges more; 0 only where nothing said otherwise, and decision 4 catches the case that matters |
 | `flush_rows` | `None` → rows `None` → low | nothing else bounds a consuming segment (rule 7) |
 | `numConsumingSegmentsQueried` | 0 → sealed k is larger | charges more sealed segments |
-| bytes ratio | no sealed segment with docs > 0 → bytes `None` → low | no basis for a ratio is not a licence to invent one |
+| bytes ratio | no sealed segment with docs > 0, or any sealed segment with no doc count → bytes `None` → low | no basis for a ratio is not a licence to invent one; the uncounted segment could be the densest |
 | metadata completeness | any sealed segment in `size` missing from metadata → rows and bytes `None` → low | the alternative is a confident sum over a subset |
-| operand resolution | any doubt — expression, `$f` name, non-chain side, unresolvable index, `OR` — → no evidence | no evidence means the product, which is the current behaviour |
+| limit prune | no explicit LIMIT, or an OFFSET → `ByLimit` and `ByServer` unread | the EXPLAIN pruned under Pinot's implicit `LIMIT 10`; the engine that runs it has none |
+| operand resolution | any doubt — expression, `$f` name, non-chain side, unresolvable index, `OR` — → no evidence for that side | no evidence means the product, which is the current behaviour |
+| key ordinals | no ordinals for a table, or an identifier that is not bare → no evidence for it | a projected name is spoofable by alias; an ordinal is not |
 | unique key (a) | config and PK map disagree → withheld | two documents disagreeing is not proof |
-| unique key (b) | nullability not establishable → withheld | the null caveat (log §6) is unclosed |
+| unique key (b) | nullability not establishable, any `-1` in the size report, more than one sealed segment named, or a multi-value column → withheld | the null caveat (log §6) is unclosed, and a consuming segment holds rows the sealed one does not |
 | plan unreadable (450) | `max_intermediate_rows` `None` → low | unchanged from today |
 
 The consuming charge is the **only** place in this design where a number
@@ -628,7 +762,16 @@ that would let decision 5(b) relax its gate.
   nothing here can be validated against the thing it bounds.
 - **It does not close the null caveat.** Decision 5(b) is gated rather than
   proven; the measurement that would settle it needs a table with real
-  nulls, which neither quickstart dataset has.
+  nulls, which neither quickstart dataset has. Gated as shipped, it finds
+  nothing on either dataset.
+- **It does not quote a genuinely multi-server table.** Decision 4 denies
+  one rather than summing a subset of its segments, and the demo tables are
+  pinned to one server apiece instead. Fetching each segment's metadata
+  individually would lift the denial, and that is U13.
+- **It does not prove a key by column name.** Only a scan ordinal the
+  engine itself reported counts, which costs one extra EXPLAIN per keyed
+  table and yields nothing for a table whose key-column plan cannot be
+  read.
 - **It does not read text plans.** Semi-joins and aggregated join inputs
   stay denied, since their JSON plan cannot be obtained on 1.5.1.
 - **It does not make an upsert table's rows exact.** Sealed `totalDocs`
