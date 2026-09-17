@@ -994,3 +994,59 @@ def test_table_facts_carry_the_upsert_key() -> None:
     assert facts.consuming == 2
     assert facts.flush_rows == 200
     assert facts.complete is False
+
+
+def _one_segment_capture(*, not_null: bool | None) -> dict[str, Any]:
+    """One sealed segment whose `id` has cardinality == totalDocs."""
+    spec: dict[str, Any] = {"name": "id", "singleValueField": True}
+    if not_null is not None:
+        spec["notNull"] = not_null
+    return {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "id",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
+                    "indexSizeMap": {"forward_index": 12},
+                    "fieldSpec": spec,
+                }
+            ],
+        }
+    }
+
+
+def test_an_unread_schema_establishes_no_nullability_f1() -> None:
+    """F1: schema_json None is a schema nobody read, not a schema that says
+    every column is non-nullable. notNull is absent and null handling is off,
+    so the only thing that could clear the column is the nullable set — and
+    with no schema that set is empty for want of evidence, not for want of
+    nullable columns. Source (b) yields nothing."""
+    config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
+    assert (
+        table_facts(
+            "t",
+            config,
+            _one_segment_capture(not_null=None),
+            _size_naming("seg0"),
+            schema_json=None,
+        ).unique_keys
+        == frozenset()
+    )
+
+
+def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
+    """F1 control: the same table, with the schema read and notNull true."""
+    config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
+    schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
+    assert table_facts(
+        "t",
+        config,
+        _one_segment_capture(not_null=True),
+        _size_naming("seg0"),
+        schema_json=schema,
+    ).unique_keys == frozenset({frozenset({"id"})})

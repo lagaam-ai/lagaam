@@ -544,12 +544,18 @@ def single_segment_unique_columns(
     one null could report cardinality == totalDocs while two rows share the
     default. Where nullability cannot be established, nothing is yielded.
 
+    A `schema_json` of None is a schema nobody read, and it yields nothing at
+    all: the second gate clears a column that null handling is off for and the
+    schema does not mark nullable, but an unread schema marks nothing nullable
+    for want of evidence rather than for want of nullable columns. Reading
+    absence as proof would let a plainly nullable column pass as a key.
+
     A multi-value column's cardinality counts distinct entries, not rows —
     totalNumberOfEntries and maxNumberOfMultiValues are reported separately —
     so equality to totalDocs proves nothing there; such a column is never
     evidence.
     """
-    if not isinstance(seg_metadata_json, dict):
+    if not isinstance(seg_metadata_json, dict) or schema_json is None:
         return frozenset()
     reported = _reported_sizes(size_json)
     if any(size < 0 for size in reported.values()):

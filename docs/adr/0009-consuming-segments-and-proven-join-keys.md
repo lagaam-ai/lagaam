@@ -109,7 +109,9 @@ segment, and the size report must carry no `-1` entry at all — a consuming
 segment holds rows the sealed segment does not, whatever the metadata says.
 The column must be single-valued (a multi-value column's cardinality counts
 entries, not rows) and its nullability must be establishable, because the
-null caveat is open.
+null caveat is open — and establishing it takes a schema document that was
+actually read, since an unread schema marks no column nullable for want of
+evidence rather than for want of nullable columns.
 
 **A projected name proves nothing; the ordinal does.** The engine learns
 each keyed table's key-column scan ordinals with one extra EXPLAIN of the

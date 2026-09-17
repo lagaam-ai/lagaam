@@ -1731,3 +1731,76 @@ async def test_the_honest_spelling_still_learns_ordinals() -> None:
         "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
     )
     assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
+
+
+def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
+    """baseballStats with no upsert config at all: one sealed segment, null
+    handling off, and a playerID the schema route says cannot be null. The
+    only document that can establish that nullability is /tables/{t}/schema,
+    which _table_facts fetches for the ?columns= filter."""
+    path = request.url.path
+    if path == "/query/sql":
+        sql = json.loads(request.content)["sql"]
+        if _is_keycols_explain(sql):
+            return httpx.Response(
+                200, json=load("explain-mse-keycols-baseballStats.json")
+            )
+        if "AS JSON" in sql:
+            return httpx.Response(
+                200, json=load("explain-mse-selfjoin-baseballStats.json")
+            )
+        return httpx.Response(
+            200,
+            json={"exceptions": [{"errorCode": 150, "message": "multi-stage only"}]},
+        )
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["baseballStats"]})
+    if path == "/tables/baseballStats/externalview":
+        return httpx.Response(200, json={"OFFLINE": None, "REALTIME": None})
+    if path == "/tables/baseballStats/size":
+        return httpx.Response(200, json=load("size-baseballStats.json"))
+    if path == "/tables/baseballStats/schema":
+        return httpx.Response(200, json=load("schema-baseballStats.json"))
+    if path == "/segments/baseballStats/metadata":
+        seg_metadata = load("seg-metadata-baseballStats-columns.json")
+        (segment,) = seg_metadata.values()
+        for column in segment["columns"]:
+            if column["columnName"] == "playerID":
+                column["cardinality"] = segment["totalDocs"]
+                column["fieldSpec"]["notNull"] = True
+        return httpx.Response(200, json=seg_metadata)
+    if path == "/tables/baseballStats":
+        return httpx.Response(200, json=load("tableconfig-baseballStats.json"))
+    return httpx.Response(404, json={})
+
+
+async def test_a_non_upsert_self_join_is_bounded_on_a_schema_proven_key_f1() -> None:
+    """F1: a single-sealed-segment table with no upsertConfig proves its key
+    through source (b), whose nullability gate reads the /tables/{t}/schema
+    document the columns filter already fetched. playerID is at scan ordinal
+    17 — the measured capture — which both operands compose down to: min plus
+    the two inputs, not the product."""
+    engine = PinotEngine(transport=httpx.MockTransport(_notnull_selfjoin_routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.playerID FROM pinot.default.baseballStats a "
+        "JOIN pinot.default.baseballStats b ON a.playerID = b.playerID LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == 97889 + 97889 + 97889
+
+
+async def test_a_schema_the_controller_will_not_serve_charges_the_product_f1() -> None:
+    """F1: the same table with /tables/{t}/schema answering 404. Nothing
+    establishes nullability, so source (b) yields no key and the self-join is
+    charged the product a twin always costs."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/tables/baseballStats/schema":
+            return httpx.Response(404, json={"code": 404, "error": "not found"})
+        return _notnull_selfjoin_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT a.playerID FROM pinot.default.baseballStats a "
+        "JOIN pinot.default.baseballStats b ON a.playerID = b.playerID LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == 97889 * 97889 + 2 * 97889

@@ -499,7 +499,11 @@ class PinotEngine:
             externalview_json=(
                 None if externalview_json is PinotClient.NotFound else externalview_json
             ),
-            schema_json=schema_json,
+            # The upsert branch's /schemas/{name} where there was one, else the
+            # /tables/{t}/schema this call already fetched to resolve columns.
+            # Source (b)'s nullability gate reads whichever arrives; without
+            # one it establishes nothing and yields no key.
+            schema_json=schema_json or table_schema_json,
             table_metadata_json=table_metadata_json,
         )
         if facts.unique_keys:
