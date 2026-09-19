@@ -56,11 +56,11 @@ def surviving_bytes(
     and unresolvable columns fall back to whole segments table-wide.
 
     The consuming term is the one projected number in a Lagaam quotation: a
-    consuming segment reports -1 bytes on every probe, so its bytes are
-    flush_rows times the worst bytes-per-doc ratio observed on this table's
-    own sealed segments, taken per segment and maximised, never averaged. No
-    sealed segment with docs > 0 leaves nothing to take a ratio from, and
-    inventing one would be a guess.
+    consuming segment reports -1 bytes on every probe, so its bytes are its
+    own stored flush threshold times the worst bytes-per-doc ratio observed
+    on this table's own sealed segments, taken per segment and maximised,
+    never averaged. No sealed segment with docs > 0 leaves nothing to take a
+    ratio from, and inventing one would be a guess.
     """
     if not facts.complete:
         return None
@@ -145,12 +145,18 @@ def _column_sizes(
 
 
 def _consuming_docs(facts: TableFacts) -> int | None:
-    """Rows the consuming segments may hold, or None if nothing bounds them."""
+    """Rows the consuming segments may hold, or None if nothing bounds them.
+
+    Each segment carries its own threshold, stored when it was created, so
+    the charge is their sum and never a count times one of them: two
+    segments born either side of a config change hold different bounds, and
+    neither is a bound on the other.
+    """
     if facts.consuming <= 0:
         return 0
-    if facts.flush_rows is None:
+    if any(rows is None for rows in facts.consuming_rows):
         return None
-    return facts.consuming * facts.flush_rows
+    return sum(rows for rows in facts.consuming_rows if rows is not None)
 
 
 def _consuming_bytes(facts: TableFacts, sizes: list[int | None]) -> int | None:
@@ -166,19 +172,32 @@ def _consuming_bytes(facts: TableFacts, sizes: list[int | None]) -> int | None:
     """
     if facts.consuming <= 0:
         return 0
-    if facts.flush_rows is None:
+    if any(rows is None for rows in facts.consuming_rows):
         return None
     if any(segment.docs is None for segment in facts.segments):
         # A segment left out of the ratio could be the densest on the table.
         return None
-    bounds = [
-        (facts.flush_rows * size + segment.docs - 1) // segment.docs
-        for segment, size in zip(facts.segments, sizes)
-        if segment.docs and size is not None
-    ]
-    if not bounds:
+    # The worst ratio is kept as the exact fraction bytes/docs and applied
+    # per segment, so the threshold multiplies before the ceiling exactly as
+    # a single-threshold table always did.
+    # Compared by cross-multiplication rather than as floats: a ratio of two
+    # segment byte counts is not a number a float is guaranteed to order.
+    worst: tuple[int, int] | None = None
+    for segment, size in zip(facts.segments, sizes):
+        if not segment.docs or size is None:
+            continue
+        if worst is None or size * worst[1] > worst[0] * segment.docs:
+            worst = (size, segment.docs)
+    if worst is None:
         return None
-    return facts.consuming * max(bounds)
+    worst_bytes, worst_docs = worst
+    # Each consuming segment at its own stored threshold, not the count
+    # times one of them: they need not have been created equal.
+    return sum(
+        (rows * worst_bytes + worst_docs - 1) // worst_docs
+        for rows in facts.consuming_rows
+        if rows is not None
+    )
 
 
 def _total(values: Iterable[int | None]) -> int | None:

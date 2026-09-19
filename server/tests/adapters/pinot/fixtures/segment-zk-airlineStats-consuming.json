@@ -1,0 +1,7 @@
+{
+    "segment.realtime.numReplicas": "1",
+    "segment.creation.time": "1789666465846",
+    "segment.flush.threshold.size": "100",
+    "segment.realtime.startOffset": "600",
+    "segment.realtime.status": "IN_PROGRESS"
+}

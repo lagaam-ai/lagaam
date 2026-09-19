@@ -56,25 +56,60 @@ that cannot be read at all leaves `missingSegments` as the count; neither
 readable leaves `consuming = 0`, which is the pre-U12 behaviour and is
 caught by decision 4's completeness check when it matters.
 
-**`flush_rows: int | None`** — the row bound on one consuming segment. Read
-from the table config in this precedence, first hit wins:
+**`consuming_rows: tuple[int | None, ...]`** — the row bound on **each**
+consuming segment, one entry per segment `consuming` counts, `None` where
+that segment's bound could not be read.
 
-1. `REALTIME.ingestionConfig.streamIngestionConfig.streamConfigMaps[0]`,
-   key `realtime.segment.flush.threshold.rows`;
-2. the same map, key `realtime.segment.flush.threshold.size` — the
-   deprecated spelling, which Pinot reads as a row count and which **the
-   bundled quickstart config actually uses** (rule 3);
-3. `REALTIME.tableIndexConfig.streamConfigs`, the legacy top-level
-   location, same two keys in the same order — absent on every config
-   measured (log §1.1), read only so an older cluster is not silently
-   unbounded.
+*Corrected after review.* This was `flush_rows: int | None`, a single value
+read from the **table config**, and the charge was `consuming × flush_rows`.
+Both halves were wrong. A config is not a bound on a segment already
+consuming: each consuming segment stores the threshold it was created with
+in its LLC segment ZK metadata, and no later config change reaches it.
+Measured on `u12flush`: a `PUT` lowering
+`realtime.segment.flush.threshold.rows` from 100 to 10 was accepted, the
+live segment's `segment.flush.threshold.size` stayed **100**, it went on to
+hold 70 rows while still CONSUMING, and it sealed at **exactly 100** — while
+the adapter, reading the config, quoted **110 rows against 170 scanned at
+`confidence="high"`**. No reload helps; only `POST /tables/{t}/forceCommit`
+does, by sealing the segment so its replacement is born with the new value
+(which the replacement was, at 10). The worst case is `stored − config` rows
+per consuming segment — 90 here — and it is unbounded in general. Autotune
+(`realtime.segment.flush.threshold.segment.size`) confirms the same thing
+from the other end: with no row threshold in the config at all, the next
+segment was created with a stored threshold of **100** that the config never
+states.
 
-Values are JSON **strings** in every config measured (`"100"`, `"50000"`),
-so the parse accepts a string of digits or an int. **A value that is not a
-positive int — a float, a byte-suffixed size, a negative, zero, an
-unparseable string, or absent — is `None`.** Pinot rejects a config setting
-more than one row bound (rule 3), so the precedence list resolves a
-conflict that cannot occur; it exists to pick a location, not a winner.
+So the source is per segment, and `consuming × one threshold` cannot be the
+charge either: two segments born either side of a config change hold
+different bounds, and neither bounds the other. The charge is the **sum** of
+`consuming_rows`, `None` if any entry is.
+
+**Reading it.** `metadata.consuming_segment_names(externalview_json)` gives
+the CONSUMING segment names; the engine fetches
+`GET /segments/{table}/{segmentName}/metadata` for each (the segment name
+through `PinotClient.path_part`, a 404 leaving that segment's threshold
+unknown, a `PinotForbidden` raising as `EngineError`, a transport failure
+quoting the table low as every other controller failure does); and a pure
+`metadata.stored_flush_rows(segment_zk_json) -> int | None` reads
+`segment.flush.threshold.size`.
+
+That endpoint was the only one of five probed that exposes the value, and it
+is a direct view of the segment's ZK simpleFields (the same fields appear at
+`/zk/get?path=.../SEGMENTS/{table}_REALTIME/{segmentName}`). The key is the
+**ZK spelling** `segment.flush.threshold.size` and not the in-JVM
+`sizeThresholdToFlushSegment`, which appears in no controller response. A
+CONSUMING segment's body carries exactly five keys and **no row count at
+all**, which is why a threshold is still the only bound there is.
+
+Values are JSON **strings** there (`"100"`), so the parse accepts a string
+of digits or an int. **A value that is not a positive int — a float, a
+byte-suffixed size, a negative, zero, an unparseable string, or absent — is
+`None`**, and a `None` takes the whole quote low.
+
+Where `missingSegments` counts more consuming segments than the externalview
+names, the surplus has no name to fetch a threshold with, so it is charged
+at nothing known — a `None` per unnamed segment, which takes the quote low.
+The count itself is still the larger of the two.
 
 **Sealed realtime segments are priced exactly like OFFLINE ones.** Their
 metadata is complete and shape-identical — `totalDocs`, `startTimeMillis`,
@@ -104,7 +139,7 @@ not a free one.
 
 ```
 rows = k-largest-by-docs over the SEALED segments, k = sealed_surviving
-     + consuming × flush_rows
+     + sum(consuming_rows)        # each segment's own stored threshold
 ```
 
 where `sealed_surviving = numSegmentsQueried − numConsumingSegmentsQueried`,
@@ -138,11 +173,12 @@ distrusted — leaving `ByValue` alone. In production
 pipeline was never exposed — but a port must not depend on its caller for
 a bound.
 
-**`flush_rows` is `None` while `consuming > 0` → rows are `None` → the
-quote is low.** There is no fallback: rule 7 is that a consuming segment
-never reports anything, so nothing else in the catalog bounds it.
-`consuming == 0` makes `flush_rows` irrelevant and the table is priced on
-sealed segments alone — which is what a pure-OFFLINE table always was.
+**Any `None` in `consuming_rows` → rows are `None` → the quote is low.**
+There is no fallback, and the table config is emphatically not one: rule 7
+is that a consuming segment never reports anything, and the config has been
+measured to disagree with the segment by 90 rows. `consuming == 0` makes
+`consuming_rows` empty and the table is priced on sealed segments alone —
+which is what a pure-OFFLINE table always was.
 
 ### 2. The consuming-segment bytes — the one extrapolated number
 
@@ -153,7 +189,8 @@ bytes exists to read (log §6: the size-threshold path is unmeasured, and the
 row-threshold path gives rows, not bytes).
 
 ```
-consuming_bytes = consuming × ceil(flush_rows × max_ratio)
+consuming_bytes = sum over consuming segments of
+                    ceil(that segment's stored threshold × max_ratio)
 
 max_ratio = max over the table's SEALED segments with docs > 0 of
               (bytes charged for the referenced columns in that segment)
@@ -177,8 +214,11 @@ bytes/doc. At the measured threshold of 100 rows that is 87,136
 whole-segment bytes or 114 column bytes per consuming segment.
 
 The product is **ceiling-divided** — `ceil` on the whole product, computed
-in integer arithmetic as `(flush_rows × numerator + docs − 1) // docs` per
-candidate segment, so no float rounding can shave a byte off the bound.
+in integer arithmetic as `(threshold × numerator + docs − 1) // docs` per
+consuming segment, so no float rounding can shave a byte off the bound. The
+worst ratio is kept as the exact fraction `numerator / docs` and compared by
+cross-multiplication, so the threshold multiplies before the ceiling — the
+arithmetic a single-threshold table always did, now once per segment.
 
 **No sealed segment with `docs > 0` → bytes are `None` → the quote is
 low.** A table that is all-consuming has no ratio to take, and inventing one
@@ -223,8 +263,8 @@ the segment set is the segment set, and charging the k largest across it is
 an upper bound on any k that could survive, exactly as it is for a single
 half.
 
-`flush_rows` is read from the `REALTIME` half's config only; an OFFLINE half
-has no stream config and no consuming segments.
+`consuming_rows` is read from the REALTIME consuming segments only; an
+OFFLINE half has no consuming segments to charge.
 
 **This is not measurable locally.** `-type HYBRID` is broken in a container
 on 1.5.1 — it shells out to the `docker` CLI to start Kafka and dies without
@@ -621,7 +661,8 @@ budget gate denies. ADR 0001 holds.
 ```
 metadata.py   PURE, +
                 consuming_count(externalview_json, size_json) -> int
-                flush_rows(config_json) -> int | None
+                stored_flush_rows(segment_zk_json) -> int | None
+                consuming_segment_names(externalview_json) -> tuple[str, ...]
                 upsert_keys(config_json, schema_json, table_metadata_json)
                                              -> frozenset[frozenset[str]]
                 single_segment_unique_columns(seg_metadata_json, config_json,
@@ -629,7 +670,7 @@ metadata.py   PURE, +
                                              -> frozenset[frozenset[str]]
                 metadata_is_complete(seg_metadata_json, size_json) -> bool
                 upsert_config_present(config_json) -> bool
-              TableFacts gains: consuming, flush_rows, complete, unique_keys
+              TableFacts gains: consuming, consuming_rows, complete, unique_keys
 
 response.py   PURE, + consuming_segments_queried(explain_json) -> int
                 reads numConsumingSegmentsQueried beside the pruning
@@ -689,7 +730,7 @@ input is missing or unreadable?
 | number | unreadable / absent → | why that is safe |
 |---|---|---|
 | `consuming` | the larger of externalview and `missingSegments`; neither readable → 0 | a larger count charges more; 0 only where nothing said otherwise, and decision 4 catches the case that matters |
-| `flush_rows` | `None` → rows `None` → low | nothing else bounds a consuming segment (rule 7) |
+| `consuming_rows` | any `None` → rows `None` → low | nothing else bounds a consuming segment (rule 7), and the table config has been measured to disagree with it by 90 rows |
 | `numConsumingSegmentsQueried` | 0 → sealed k is larger | charges more sealed segments |
 | bytes ratio | no sealed segment with docs > 0, or any sealed segment with no doc count → bytes `None` → low | no basis for a ratio is not a licence to invent one; the uncounted segment could be the densest |
 | metadata completeness | any sealed segment in `size` missing from metadata → rows and bytes `None` → low | the alternative is a confident sum over a subset |

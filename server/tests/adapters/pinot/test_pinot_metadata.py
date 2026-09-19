@@ -13,11 +13,12 @@ import pytest
 
 from lagaam.adapters.pinot.metadata import (
     consuming_count,
-    flush_rows,
+    consuming_segment_names,
     metadata_is_complete,
     row_estimate,
     segment_facts,
     single_segment_unique_columns,
+    stored_flush_rows,
     table_facts,
     table_names,
     table_schema,
@@ -359,74 +360,50 @@ def test_consuming_count_is_zero_when_neither_document_can_be_read(
     assert consuming_count(body, body) == 0
 
 
-def test_flush_rows_accepts_the_deprecated_size_spelling() -> None:
-    """The .size spelling is the deprecated one; a minimal hand-built config."""
+def test_stored_flush_rows_reads_the_live_consuming_segments_own_threshold() -> None:
+    """The capture off the live realtime instance's CONSUMING segment.
+
+    Five keys, and the threshold among them is the one stored at creation.
+    """
+    body = load("segment-zk-airlineStats-consuming.json")
+    assert body["segment.realtime.status"] == "IN_PROGRESS"
+    assert stored_flush_rows(body) == 100
+
+
+def test_stored_flush_rows_reads_the_threshold_as_a_plain_int_too() -> None:
+    """Every capture spells it as a string; an int is accepted all the same."""
+    assert stored_flush_rows({"segment.flush.threshold.size": 100}) == 100
+
+
+def test_a_sealed_segment_carries_the_threshold_it_was_created_with() -> None:
+    """Measured on u12flush: the segment sealed at exactly 100 while the
+    table config said 10 for the last 50 of those rows."""
     assert (
-        flush_rows(
+        stored_flush_rows(
             {
-                "REALTIME": {
-                    "ingestionConfig": {
-                        "streamIngestionConfig": {
-                            "streamConfigMaps": [
-                                {"realtime.segment.flush.threshold.size": "50000"}
-                            ]
-                        }
-                    }
-                }
+                "segment.flush.threshold.size": "100",
+                "segment.total.docs": "100",
+                "segment.realtime.status": "DONE",
             }
         )
-        == 50000
-    )
-
-
-def test_flush_rows_reads_the_rows_spelling_as_a_string() -> None:
-    assert flush_rows(load("tableconfig-airlineStats-realtime.json")) == 100
-    assert flush_rows(load("tableconfig-u12upsert.json")) == 200
-
-
-def test_flush_rows_falls_back_to_the_legacy_stream_config_location() -> None:
-    """Absent on every config measured; read so an older cluster is not unbounded."""
-    assert (
-        flush_rows(
-            {
-                "REALTIME": {
-                    "tableIndexConfig": {
-                        "streamConfigs": {
-                            "realtime.segment.flush.threshold.rows": "250"
-                        }
-                    }
-                }
-            }
-        )
-        == 250
+        == 100
     )
 
 
 @pytest.mark.parametrize(
-    "value", ["", "10.5", "500M", "-100", "0", "abc", None, True, 4.0]
+    "value", ["", "10.5", "500M", "-100", "0", "abc", None, True, 4.0, -100, 0]
 )
-def test_a_threshold_that_is_not_a_positive_int_is_no_bound(value: Any) -> None:
-    assert (
-        flush_rows(
-            {
-                "REALTIME": {
-                    "ingestionConfig": {
-                        "streamIngestionConfig": {
-                            "streamConfigMaps": [
-                                {"realtime.segment.flush.threshold.rows": value}
-                            ]
-                        }
-                    }
-                }
-            }
-        )
-        is None
-    )
+def test_a_stored_threshold_that_is_not_a_positive_int_is_no_bound(
+    value: Any,
+) -> None:
+    assert stored_flush_rows({"segment.flush.threshold.size": value}) is None
 
 
-@pytest.mark.parametrize("body", [None, {}, [], "junk", {"OFFLINE": {}}])
-def test_flush_rows_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
-    assert flush_rows(body) is None
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"other": "1"}])
+def test_stored_flush_rows_never_raises_on_a_shape_it_cannot_read(
+    body: Any,
+) -> None:
+    assert stored_flush_rows(body) is None
 
 
 def test_the_consuming_entry_is_not_a_sealed_fact() -> None:
@@ -485,6 +462,20 @@ def test_completeness_is_true_when_the_size_report_names_nothing(body: Any) -> N
     assert metadata_is_complete(body, body)
 
 
+def test_consuming_segment_names_come_from_the_externalview() -> None:
+    """The names the per-segment metadata fetch is addressed with."""
+    assert consuming_segment_names(
+        load("externalview-airlineStats-realtime.json")
+    ) == ("airlineStats__0__6__20260917T1214Z",)
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk", {"REALTIME": None}])
+def test_consuming_segment_names_never_raises_on_a_shape_it_cannot_read(
+    body: Any,
+) -> None:
+    assert consuming_segment_names(body) == ()
+
+
 def test_table_facts_carry_the_realtime_numbers() -> None:
     facts = table_facts(
         "airlineStats",
@@ -492,13 +483,48 @@ def test_table_facts_carry_the_realtime_numbers() -> None:
         load("seg-metadata-airlineStats-realtime.json"),
         load("size-airlineStats-realtime.json"),
         externalview_json=load("externalview-airlineStats-realtime.json"),
+        consuming_segments_json={
+            "airlineStats__0__6__20260917T1214Z": load(
+                "segment-zk-airlineStats-consuming.json"
+            )
+        },
     )
     assert facts.types == frozenset({"REALTIME"})
     assert len(facts.segments) == 6
     assert facts.consuming == 1
-    assert facts.flush_rows == 100
+    assert facts.consuming_rows == (100,)
     assert facts.complete is True
     assert facts.unique_keys == frozenset()
+
+
+def test_a_consuming_segment_nobody_read_has_an_unknown_threshold() -> None:
+    """No ZK document for the segment externalview names: rows are unknown,
+    which takes the whole quote low rather than trusting the config."""
+    facts = table_facts(
+        "airlineStats",
+        load("tableconfig-airlineStats-realtime.json"),
+        load("seg-metadata-airlineStats-realtime.json"),
+        load("size-airlineStats-realtime.json"),
+        externalview_json=load("externalview-airlineStats-realtime.json"),
+    )
+    assert facts.consuming == 1
+    assert facts.consuming_rows == (None,)
+
+
+def test_a_consuming_segment_the_externalview_does_not_name_is_unknown() -> None:
+    """missingSegments can exceed the CONSUMING names externalview carries.
+    The count is still the larger one, and the segments nobody named have no
+    threshold to read, so they are charged at nothing known."""
+    facts = table_facts(
+        "u12upsert",
+        load("tableconfig-u12upsert.json"),
+        load("seg-metadata-u12upsert.json"),
+        load("size-u12upsert.json"),
+        externalview_json={"REALTIME": {}},
+    )
+    # Two missingSegments, no CONSUMING name in the externalview at all.
+    assert facts.consuming == 2
+    assert facts.consuming_rows == (None, None)
 
 
 def test_table_facts_without_the_new_documents_are_the_pre_u12_facts() -> None:
@@ -510,7 +536,7 @@ def test_table_facts_without_the_new_documents_are_the_pre_u12_facts() -> None:
         load("size-airlineStats.json"),
     )
     assert facts.consuming == 0
-    assert facts.flush_rows is None
+    assert facts.consuming_rows == ()
     assert facts.complete is True
     assert len(facts.segments) == 31
 
@@ -1085,7 +1111,9 @@ def test_table_facts_carry_the_upsert_key() -> None:
     )
     assert facts.unique_keys == frozenset({frozenset({"pk"})})
     assert facts.consuming == 2
-    assert facts.flush_rows == 200
+    # No externalview and no segment metadata: two consuming segments whose
+    # thresholds nobody read. The table config's 200 is not a substitute.
+    assert facts.consuming_rows == (None, None)
     assert facts.complete is False
 
 

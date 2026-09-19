@@ -13,6 +13,7 @@ from lagaam.adapters.pinot.engine import (
     _OPT_TIMEOUT_MS,
     PinotEngine,
 )
+from lagaam.adapters.pinot.metadata import stored_flush_rows
 from lagaam.adapters.pinot.names import two_part_sql
 from lagaam.adapters.pinot.response import (
     consuming_segments_queried,
@@ -602,13 +603,73 @@ async def _realtime_scanned(engine: PinotEngine, sql: str) -> int:
     return scanned
 
 
-async def _flush_rows(engine: PinotEngine, table: str) -> int:
-    """The table's own flush threshold, from its live config."""
+async def _config_flush_rows(engine: PinotEngine, table: str) -> int:
+    """The table config's flush threshold, which is not what a segment uses."""
     config = await engine._client.controller_get(f"/tables/{table}", database="default")
     maps = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
         "streamConfigMaps"
     ]
     return int(maps[0]["realtime.segment.flush.threshold.rows"])
+
+
+async def _consuming_names(engine: PinotEngine, table: str) -> list[str]:
+    """The CONSUMING segment names the live externalview carries."""
+    body = await engine._client.controller_get(
+        f"/tables/{table}/externalview", database="default"
+    )
+    return [
+        name
+        for name, states in body["REALTIME"].items()
+        if "CONSUMING" in states.values()
+    ]
+
+
+async def _consuming_charge(engine: PinotEngine, table: str) -> int:
+    """The table's consuming charge in rows: each segment's stored threshold.
+
+    Read from each consuming segment's own LLC ZK metadata, because that is
+    what bounds it — a table config an operator lowered under a segment
+    already consuming does not. Measured on `u12flush`: a `PUT` of 100 -> 10
+    left the live segment at 100 and it sealed at exactly 100.
+    """
+    total = 0
+    for name in await _consuming_names(engine, table):
+        body = await engine._client.controller_get(
+            f"/segments/{table}/{name}/metadata", database="default"
+        )
+        total += int(body["segment.flush.threshold.size"])
+    return total
+
+
+async def test_realtime_the_consuming_charge_is_the_segments_stored_threshold(
+    pinot_realtime_ready: None,
+) -> None:
+    """The threshold the adapter charges is the segment's own, not the config's.
+
+    Both are 100 on this instance, so the numbers agree today — the test is
+    here so a divergence becomes visible rather than silent. It also pins
+    the request the engine makes: `GET /segments/{t}/{segment}/metadata`,
+    the only controller path measured to expose the stored value.
+    """
+    engine = _realtime_engine()
+    names = await _consuming_names(engine, "airlineStats")
+    assert names, "this shape is about the consuming charge"
+    stored = []
+    for name in names:
+        body = await engine._client.controller_get(
+            f"/segments/airlineStats/{name}/metadata", database="default"
+        )
+        assert body["segment.realtime.status"] == "IN_PROGRESS"
+        assert stored_flush_rows(body) is not None
+        stored.append(stored_flush_rows(body))
+    assert stored == [100] * len(names)
+    assert await _config_flush_rows(engine, "airlineStats") == 100
+
+    # And the quote really is built from it: the facts the engine gathers
+    # carry one stored threshold per consuming segment.
+    facts = await engine._table_facts("default", "airlineStats", None, {}, {})
+    assert facts.consuming == len(names)
+    assert list(facts.consuming_rows) == stored
 
 
 async def _externalview_states(engine: PinotEngine, table: str) -> dict[str, int]:
@@ -684,7 +745,7 @@ async def test_realtime_rows_are_the_sealed_sum_plus_the_consuming_charge(
     sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
     estimate = await engine.estimate_cost(sql)
     consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
-    threshold = await _flush_rows(engine, "airlineStats")
+    charge = await _consuming_charge(engine, "airlineStats")
     assert consuming > 0, "this shape is about the consuming charge"
 
     explain = await engine._explain(
@@ -700,7 +761,7 @@ async def test_realtime_rows_are_the_sealed_sum_plus_the_consuming_charge(
     largest = sum(sorted(docs, reverse=True)[:sealed_k])
 
     # Exact, because the design makes this term-by-term exact.
-    assert estimate.row_estimate == largest + consuming * threshold
+    assert estimate.row_estimate == largest + charge
     assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
 
 
@@ -716,12 +777,12 @@ async def test_realtime_the_consuming_charge_survives_an_impossible_filter(
     )
     estimate = await engine.estimate_cost(sql)
     consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
-    threshold = await _flush_rows(engine, "airlineStats")
+    charge = await _consuming_charge(engine, "airlineStats")
     assert consuming > 0
     assert estimate.row_estimate is not None
     # The charge is unconditional: it is in the quote even though the filter
     # matches nothing at all.
-    assert estimate.row_estimate >= consuming * threshold
+    assert estimate.row_estimate >= charge
     # And it still bounds the (empty) execution.
     assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
 
@@ -788,10 +849,10 @@ async def test_realtime_an_offset_query_ignores_the_limit_prune(
     estimate = await engine.estimate_cost(sql)
     sealed = await _sealed_docs(engine, "airlineStats")
     consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
-    threshold = await _flush_rows(engine, "airlineStats")
+    charge = await _consuming_charge(engine, "airlineStats")
     assert estimate.row_estimate is not None
     # Every sealed segment's docs plus the consuming charge — no prune.
-    assert estimate.row_estimate >= sealed + consuming * threshold
+    assert estimate.row_estimate >= sealed + charge
     assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
 
 
@@ -820,9 +881,9 @@ async def _realtime_docs_bound(engine: PinotEngine, table: str) -> int:
     Derived from the controller, not from a single-table quote: that quote
     carries the limit prune, so it answers about a k-largest subset (600 for
     these tables) rather than the whole table the join walks. D is every
-    sealed segment's totalDocs plus one flush-threshold charge per consuming
-    segment — the same two documents the completeness check compares, and
-    the same arithmetic quote.py applies.
+    sealed segment's totalDocs plus each consuming segment's own stored
+    flush threshold — the same documents the completeness check compares,
+    and the same arithmetic quote.py applies.
     """
     size = await engine._client.controller_get(
         f"/tables/{table}/size", database="default"
@@ -837,12 +898,6 @@ async def _realtime_docs_bound(engine: PinotEngine, table: str) -> int:
         f"{table} metadata is short of /size — the segments split across "
         f"servers again and D cannot be derived ({sorted(named - set(metadata))})"
     )
-    config = await engine._client.controller_get(f"/tables/{table}")
-    stream = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
-        "streamConfigMaps"
-    ][0]
-    flush_rows = int(stream["realtime.segment.flush.threshold.rows"])
-
     sealed_docs = 0
     consuming = 0
     for name, body in segments.items():
@@ -851,7 +906,7 @@ async def _realtime_docs_bound(engine: PinotEngine, table: str) -> int:
             continue
         sealed_docs += int(metadata[name]["totalDocs"])
     assert consuming > 0, f"{table} has no consuming segment"
-    return sealed_docs + consuming * flush_rows
+    return sealed_docs + await _consuming_charge(engine, table)
 
 
 async def _realtime_true_pairs(engine: PinotEngine, table: str) -> int:

@@ -35,8 +35,8 @@ def facts(
     *segments: SegmentFact,
     types: frozenset[str] = frozenset({"OFFLINE"}),
     columns: frozenset[str] = frozenset(),
-    consuming: int = 0,
-    flush_rows: int | None = None,
+    consuming: int | None = None,
+    consuming_rows: tuple[int | None, ...] = (),
     complete: bool = True,
 ) -> TableFacts:
     return TableFacts(
@@ -45,8 +45,8 @@ def facts(
         time_column=None,
         segments=segments,
         columns=columns,
-        consuming=consuming,
-        flush_rows=flush_rows,
+        consuming=len(consuming_rows) if consuming is None else consuming,
+        consuming_rows=consuming_rows,
         complete=complete,
     )
 
@@ -59,6 +59,11 @@ def realtime() -> TableFacts:
         load("size-airlineStats-realtime.json"),
         frozenset({"carrier", "dayssinceepoch"}),
         externalview_json=load("externalview-airlineStats-realtime.json"),
+        consuming_segments_json={
+            "airlineStats__0__6__20260917T1214Z": load(
+                "segment-zk-airlineStats-consuming.json"
+            )
+        },
     )
 
 
@@ -191,7 +196,7 @@ def test_the_consuming_segment_is_charged_at_the_flush_threshold() -> None:
     """Six sealed at 100 docs, one consuming bounded at 100 by the config."""
     table = realtime()
     assert table.consuming == 1
-    assert table.flush_rows == 100
+    assert table.consuming_rows == (100,)
     assert surviving_docs(table, None) == 700
 
 
@@ -218,8 +223,7 @@ def test_the_ratio_is_per_segment_and_maximised_never_averaged() -> None:
         seg("small", 10, 1000),
         seg("big", 1000, 1000),
         types=frozenset({"REALTIME"}),
-        consuming=1,
-        flush_rows=5,
+        consuming_rows=(5,),
     )
     assert surviving_bytes(table, None, None) == 2000 + 500
 
@@ -227,7 +231,7 @@ def test_the_ratio_is_per_segment_and_maximised_never_averaged() -> None:
 def test_the_bytes_product_is_ceiling_divided_in_integer_arithmetic() -> None:
     """3 x 7 / 2 is 10.5, and a bound may not be shaved to 10."""
     table = facts(
-        seg("a", 2, 7), types=frozenset({"REALTIME"}), consuming=1, flush_rows=3
+        seg("a", 2, 7), types=frozenset({"REALTIME"}), consuming_rows=(3,)
     )
     assert surviving_bytes(table, None, None) == 7 + 11
 
@@ -236,17 +240,58 @@ def test_more_than_one_consuming_segment_is_charged_once_each() -> None:
     table = facts(
         seg("a", 100, 1000),
         types=frozenset({"REALTIME"}),
-        consuming=2,
-        flush_rows=50,
+        consuming_rows=(50, 50),
     )
     assert surviving_docs(table, None) == 100 + 100
     assert surviving_bytes(table, None, None) == 1000 + 1000
 
 
+def test_each_consuming_segment_is_charged_its_own_stored_threshold() -> None:
+    """Two consuming segments created either side of a config change hold
+    different thresholds, and neither may be charged at the other's.
+
+    Measured on u12flush: a `PUT` lowering the config 100 -> 10 left the
+    live segment's stored threshold at 100 and it sealed at exactly 100,
+    while the segment created after the PUT was born at 10.
+    """
+    table = facts(
+        seg("a", 100, 1000),
+        types=frozenset({"REALTIME"}),
+        consuming_rows=(100, 10),
+    )
+    assert surviving_docs(table, None) == 100 + 110
+    # 10 bytes/doc from the one sealed segment, applied to each threshold.
+    assert surviving_bytes(table, None, None) == 1000 + 1000 + 100
+
+
+def test_one_unreadable_threshold_takes_the_whole_table_low() -> None:
+    """A consuming segment nobody could read bounds nothing, and the
+    segments beside it do not bound it either."""
+    table = facts(
+        seg("a", 100, 1000),
+        types=frozenset({"REALTIME"}),
+        consuming_rows=(100, None),
+    )
+    assert surviving_docs(table, None) is None
+    assert surviving_bytes(table, None, None) is None
+
+
+def test_the_config_threshold_is_never_the_charge() -> None:
+    """The exact under-quote Astra reproduced: the table config said 10 while
+    the live consuming segment was born at 100 and held 70 rows. Charging the
+    config's 10 quoted 110 against 170 scanned; the stored 100 quotes 200."""
+    table = facts(
+        seg("sealed", 100, 1000),
+        types=frozenset({"REALTIME"}),
+        consuming_rows=(100,),
+    )
+    assert surviving_docs(table, None) == 100 + 100
+
+
 def test_no_flush_threshold_makes_both_numbers_unknown() -> None:
     """Rule 7: nothing else in the catalog bounds a consuming segment."""
     table = facts(
-        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming=1
+        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming_rows=(None,)
     )
     assert surviving_docs(table, None) is None
     assert surviving_bytes(table, None, None) is None
@@ -260,7 +305,7 @@ def test_no_consuming_segment_makes_the_threshold_irrelevant() -> None:
 
 def test_an_all_consuming_table_has_no_ratio_to_take() -> None:
     """Bytes only. Rows still hold: the threshold bounds them without a ratio."""
-    table = facts(types=frozenset({"REALTIME"}), consuming=1, flush_rows=100)
+    table = facts(types=frozenset({"REALTIME"}), consuming_rows=(100,))
     assert surviving_bytes(table, None, None) is None
     assert surviving_docs(table, None) == 100
 
@@ -268,7 +313,7 @@ def test_an_all_consuming_table_has_no_ratio_to_take() -> None:
 def test_a_sealed_segment_with_zero_docs_is_no_basis_for_a_ratio() -> None:
     """Dividing by its docs is not a bound, it is a crash."""
     table = facts(
-        seg("empty", 0, 900), types=frozenset({"REALTIME"}), consuming=1, flush_rows=10
+        seg("empty", 0, 900), types=frozenset({"REALTIME"}), consuming_rows=(10,)
     )
     assert surviving_bytes(table, None, None) is None
 
@@ -293,7 +338,7 @@ def test_a_realtime_table_now_quotes_at_high_confidence() -> None:
 
 def test_a_realtime_table_nobody_can_bound_still_quotes_low() -> None:
     table = facts(
-        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming=1
+        seg("a", 100, 1000), types=frozenset({"REALTIME"}), consuming_rows=(None,)
     )
     estimate = quote([(table, None)], None, 100)
     assert estimate.scanned_bytes is None
@@ -329,6 +374,11 @@ def test_a_hybrid_table_is_charged_as_one_segment_set() -> None:
         merged,
         frozenset({"carrier", "dayssinceepoch"}),
         externalview_json=load("externalview-airlineStats-realtime.json"),
+        consuming_segments_json={
+            "airlineStats__0__6__20260917T1214Z": load(
+                "segment-zk-airlineStats-consuming.json"
+            )
+        },
     )
     assert table.types == frozenset({"OFFLINE", "REALTIME"})
     assert len(table.segments) == 31 + 6
@@ -358,7 +408,6 @@ def test_a_consuming_byte_bound_needs_every_sealed_segments_doc_count() -> None:
         seg("counted", 1000, 1000),
         seg("uncounted", None, 5000),
         types=frozenset({"REALTIME"}),
-        consuming=1,
-        flush_rows=5,
+        consuming_rows=(5,),
     )
     assert surviving_bytes(table, None, None) is None

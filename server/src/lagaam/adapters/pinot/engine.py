@@ -24,6 +24,7 @@ from lagaam.adapters.pinot.client import (
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
+    consuming_segment_names,
     schema_columns,
     table_facts,
     table_names,
@@ -468,6 +469,12 @@ class PinotEngine:
         externalview_json = await self._client.controller_get(
             f"/tables/{part}/externalview", database=database
         )
+        externalview = (
+            None if externalview_json is PinotClient.NotFound else externalview_json
+        )
+        consuming_segments_json = await self._consuming_segments(
+            database, part, externalview
+        )
         schema_json: Any = None
         table_metadata_json: Any = None
         if upsert_config_present(config):
@@ -496,9 +503,8 @@ class PinotEngine:
             None if seg_json is PinotClient.NotFound else seg_json,
             None if size_json is PinotClient.NotFound else size_json,
             frozenset(resolved),
-            externalview_json=(
-                None if externalview_json is PinotClient.NotFound else externalview_json
-            ),
+            externalview_json=externalview,
+            consuming_segments_json=consuming_segments_json,
             # The upsert branch's /schemas/{name} where there was one, else the
             # /tables/{t}/schema this call already fetched to resolve columns.
             # Source (b)'s nullability gate reads whichever arrives; without
@@ -519,6 +525,43 @@ class PinotEngine:
                 facts,
             )
         return facts
+
+    async def _consuming_segments(
+        self, database: str, part: str, externalview: Any
+    ) -> dict[str, Any]:
+        """Each CONSUMING segment's own ZK metadata, keyed by segment name.
+
+        A consuming segment's row threshold is the one it was created with,
+        stored in its LLC segment ZK metadata, and the table config is not a
+        bound on it: measured on `u12flush`, a `PUT` lowering the config
+        100 -> 10 left the live segment's stored threshold at 100 and it
+        sealed at exactly 100, while the adapter — reading the config —
+        quoted 110 rows against 170 scanned, at `confidence="high"`.
+
+        One GET per consuming segment, and none at all on a table with none,
+        so an OFFLINE table pays nothing for this. A segment name comes from
+        the externalview, which is the controller's own spelling, but it
+        still goes through `path_part`: a name no URL path can carry is a
+        segment whose threshold is simply unknown, not a request to make.
+
+        A 404 leaves the segment out, which charges it at nothing known and
+        takes the quote low. A refusal is not an outage and is raised, as
+        every other controller refusal in this adapter is; a transport
+        failure likewise propagates, and `estimate_cost` turns it into a low
+        quote there.
+        """
+        documents: dict[str, Any] = {}
+        for name in consuming_segment_names(externalview):
+            try:
+                segment_part = PinotClient.path_part(name)
+            except ValueError:
+                continue
+            body = await self._client.controller_get(
+                f"/segments/{part}/{segment_part}/metadata", database=database
+            )
+            if body is not PinotClient.NotFound:
+                documents[name] = body
+        return documents
 
     async def _record_keycols(
         self,

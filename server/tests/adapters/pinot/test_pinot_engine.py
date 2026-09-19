@@ -1275,9 +1275,20 @@ def _realtime_routes(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200, json=load("seg-metadata-airlineStats-realtime-columns.json")
         )
+    if path == _CONSUMING_ZK_PATH:
+        return httpx.Response(
+            200, json=load("segment-zk-airlineStats-consuming.json")
+        )
     if path == "/tables/airlineStats":
         return httpx.Response(200, json=load("tableconfig-airlineStats-realtime.json"))
     return httpx.Response(404, json={})
+
+
+# The CONSUMING segment the captured externalview names, and its own ZK
+# metadata as the live controller serves it.
+_CONSUMING_ZK_PATH = (
+    "/segments/airlineStats/airlineStats__0__6__20260917T1214Z/metadata"
+)
 
 
 async def test_a_realtime_table_is_quoted_with_its_consuming_segment_charged() -> None:
@@ -1291,6 +1302,86 @@ async def test_a_realtime_table_is_quoted_with_its_consuming_segment_charged() -
     assert estimate.row_estimate == 100 + 100
     assert estimate.scanned_bytes == 114 + 114
     assert estimate.confidence == "high"
+
+
+async def test_the_consuming_charge_comes_from_the_segments_own_metadata() -> None:
+    """The threshold is read from the segment, not from the table config.
+
+    Measured on u12flush: a `PUT` lowering the config 100 -> 10 left the live
+    consuming segment's stored threshold at 100 and it sealed at exactly 100,
+    so a table config is no bound on a segment already consuming.
+    """
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        if request.url.path == "/tables/airlineStats":
+            # What the operator lowered it to, after this segment was born.
+            config = load("tableconfig-airlineStats-realtime.json")
+            config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
+                "streamConfigMaps"
+            ][0]["realtime.segment.flush.threshold.rows"] = "10"
+            return httpx.Response(200, json=config)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert _CONSUMING_ZK_PATH in seen
+    # The segment's stored 100, never the config's 10.
+    assert estimate.row_estimate == 100 + 100
+
+
+async def test_a_consuming_segment_whose_metadata_is_missing_quotes_low() -> None:
+    """A 404 on the segment's own metadata is a threshold nobody knows, and
+    the config's value may not stand in for it."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == _CONSUMING_ZK_PATH:
+            return httpx.Response(404, json={})
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.row_estimate is None
+    assert estimate.scanned_bytes is None
+    assert estimate.confidence == "low"
+
+
+async def test_a_refused_segment_metadata_fetch_is_an_engine_error() -> None:
+    """A 403 is a refusal, not an outage, and reads the same as every other
+    controller refusal in this adapter."""
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == _CONSUMING_ZK_PATH:
+            return httpx.Response(403, json={})
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    with pytest.raises(EngineError):
+        await engine.estimate_cost(
+            "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+        )
+
+
+async def test_a_table_with_no_consuming_segment_fetches_no_segment_metadata(
+) -> None:
+    """One call per consuming segment and never one more: an OFFLINE table
+    pays nothing for a document it has no segment to ask about."""
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return _quote_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert not any(path.endswith("/metadata") and "__" in path for path in seen)
 
 
 async def test_a_realtime_statement_with_no_limit_is_charged_in_full() -> None:
@@ -1557,20 +1648,18 @@ async def test_a_table_without_keys_is_never_asked_for_its_ordinals() -> None:
 
 
 async def test_a_realtime_table_nobody_can_bound_is_quoted_low_and_denied() -> None:
-    """A consuming segment with no flush threshold bounds nothing, and the
-    gate denies the query rather than letting an unquotable scan through."""
+    """A consuming segment with no stored flush threshold bounds nothing, and
+    the gate denies the query rather than letting an unquotable scan through.
+
+    The threshold is the segment's, so this is a segment whose own metadata
+    carries no readable one — the table config is not consulted at all.
+    """
 
     def routes(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/tables/airlineStats":
-            config = load("tableconfig-airlineStats-realtime.json")
-            maps = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
-                "streamConfigMaps"
-            ]
-            for stream in maps:
-                for key in list(stream):
-                    if key.startswith("realtime.segment.flush.threshold"):
-                        del stream[key]
-            return httpx.Response(200, json=config)
+        if request.url.path == _CONSUMING_ZK_PATH:
+            body = load("segment-zk-airlineStats-consuming.json")
+            del body["segment.flush.threshold.size"]
+            return httpx.Response(200, json=body)
         return _realtime_routes(request)
 
     engine = PinotEngine(transport=httpx.MockTransport(routes))

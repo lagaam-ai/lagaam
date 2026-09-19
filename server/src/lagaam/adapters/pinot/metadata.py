@@ -138,11 +138,15 @@ class TableFacts:
     # empty when none was asked for or the schema could not be read. A
     # segment missing any of them is priced whole rather than per column.
     columns: frozenset[str] = frozenset()
-    # How many CONSUMING segments this table has, and the row bound on one of
-    # them. A consuming segment reports nothing (0 docs, -1 bytes) until it
-    # seals, so it is charged from the config or the quote goes low.
+    # How many CONSUMING segments this table has, and the row bound on each.
+    # A consuming segment reports nothing (0 docs, -1 bytes) until it seals,
+    # so it is charged at the flush threshold stored in its own ZK metadata
+    # at creation — never the table config's, which an operator can lower
+    # under a segment already consuming. One entry per consuming segment,
+    # None where that segment's threshold could not be read, and a None
+    # takes the whole quote low.
     consuming: int = 0
-    flush_rows: int | None = None
+    consuming_rows: tuple[int | None, ...] = ()
     # False when the metadata response did not cover every sealed segment the
     # size report names: a confident sum over half a table is the one failure
     # the gate exists to prevent.
@@ -155,12 +159,10 @@ class TableFacts:
 # Long.MIN_VALUE: what a consuming segment reports where a CRC would be.
 _CONSUMING_CRC = -9223372036854775808
 
-# The flush threshold, most specific location first. `.size` is the deprecated
-# spelling of `.rows` and is what the bundled quickstart config actually uses.
-_FLUSH_KEYS = (
-    "realtime.segment.flush.threshold.rows",
-    "realtime.segment.flush.threshold.size",
-)
+# The row threshold a consuming segment was created with, in its own LLC
+# segment ZK metadata. `sizeThresholdToFlushSegment` is the in-JVM field name
+# and appears in no controller response; this is the ZK simpleField spelling.
+_STORED_FLUSH_KEY: Final = "segment.flush.threshold.size"
 
 
 def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
@@ -215,24 +217,51 @@ def consuming_count(externalview_json: Any, size_json: Any) -> int:
     return max(_externalview_consuming(externalview_json), _missing_segments(size_json))
 
 
-def flush_rows(config_json: Any) -> int | None:
-    """The row bound on one consuming segment, from the REALTIME stream config.
+def stored_flush_rows(segment_zk_json: Any) -> int | None:
+    """The row bound on one consuming segment, from that segment's own metadata.
 
-    Values are JSON strings in every config measured. Anything that is not a
-    positive int — a float, a byte-suffixed size, a negative, zero, absent —
-    is None, and a None here takes the whole quote low rather than guessing.
+    A consuming segment's row threshold is stored in its LLC segment ZK
+    metadata at creation, and the table config is not a bound on it. Measured
+    on `u12flush`: after a `PUT` lowering the config 100 -> 10, the live
+    consuming segment's `segment.flush.threshold.size` stayed 100 and the
+    segment sealed at exactly 100 — while the adapter, reading the config,
+    charged 10. No reload changes it; only a `forceCommit` does, by sealing
+    the segment so its replacement is born with the new value. Autotune
+    (`...threshold.segment.size`) reaches the same place from the other end:
+    it stores a row threshold the config never states at all.
+
+    `GET /segments/{table}/{segmentName}/metadata` serves it, as a direct
+    view of the ZK simpleFields. Values are JSON strings there; a plain int
+    is accepted too. Anything that is not a positive int — a float, a
+    byte-suffixed size, a negative, zero, absent — is None, and a None here
+    takes the whole quote low rather than guessing.
     """
-    if not isinstance(config_json, dict):
+    if not isinstance(segment_zk_json, dict):
         return None
-    half = config_json.get("REALTIME")
+    return _positive_int_or_digits(segment_zk_json.get(_STORED_FLUSH_KEY))
+
+
+def consuming_segment_names(externalview_json: Any) -> tuple[str, ...]:
+    """The names of the REALTIME segments any server calls CONSUMING.
+
+    The addresses the per-segment metadata fetch is made with, in the
+    externalview's own order so a table's thresholds line up with its
+    segments. `consuming_count` stays the count, because `missingSegments`
+    can name more than the externalview does.
+    """
+    if not isinstance(externalview_json, dict):
+        return ()
+    half = externalview_json.get("REALTIME")
     if not isinstance(half, dict):
-        return None
-    for source in _stream_config_maps(half):
-        for key in _FLUSH_KEYS:
-            bound = _positive_int_or_digits(source.get(key))
-            if bound is not None:
-                return bound
-    return None
+        return ()
+    return tuple(
+        name
+        for name, states in half.items()
+        if isinstance(name, str)
+        and name
+        and isinstance(states, dict)
+        and "CONSUMING" in states.values()
+    )
 
 
 def metadata_is_complete(seg_metadata_json: Any, size_json: Any) -> bool:
@@ -273,36 +302,9 @@ def _is_consuming(body: dict[str, Any], reported: int | None) -> bool:
     )
 
 
-def _stream_config_maps(half: dict[str, Any]) -> list[dict[str, Any]]:
-    """The stream config maps of one table half, current location first."""
-    maps: list[dict[str, Any]] = []
-    ingestion = half.get("ingestionConfig")
-    if isinstance(ingestion, dict):
-        stream = ingestion.get("streamIngestionConfig")
-        if isinstance(stream, dict):
-            configs = stream.get("streamConfigMaps")
-            if isinstance(configs, list):
-                maps.extend(entry for entry in configs if isinstance(entry, dict))
-    index_config = half.get("tableIndexConfig")
-    if isinstance(index_config, dict):
-        legacy = index_config.get("streamConfigs")
-        if isinstance(legacy, dict):
-            maps.append(legacy)
-    return maps
-
-
 def _externalview_consuming(externalview_json: Any) -> int:
     """Segments of the REALTIME map any server calls CONSUMING."""
-    if not isinstance(externalview_json, dict):
-        return 0
-    half = externalview_json.get("REALTIME")
-    if not isinstance(half, dict):
-        return 0
-    return sum(
-        1
-        for states in half.values()
-        if isinstance(states, dict) and "CONSUMING" in states.values()
-    )
+    return len(consuming_segment_names(externalview_json))
 
 
 def _missing_segments(size_json: Any) -> int:
@@ -387,27 +389,59 @@ def table_facts(
     externalview_json: Any = None,
     schema_json: Any = None,
     table_metadata_json: Any = None,
+    consuming_segments_json: Mapping[str, Any] | None = None,
 ) -> TableFacts:
     """One table's type, time column, segments and realtime facts.
 
-    The three keyword documents are the U12 additions and default to None, so
+    The four keyword documents are the U12 additions and default to None, so
     an OFFLINE caller that fetches none of them gets exactly the pre-U12
     facts: no consuming segments, no threshold, complete, no key evidence.
+
+    `consuming_segments_json` maps a consuming segment's name to its own ZK
+    metadata, as `GET /segments/{table}/{segmentName}/metadata` serves it. A
+    segment the caller could not read is absent from the mapping and is
+    charged at nothing known, which takes the quote low.
     """
+    consuming = consuming_count(externalview_json, size_json)
     return TableFacts(
         table=table,
         types=table_types(config_json),
         time_column=time_column(config_json),
         segments=tuple(segment_facts(seg_metadata_json, size_json)),
         columns=columns,
-        consuming=consuming_count(externalview_json, size_json),
-        flush_rows=flush_rows(config_json),
+        consuming=consuming,
+        consuming_rows=_consuming_rows(
+            consuming, externalview_json, consuming_segments_json
+        ),
         complete=metadata_is_complete(seg_metadata_json, size_json),
         unique_keys=upsert_keys(config_json, schema_json, table_metadata_json)
         or single_segment_unique_columns(
             seg_metadata_json, config_json, schema_json, size_json
         ),
     )
+
+
+def _consuming_rows(
+    consuming: int,
+    externalview_json: Any,
+    consuming_segments_json: Mapping[str, Any] | None,
+) -> tuple[int | None, ...]:
+    """One stored row threshold per consuming segment, None where unknown.
+
+    The count is `consuming_count`'s, which is the larger of the externalview
+    and `missingSegments`. Where `missingSegments` names more segments than
+    the externalview does, the surplus has no name to fetch a threshold with
+    and so is charged at nothing known — a None, which takes the quote low.
+    """
+    if consuming <= 0:
+        return ()
+    documents = consuming_segments_json or {}
+    rows = [
+        stored_flush_rows(documents.get(name))
+        for name in consuming_segment_names(externalview_json)[:consuming]
+    ]
+    rows.extend([None] * (consuming - len(rows)))
+    return tuple(rows)
 
 
 def _segment_sizes(size_json: Any) -> dict[str, int]:

@@ -25,13 +25,43 @@ A key proven by name would have been a key spoofable by alias.
 
 ## Decision
 
-**A consuming segment is charged at the stream's flush threshold, in rows,
-unconditionally.** `realtime.segment.flush.threshold.rows` — or the
-deprecated `.threshold.size`, which the bundled quickstart config actually
-uses — bounds a consuming segment exactly: 25 of 25 sealed segments held
-exactly 100 docs at a threshold of 100, so a segment seals *at* the
-threshold rather than below it. The table's charge is `consuming ×
-flush_rows` on top of the k-largest sealed charge, where the sealed k is
+**A consuming segment is charged at the flush threshold stored in its own
+segment metadata, in rows, unconditionally.** A threshold bounds a consuming
+segment exactly: 25 of 25 sealed segments held exactly 100 docs at a
+threshold of 100, so a segment seals *at* the threshold rather than below it.
+
+*Corrected after review.* The threshold was read from the **table config**,
+and a config is not a bound on a segment already consuming. Each consuming
+segment stores the threshold it was created with in its LLC segment ZK
+metadata, and no later config change reaches it. Measured on `u12flush`: a
+`PUT` lowering `realtime.segment.flush.threshold.rows` from 100 to 10 was
+accepted, the live segment's `segment.flush.threshold.size` stayed **100**,
+it went on to hold 70 rows while still CONSUMING, and it sealed at **exactly
+100** — while the adapter, reading the config, quoted **110 rows against 170
+scanned at `confidence="high"`**. No reload helps; only `forceCommit` does,
+by sealing the segment so its replacement is born with the new value (which
+the replacement was, at 10). Autotune
+(`realtime.segment.flush.threshold.segment.size`) reaches the same place
+from the other end: with no row threshold in the config at all, the next
+segment was created with a stored threshold of 100 that the config never
+states. The worst case is `stored − config` rows per consuming segment — 90
+here — and it is unbounded in general.
+
+So the source is `GET /segments/{table}/{segmentName}/metadata` →
+`segment.flush.threshold.size`, one call per CONSUMING segment named in the
+externalview. That endpoint is a direct view of the segment's ZK
+simpleFields and was the only one of five probed that exposes the value;
+the key is the ZK spelling and not the in-JVM `sizeThresholdToFlushSegment`,
+which appears in no controller response. A consuming segment's live row
+count is not exposed anywhere, which is why the threshold is still the only
+bound there is. A 404 on that path is a threshold nobody knows and takes the
+quote low; a 403 is a refusal and raises, as every other controller refusal
+in this adapter does.
+
+The table's charge is the **sum of the consuming segments' own stored
+thresholds** — never a count times one of them, since two segments born
+either side of a config change hold different bounds and neither bounds the
+other — on top of the k-largest sealed charge, where the sealed k is
 `numSegmentsQueried − numConsumingSegmentsQueried` from the same
 single-stage EXPLAIN the pruning oracle already issues. The consuming term
 is added outside the pruning logic, because measured,
@@ -39,8 +69,9 @@ is added outside the pruning logic, because measured,
 `DaysSinceEpoch < 1` — filters excluding every possible value — while the
 broker pruned 6 of 7 segments (log §1.6). A time predicate cannot remove a
 consuming segment's cost, so the oracle must never be allowed to prune it
-away. No threshold in the config means no bound, which means `None`, which
-the gate denies.
+away. A consuming segment whose own metadata carries no readable threshold
+has no bound, which means `None`, which the gate denies — and the table
+config may not stand in for it.
 
 **The limit prune is trusted only under an explicit outermost LIMIT and no
 OFFSET.** The single-stage EXPLAIN prunes against Pinot's *own* implicit
@@ -61,8 +92,9 @@ called, but a port must not depend on its caller for a bound.
 **Its bytes are the one projected number in a Lagaam quotation.** No
 endpoint on 1.5.1 reports a consuming segment's size, so there is nothing
 to measure and nothing to validate a projection against. The charge is
-`flush_rows × ceil(max over the table's own sealed segments of charged
-bytes ÷ docs)` per consuming segment, taken per segment and maximised
+`ceil(that segment's stored threshold × the max over the table's own sealed
+segments of charged bytes ÷ docs)` per consuming segment, summed — each
+segment at its own threshold — taken per sealed segment and maximised
 rather than averaged, over exactly the bytes the sealed charge attributes —
 the referenced columns where a segment carries them all, the whole segment
 where it falls back — and ceiling-divided in integer arithmetic. Measured
@@ -82,8 +114,10 @@ table returned partition 0's two, then partition 1's two, then partition
 under-quote at `confidence="high"`. A table whose segments span servers is
 now denied, and the `pinot-realtime` profile pins each table to one server
 with a single replica group so the demo tables are complete. Fetching each
-segment's metadata individually is the path that would lift the denial, and
-it is U13.
+*sealed* segment's metadata individually is the path that would lift the
+denial, and it is U13 — the per-segment fetch the consuming charge now makes
+is over consuming segments only, and answers a different question (the
+stored threshold, which the bulk endpoint does not carry at all).
 
 **A join key is charged as a key only where the catalog proves it, and only
 where the scan ordinal agrees.** Two sources of evidence:
@@ -181,9 +215,12 @@ union, plus the consuming charge — and this path is unit-tested only.
   exclude it. It is the only number in the quotation that is not a
   measurement, which is why it is recorded here rather than left in a
   docstring.
+- **A realtime table costs one extra controller call per consuming
+  segment.** A table with no consuming segment pays nothing for it, and a
+  quotation over such a table makes exactly the requests it made before.
 - **A consuming segment is over-charged whenever it is not full.** It is
-  charged its whole flush threshold from the moment it exists, so a segment
-  holding one row is priced at a hundred. That is what an upper bound on
+  charged its whole stored flush threshold from the moment it exists, so a
+  segment holding one row is priced at a hundred. That is what an upper bound on
   data nothing reports is made of.
 - **An upsert table is over-charged in rows**, because a sealed upsert
   segment's `totalDocs` counts every version: 200 on disk against a visible
