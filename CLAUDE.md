@@ -18,7 +18,7 @@ Two halves:
 
 ## Locked architecture decisions (do not relitigate)
 - Hexagonal core: `QueryEngine` interface (port) + adapters. Trino adapter
-  first; native Pinot adapter second (v0.2). Core never imports engine SDKs.
+  and native Pinot adapter both implemented. Core never imports engine SDKs.
   `server/src/lagaam/core/` (grounding, cost guards, verification) is the IP —
   guard its boundaries hardest.
 - Token cost = METER: cumulative counting, enforced at the LLM proxy.
@@ -67,7 +67,9 @@ Two halves:
 
 ## Scope discipline (critical)
 v0.1 = Trino adapter + schema tools + EXPLAIN cost guard + query budget +
-read-only enforcement + audit log. NOTHING ELSE.
-Explicitly deferred: Pinot adapter (v0.2), operator/CRDs (month 3+),
+read-only enforcement + audit log — shipped. Native Pinot adapter (grounding,
+execution, quotation, realtime/join-key evidence — U9-U12, ADR 0008/0009) —
+shipped.
+Still deferred: operator/CRDs (month 3+), the Pinot demo GIF,
 UI/dashboard, multi-tenancy, RBAC beyond per-agent allowlists, GraphRAG.
 If a task expands scope, say so and push back before implementing.

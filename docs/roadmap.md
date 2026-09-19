@@ -19,11 +19,13 @@ One unit at a time; each unit ends in something demoable or a failing test.
 ## Phase 2 — Launch
 - README as landing page (GIF up top, quickstart ≤ 5 commands)
 - Benchmarks vs raw MCP wrappers: cost-guard catch rate on a bad-query suite
-- First public release; collect issues, fix fast, weekly release cadence
+- First public release; collect issues, fix fast, weekly release cadence —
+  **done** (v0.1.0 through v0.1.4, per `gh release list`)
 
 ## Phase 3 — Depth
 - Native Pinot adapter (realtime tables, upserts — the signature demo:
-  "agent answers on data that landed 2 seconds ago")
+  "agent answers on data that landed 2 seconds ago") — **done** (U9-U12,
+  ADR 0008/0009); the signature demo GIF is still open
 - Operator v0: Agent CRD + reconcile → pod + identity + limits ConfigMap
 - LiteLLM proxy wiring: token/dollar meter per agent
 - `kubectl get agents` demo GIF

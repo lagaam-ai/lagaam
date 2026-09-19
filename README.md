@@ -1,8 +1,8 @@
 ![Lagaam — every query priced before it runs](docs/banner.png)
 
 **Stop your agent from running the $500 query.** Lagaam is a governed MCP
-server that sits between your AI agents and your lakehouse (Trino today,
-Pinot next). Every query is schema-grounded, priced *before* it runs,
+server that sits between your AI agents and your lakehouse (Trino and
+Apache Pinot). Every query is schema-grounded, priced *before* it runs,
 checked against a budget, and audited — and every rejection tells the agent
 exactly how to fix its SQL.
 
@@ -125,15 +125,27 @@ kind that runs for $500.
 
 ## How it works
 
-A `QueryEngine` port with a Trino adapter and an experimental Pinot adapter.
-Every `query_data` call walks one pipeline: **validate (sqlglot AST) → table
-allowlist → cost quotation → budget gate → execute (row cap + timeout) →
-verify → audit**.
+A `QueryEngine` port with a Trino adapter and a native Pinot adapter —
+grounding, execution, and a synthesised cost quotation for both OFFLINE and
+REALTIME tables. Every `query_data` call walks one pipeline: **validate
+(sqlglot AST) → table allowlist → cost quotation → budget gate → execute
+(row cap + timeout) → verify → audit**.
 
-The quote is the engine's own plan, not a guess from the SQL text:
+On Trino, the quote is the engine's own plan, not a guess from the SQL text:
 `EXPLAIN (TYPE IO)` prices the bytes a query would scan, and
 `EXPLAIN (TYPE LOGICAL)` prices the widest row count any operator would
 build — the number a cross join blows and a `LIMIT` cannot hide.
+
+Pinot gives no such plan — every table scan reports the same placeholder
+row count whatever the table holds, and no endpoint reports bytes at all —
+so its quote is synthesised instead: from static segment metadata, the
+broker's own pruning oracle (how many segments survive the predicate), and
+the plan's join/union shape. A consuming (REALTIME) segment, which the
+controller reports as empty mid-flight, is priced at the stream's own flush
+threshold instead of zero. A join is charged its bound rather than the
+product wherever the catalog can prove the join key. See
+[ADR 0008](docs/adr/0008-pinot-quotation-is-adapter-synthesised.md) and
+[ADR 0009](docs/adr/0009-consuming-segments-and-proven-join-keys.md).
 
 Details in [docs/architecture.md](docs/architecture.md); the longer story in
 [docs/vision.md](docs/vision.md).
@@ -142,7 +154,7 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 `v0.1.4` — Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
-audit log. 976 unit + 144 integration tests (live Trino 476 and Pinot
+audit log. 1,031 unit + 145 integration tests (live Trino 476 and Pinot
 1.5.1, batch and realtime), mypy strict. `LAGAAM_ENGINE=pinot` starts the
 native Pinot adapter: grounding, execution and a quotation synthesised from
 segment metadata and the broker's own pruning oracle, for OFFLINE and
