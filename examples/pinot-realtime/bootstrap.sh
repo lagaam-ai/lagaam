@@ -22,10 +22,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROWS="${U12_AIRLINE_ROWS:-600}"
 UPSERT_ROWS=600
 
-# A failed run must not leave the feeds behind on the host.
+# A failed run must not leave the feeds — or a response body — behind on the
+# host. POST_BODY is set while post_json holds a temp file and cleared after
+# it removes one, so the trap never names a path that has been reused.
 FEED=""
 UP_FEED=""
-trap 'rm -f "${FEED-}" "${UP_FEED-}"' EXIT
+POST_BODY=""
+trap 'rm -f "${FEED-}" "${UP_FEED-}" "${POST_BODY-}"' EXIT
 
 wait_for_controller() {
   for _ in $(seq 1 60); do
@@ -93,22 +96,23 @@ schema_exists() { resource_exists schemas "$1"; }
 post_json() {
   local what="$1" url="$2" file="$3" body code
   body="$(mktemp -t u12_post.XXXXXX)"
+  POST_BODY="${body}"
   code="$(curl -s -o "${body}" -w '%{http_code}' -X POST "${url}" \
             -H 'Content-Type: application/json' --data-binary "@${file}")" || {
-    rm -f "${body}"
+    rm -f "${body}"; POST_BODY=""
     echo "POST ${url} (${what}) failed to connect" >&2
     exit 1
   }
   case "${code}" in
-    2??|409) rm -f "${body}"; return 0 ;;
+    2??|409) rm -f "${body}"; POST_BODY=""; return 0 ;;
   esac
   if grep -qi 'already exists' "${body}"; then
-    rm -f "${body}"
+    rm -f "${body}"; POST_BODY=""
     return 0
   fi
   echo "POST ${url} (${what}) answered HTTP ${code}:" >&2
   cat "${body}" >&2
-  rm -f "${body}"
+  rm -f "${body}"; POST_BODY=""
   exit 1
 }
 
