@@ -10,7 +10,10 @@ take their own k largest, because the segment with the most rows is not
 always the one with the most bytes.
 
 A number that cannot be bounded is None, which the budget gate denies. That
-is the whole contract: this module never returns a figure it cannot defend.
+is the whole contract: this module never returns a figure it cannot defend —
+with one named exception, the consuming segments' bytes, which no endpoint
+reports and which are projected from the worst bytes-per-doc ratio among
+this table's own sealed segments (ADR 0009).
 """
 
 from collections.abc import Iterable, Sequence
@@ -21,32 +24,58 @@ from lagaam.core.models import CostEstimate
 
 
 def surviving_docs(facts: TableFacts, surviving: int | None) -> int | None:
-    """Docs in the k largest segments by docs, or None if any is unknown.
+    """Docs in the k largest sealed segments, plus the consuming charge.
 
-    One unknown segment poisons the sum: the others do not bound it.
+    One unknown segment poisons the sum: the others do not bound it. So does
+    incomplete metadata, which means the segments in hand are not the table.
+
+    The consuming term is added outside the k-largest logic and is never
+    pruned: measured, numConsumingSegmentsQueried stayed 1 under filters
+    excluding every possible value while the broker pruned 6 of 7 segments.
     """
+    if not facts.complete:
+        return None
+    consuming = _consuming_docs(facts)
+    if consuming is None:
+        return None
     counts = [segment.docs for segment in facts.segments]
-    if not counts or any(count is None for count in counts):
+    if any(count is None for count in counts):
         return None
     known = sorted((count for count in counts if count is not None), reverse=True)
-    return sum(known[: _k(surviving, len(known))])
+    if not known:
+        return consuming if facts.consuming else None
+    return sum(known[: _k(surviving, len(known))]) + consuming
 
 
 def surviving_bytes(
     facts: TableFacts, surviving: int | None, columns: frozenset[str] | None
 ) -> int | None:
-    """Bytes in the k largest segments, charging only referenced columns.
+    """Bytes in the k largest sealed segments, plus the consuming projection.
 
     A segment matching none of the referenced columns is charged whole,
     and unresolvable columns fall back to whole segments table-wide.
+
+    The consuming term is the one projected number in a Lagaam quotation: a
+    consuming segment reports -1 bytes on every probe, so its bytes are its
+    own stored flush threshold times the worst bytes-per-doc ratio observed
+    on this table's own sealed segments, taken per segment and maximised,
+    never averaged. No sealed segment with docs > 0 leaves nothing to take a
+    ratio from, and inventing one would be a guess.
     """
+    if not facts.complete:
+        return None
     sizes = _column_sizes(facts, columns)
     if sizes is None:
         sizes = [segment.total_bytes for segment in facts.segments]
-    if not sizes or any(size is None for size in sizes):
+    if any(size is None for size in sizes):
+        return None
+    consuming = _consuming_bytes(facts, sizes)
+    if consuming is None:
         return None
     known = sorted((size for size in sizes if size is not None), reverse=True)
-    return sum(known[: _k(surviving, len(known))])
+    if not known:
+        return None
+    return sum(known[: _k(surviving, len(known))]) + consuming
 
 
 def quote(
@@ -63,15 +92,8 @@ def quote(
         return CostEstimate(
             max_intermediate_rows=max_intermediate_rows, confidence="low"
         )
-    # A consuming segment reports zero docs and -1 bytes, so a REALTIME half
-    # is an unbounded unknown until U12 charges it at its flush threshold.
-    realtime = any("REALTIME" in facts.types for facts, _ in tables)
     rows = _total(surviving_docs(facts, k) for facts, k in tables)
-    total_bytes = (
-        None
-        if realtime
-        else _total(surviving_bytes(facts, k, columns) for facts, k in tables)
-    )
+    total_bytes = _total(surviving_bytes(facts, k, columns) for facts, k in tables)
     return CostEstimate(
         scanned_bytes=total_bytes,
         row_estimate=rows,
@@ -120,6 +142,62 @@ def _column_sizes(
                 matched = True
         sizes.append(total if matched else segment.total_bytes)
     return sizes
+
+
+def _consuming_docs(facts: TableFacts) -> int | None:
+    """Rows the consuming segments may hold, or None if nothing bounds them.
+
+    Each segment carries its own threshold, stored when it was created, so
+    the charge is their sum and never a count times one of them: two
+    segments born either side of a config change hold different bounds, and
+    neither is a bound on the other.
+    """
+    if facts.consuming <= 0:
+        return 0
+    if any(rows is None for rows in facts.consuming_rows):
+        return None
+    return sum(rows for rows in facts.consuming_rows if rows is not None)
+
+
+def _consuming_bytes(facts: TableFacts, sizes: list[int | None]) -> int | None:
+    """Bytes the consuming segments may hold, projected from sealed ratios.
+
+    `sizes` is per segment in facts.segments order and carries the same
+    per-segment column-or-whole choice the sealed charge made, so the ratio
+    is taken over exactly the bytes being charged.
+
+    A sealed segment with no doc count takes the whole bound down rather
+    than dropping out of the maximum: the segment nobody counted could be
+    the densest one, and the ratio would then bound nothing.
+    """
+    if facts.consuming <= 0:
+        return 0
+    if any(rows is None for rows in facts.consuming_rows):
+        return None
+    if any(segment.docs is None for segment in facts.segments):
+        # A segment left out of the ratio could be the densest on the table.
+        return None
+    # The worst ratio is kept as the exact fraction bytes/docs and applied
+    # per segment, so the threshold multiplies before the ceiling exactly as
+    # a single-threshold table always did.
+    # Compared by cross-multiplication rather than as floats: a ratio of two
+    # segment byte counts is not a number a float is guaranteed to order.
+    worst: tuple[int, int] | None = None
+    for segment, size in zip(facts.segments, sizes):
+        if not segment.docs or size is None:
+            continue
+        if worst is None or size * worst[1] > worst[0] * segment.docs:
+            worst = (size, segment.docs)
+    if worst is None:
+        return None
+    worst_bytes, worst_docs = worst
+    # Each consuming segment at its own stored threshold, not the count
+    # times one of them: they need not have been created equal.
+    return sum(
+        (rows * worst_bytes + worst_docs - 1) // worst_docs
+        for rows in facts.consuming_rows
+        if rows is not None
+    )
 
 
 def _total(values: Iterable[int | None]) -> int | None:

@@ -7,9 +7,19 @@ Then: uv run pytest -m integration
 import pytest
 
 from lagaam.adapters.pinot.client import PinotClient
-from lagaam.adapters.pinot.engine import PinotEngine
+from lagaam.adapters.pinot.engine import (
+    _EXPLAIN_PRUNING,
+    _EXPLAIN_TIMEOUT_MS,
+    _OPT_TIMEOUT_MS,
+    PinotEngine,
+)
+from lagaam.adapters.pinot.metadata import stored_flush_rows
 from lagaam.adapters.pinot.names import two_part_sql
-from lagaam.adapters.pinot.response import result_failure
+from lagaam.adapters.pinot.response import (
+    consuming_segments_queried,
+    result_failure,
+    surviving_segments,
+)
 from lagaam.core.budget import (
     DEFAULT_MAX_INTERMEDIATE_ROWS,
     DEFAULT_MAX_SCAN_BYTES,
@@ -535,3 +545,476 @@ async def test_a_lowercase_table_quotes_what_the_canonical_one_does(
     assert lowered.confidence == "high"
     assert lowered.row_estimate == canonical.row_estimate
     assert lowered.scanned_bytes == canonical.scanned_bytes
+
+
+def _realtime_engine() -> PinotEngine:
+    return PinotEngine(
+        controller_url="http://localhost:9001", broker_url="http://localhost:8001"
+    )
+
+
+async def test_a_realtime_table_grounds_without_a_row_count(
+    pinot_realtime_ready: None,
+) -> None:
+    """The STREAM half of the profile answers, and a REALTIME table carries no
+    grounding count: the controller's numRows is an OFFLINE fact, so a card
+    built from a consuming table has to say None rather than guess."""
+    engine = _realtime_engine()
+    card = await engine.describe_table("pinot", "default", "airlineStats")
+    assert card.table == "airlineStats"
+    assert card.row_estimate is None
+
+    result = await engine.execute(
+        "SELECT count(*) FROM pinot.default.airlineStats LIMIT 1",
+        max_rows=1,
+        timeout_seconds=30.0,
+    )
+    assert result.rows[0][0] > 0
+
+
+# --- U12 Task 8: the realtime charge and the key evidence, against the live
+# STREAM instance on :9001/:8001. Every number below is derived from the
+# cluster at test time; nothing is transcribed from a measurement log.
+
+
+async def _realtime_count(engine: PinotEngine, table: str) -> int:
+    """count(*) through the broker, on the engine these quotes bound."""
+    body = await engine._client.broker_query(
+        f"SELECT count(*) FROM {table}", "useMultistageEngine=true"
+    )
+    count = body["resultTable"]["rows"][0][0]
+    assert isinstance(count, int) and not isinstance(count, bool)
+    return count
+
+
+async def _realtime_scanned(engine: PinotEngine, sql: str) -> int:
+    """numDocsScanned from really executing the agent's own SQL.
+
+    The quotation is a bound on execution, so the only honest comparison is
+    against the same statement run on the same (multi-stage) engine the
+    quote is written for — not against a count(*) of the table.
+    """
+    body = await engine._client.broker_query(
+        two_part_sql(sql, PinotEngine.CATALOG), "useMultistageEngine=true"
+    )
+    assert not body.get("exceptions"), body.get("exceptions")
+    scanned = body.get("numDocsScanned")
+    assert isinstance(scanned, int) and not isinstance(scanned, bool)
+    return scanned
+
+
+async def _config_flush_rows(engine: PinotEngine, table: str) -> int:
+    """The table config's flush threshold, which is not what a segment uses."""
+    config = await engine._client.controller_get(f"/tables/{table}", database="default")
+    maps = config["REALTIME"]["ingestionConfig"]["streamIngestionConfig"][
+        "streamConfigMaps"
+    ]
+    return int(maps[0]["realtime.segment.flush.threshold.rows"])
+
+
+async def _consuming_names(engine: PinotEngine, table: str) -> list[str]:
+    """The CONSUMING segment names the live externalview carries."""
+    body = await engine._client.controller_get(
+        f"/tables/{table}/externalview", database="default"
+    )
+    return [
+        name
+        for name, states in body["REALTIME"].items()
+        if "CONSUMING" in states.values()
+    ]
+
+
+async def _consuming_charge(engine: PinotEngine, table: str) -> int:
+    """The table's consuming charge in rows: each segment's stored threshold.
+
+    Read from each consuming segment's own LLC ZK metadata, because that is
+    what bounds it — a table config an operator lowered under a segment
+    already consuming does not. Measured on `u12flush`: a `PUT` of 100 -> 10
+    left the live segment at 100 and it sealed at exactly 100.
+    """
+    total = 0
+    for name in await _consuming_names(engine, table):
+        body = await engine._client.controller_get(
+            f"/segments/{table}/{name}/metadata", database="default"
+        )
+        total += int(body["segment.flush.threshold.size"])
+    return total
+
+
+async def test_realtime_the_consuming_charge_is_the_segments_stored_threshold(
+    pinot_realtime_ready: None,
+) -> None:
+    """The threshold the adapter charges is the segment's own, not the config's.
+
+    Both are 100 on this instance, so the numbers agree today — the test is
+    here so a divergence becomes visible rather than silent. It also pins
+    the request the engine makes: `GET /segments/{t}/{segment}/metadata`,
+    the only controller path measured to expose the stored value.
+    """
+    engine = _realtime_engine()
+    names = await _consuming_names(engine, "airlineStats")
+    assert names, "this shape is about the consuming charge"
+    stored = []
+    for name in names:
+        body = await engine._client.controller_get(
+            f"/segments/airlineStats/{name}/metadata", database="default"
+        )
+        assert body["segment.realtime.status"] == "IN_PROGRESS"
+        assert stored_flush_rows(body) is not None
+        stored.append(stored_flush_rows(body))
+    assert stored == [100] * len(names)
+    assert await _config_flush_rows(engine, "airlineStats") == 100
+
+    # And the quote really is built from it: the facts the engine gathers
+    # carry one stored threshold per consuming segment.
+    facts = await engine._table_facts("default", "airlineStats", None, {}, {})
+    assert facts.consuming == len(names)
+    assert list(facts.consuming_rows) == stored
+
+
+async def _externalview_states(engine: PinotEngine, table: str) -> dict[str, int]:
+    """How many segment replicas sit in each state right now."""
+    body = await engine._client.controller_get(
+        f"/tables/{table}/externalview", database="default"
+    )
+    counts: dict[str, int] = {}
+    for states in body["REALTIME"].values():
+        for state in states.values():
+            counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+async def _sealed_segment_docs(engine: PinotEngine, table: str) -> list[int]:
+    """Per-segment docs for the sealed segments, from the controller.
+
+    A consuming segment reports -1 bytes in /size and carries no useful
+    entry in the metadata response, so the size report is what says which
+    names are sealed.
+    """
+    metadata = await engine._client.controller_get(
+        f"/segments/{table}/metadata", database="default"
+    )
+    size = await engine._client.controller_get(
+        f"/tables/{table}/size", database="default"
+    )
+    reported = {
+        name: body["reportedSizeInBytes"]
+        for name, body in (size["realtimeSegments"]["segments"] or {}).items()
+    }
+    return [
+        body["totalDocs"]
+        for name, body in metadata.items()
+        if reported.get(name, -1) >= 0
+    ]
+
+
+async def _sealed_docs(engine: PinotEngine, table: str) -> int:
+    """Docs in the sealed segments only."""
+    return sum(await _sealed_segment_docs(engine, table))
+
+
+async def test_realtime_an_unfiltered_select_is_priced_not_denied(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (a). A table with a consuming segment quotes high, with bytes,
+    and bounds what the engine really scans for that same statement."""
+    engine = _realtime_engine()
+    sql = "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 1000"
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None and estimate.scanned_bytes > 0
+    assert estimate.row_estimate is not None
+    # The bound that matters: it covers the execution, derived not transcribed.
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+    # A LIMIT large enough to prune nothing also covers the whole live table.
+    assert estimate.row_estimate >= await _realtime_count(engine, "airlineStats")
+
+
+async def test_realtime_rows_are_the_sealed_sum_plus_the_consuming_charge(
+    pinot_realtime_ready: None,
+) -> None:
+    """The quote's own arithmetic, with every term derived from the cluster:
+    the k largest sealed segments' docs, plus consuming segments x this
+    table's flush threshold.
+
+    k is the survivor count the pruning oracle reports, net of the consuming
+    segments it counts among them — those are charged by the threshold, not
+    by their (zero) docs.
+    """
+    engine = _realtime_engine()
+    sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
+    estimate = await engine.estimate_cost(sql)
+    consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
+    charge = await _consuming_charge(engine, "airlineStats")
+    assert consuming > 0, "this shape is about the consuming charge"
+
+    explain = await engine._explain(
+        f"{_EXPLAIN_PRUNING}{two_part_sql(sql, PinotEngine.CATALOG)}",
+        f"{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+    )
+    surviving = surviving_segments(explain, trust_limit_prune=True)
+    assert surviving is not None
+    sealed_k = max(1, surviving - consuming_segments_queried(explain))
+
+    # The k largest sealed segments, from the controller's own docs counts.
+    docs = await _sealed_segment_docs(engine, "airlineStats")
+    largest = sum(sorted(docs, reverse=True)[:sealed_k])
+
+    # Exact, because the design makes this term-by-term exact.
+    assert estimate.row_estimate == largest + charge
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+
+async def test_realtime_the_consuming_charge_survives_an_impossible_filter(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (b). A predicate excluding every value prunes sealed segments
+    but can never prune the consuming one, so the charge stays."""
+    engine = _realtime_engine()
+    sql = (
+        "SELECT Carrier FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch > 99999 LIMIT 1000"
+    )
+    estimate = await engine.estimate_cost(sql)
+    consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
+    charge = await _consuming_charge(engine, "airlineStats")
+    assert consuming > 0
+    assert estimate.row_estimate is not None
+    # The charge is unconditional: it is in the quote even though the filter
+    # matches nothing at all.
+    assert estimate.row_estimate >= charge
+    # And it still bounds the (empty) execution.
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+
+async def test_realtime_a_selective_filter_shrinks_the_sealed_k(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (c). The consuming charge is unconditional; the sealed one is
+    not — a value filter keeping only some segments quotes fewer rows."""
+    engine = _realtime_engine()
+    unfiltered_sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
+    # The low end of this table's own live time range, so some sealed
+    # segments survive and some are pruned.
+    body = await engine._client.broker_query(
+        "SELECT min(DaysSinceEpoch) FROM airlineStats", "useMultistageEngine=true"
+    )
+    low = body["resultTable"]["rows"][0][0]
+    filtered_sql = (
+        "SELECT Carrier FROM pinot.default.airlineStats "
+        f"WHERE DaysSinceEpoch = {low} LIMIT 1000"
+    )
+    unfiltered = await engine.estimate_cost(unfiltered_sql)
+    filtered = await engine.estimate_cost(filtered_sql)
+    assert unfiltered.row_estimate is not None
+    assert filtered.row_estimate is not None
+    assert filtered.row_estimate < unfiltered.row_estimate
+    # Still a bound on what that filtered statement really scans.
+    assert filtered.row_estimate >= await _realtime_scanned(engine, filtered_sql)
+
+
+async def test_realtime_bytes_are_present_at_high_confidence(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (f). A consuming segment reports -1 bytes on every probe, so
+    without the projection from sealed ratios this table would quote no
+    bytes at all and be denied rather than priced."""
+    engine = _realtime_engine()
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
+    )
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None
+    assert estimate.scanned_bytes > 0
+
+
+async def test_realtime_describe_table_still_carries_no_row_estimate(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (g). Grounding is untouched: the controller's numRows is not a
+    pre-execution fact for a REALTIME table, so the card withholds it."""
+    engine = _realtime_engine()
+    card = await engine.describe_table("pinot", "default", "airlineStats")
+    assert card.row_estimate is None
+    assert card.columns
+
+
+async def test_realtime_an_offset_query_ignores_the_limit_prune(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (h). The planner prices OFFSET as though it were absent, so the
+    limit prune is not believed and every sealed segment is charged."""
+    engine = _realtime_engine()
+    sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 10 OFFSET 5"
+    estimate = await engine.estimate_cost(sql)
+    sealed = await _sealed_docs(engine, "airlineStats")
+    consuming = (await _externalview_states(engine, "airlineStats")).get("CONSUMING", 0)
+    charge = await _consuming_charge(engine, "airlineStats")
+    assert estimate.row_estimate is not None
+    # Every sealed segment's docs plus the consuming charge — no prune.
+    assert estimate.row_estimate >= sealed + charge
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+
+async def test_realtime_a_mixed_case_name_quotes_what_the_canonical_one_does(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (i). The broker runs either spelling; the controller's REST
+    paths are case-sensitive, so the mixed-case one must not 404 into a
+    false denial on the realtime instance either."""
+    engine = _realtime_engine()
+    mixed = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.AIRLINESTATS LIMIT 1000"
+    )
+    canonical = await engine.estimate_cost(
+        "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
+    )
+    assert canonical.confidence == "high"
+    assert mixed.confidence == "high"
+    assert mixed.row_estimate == canonical.row_estimate
+    assert mixed.scanned_bytes == canonical.scanned_bytes
+
+
+async def _realtime_docs_bound(engine: PinotEngine, table: str) -> int:
+    """The per-table docs bound the quotation walker itself charges, D.
+
+    Derived from the controller, not from a single-table quote: that quote
+    carries the limit prune, so it answers about a k-largest subset (600 for
+    these tables) rather than the whole table the join walks. D is every
+    sealed segment's totalDocs plus each consuming segment's own stored
+    flush threshold — the same documents the completeness check compares,
+    and the same arithmetic quote.py applies.
+    """
+    size = await engine._client.controller_get(
+        f"/tables/{table}/size", database="default"
+    )
+    segments = size["realtimeSegments"]["segments"] or {}
+    metadata = await engine._client.controller_get(
+        f"/segments/{table}/metadata", database="default"
+    )
+    # The premise of every number below: the metadata really is the table.
+    named = set(segments)
+    assert named <= set(metadata), (
+        f"{table} metadata is short of /size — the segments split across "
+        f"servers again and D cannot be derived ({sorted(named - set(metadata))})"
+    )
+    sealed_docs = 0
+    consuming = 0
+    for name, body in segments.items():
+        if body["reportedSizeInBytes"] < 0:
+            consuming += 1
+            continue
+        sealed_docs += int(metadata[name]["totalDocs"])
+    assert consuming > 0, f"{table} has no consuming segment"
+    return sealed_docs + await _consuming_charge(engine, table)
+
+
+async def _realtime_true_pairs(engine: PinotEngine, table: str) -> int:
+    """The join's real output size: sum over keys of (versions per key)^2."""
+    body = await engine._client.broker_query(
+        f"SELECT SUM(c*c) FROM (SELECT pk, COUNT(*) c FROM {table} GROUP BY pk) t",
+        "useMultistageEngine=true",
+    )
+    assert not body.get("exceptions"), body.get("exceptions")
+    return int(body["resultTable"]["rows"][0][0])
+
+
+async def test_realtime_an_upsert_self_join_is_bounded_by_its_key(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (d), live. u12upsert declares pk as its primary key, so a
+    self-join on pk is at most one match per key: the walker charges
+    min(left, right) + left + right instead of the product.
+
+    Every number is derived — D from the controller's own segment metadata,
+    the true pair count from the broker — so this fails loudly rather than
+    vacuously if the cluster layout changes.
+    """
+    engine = _realtime_engine()
+    docs = await _realtime_docs_bound(engine, "u12upsert")
+    estimate = await engine.estimate_cost(
+        "SELECT a.pk FROM pinot.default.u12upsert a "
+        "JOIN pinot.default.u12upsert b ON a.pk = b.pk LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == min(docs, docs) + docs + docs
+    # The whole point of the key rule: strictly under the product bound.
+    assert estimate.max_intermediate_rows < docs * docs + 2 * docs
+    # And still a bound, never a guess.
+    assert estimate.max_intermediate_rows >= await _realtime_true_pairs(
+        engine, "u12upsert"
+    )
+
+
+async def test_realtime_the_plain_twin_self_join_is_charged_the_product(
+    pinot_realtime_ready: None,
+) -> None:
+    """Shape (e), live. The contrast that makes (d) mean anything: the same
+    rows, the same topic, the same SQL — but no declared primary key, so
+    nothing rules out every row matching every row and the walker charges
+    the full product."""
+    engine = _realtime_engine()
+    docs = await _realtime_docs_bound(engine, "u12plain")
+    estimate = await engine.estimate_cost(
+        "SELECT a.pk FROM pinot.default.u12plain a "
+        "JOIN pinot.default.u12plain b ON a.pk = b.pk LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert estimate.max_intermediate_rows == docs * docs + 2 * docs
+    assert estimate.max_intermediate_rows >= await _realtime_true_pairs(
+        engine, "u12plain"
+    )
+
+
+async def test_realtime_the_upsert_pk_is_the_schema_s_primary_key(
+    pinot_realtime_ready: None,
+) -> None:
+    """The evidence the key rule would read, if the table could be sized:
+    u12upsert declares a primary key and its twin does not."""
+    engine = _realtime_engine()
+    upsert = await engine._client.controller_get("/schemas/u12upsert")
+    plain = await engine._client.controller_get("/schemas/u12plain")
+    assert upsert.get("primaryKeyColumns") == ["pk"]
+    assert not plain.get("primaryKeyColumns")
+    # And the upsert view really does collapse to one row per key, where the
+    # twin on the same topic keeps every version.
+    keys = await _realtime_count(engine, "u12upsert")
+    versions = await _realtime_count(engine, "u12plain")
+    assert keys < versions
+
+
+async def test_realtime_a_bare_select_bounds_its_own_execution(
+    pinot_realtime_ready: None,
+) -> None:
+    """The soundness rule, on the shape that used to break it (ruling 8.1).
+
+    The pruning EXPLAIN of a bare select reports numSegmentsPrunedByLimit 5
+    of 7 queried — Pinot planned it under its own implicit LIMIT 10 — while
+    executing the same SQL on the multi-stage engine scans the whole table.
+    `trust_limit_prune` now requires an explicit LIMIT, so the prune is not
+    read and every sealed segment is charged.
+    """
+    engine = _realtime_engine()
+    sql = "SELECT Carrier FROM pinot.default.airlineStats"
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "high"
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+
+async def test_a_bare_select_bounds_its_own_execution_on_the_batch_instance(
+    pinot_ready: None,
+) -> None:
+    """The same shape on the OFFLINE quickstart, where the under-quote was
+    worst: 422 against 9,746 docs scanned, a 23x breach at high confidence."""
+    engine = _engine()
+    sql = "SELECT Carrier FROM pinot.default.airlineStats"
+    estimate = await engine.estimate_cost(sql)
+    body = await engine._client.broker_query(
+        two_part_sql(sql, PinotEngine.CATALOG), "useMultistageEngine=true"
+    )
+    scanned = body["numDocsScanned"]
+    assert scanned >= 9746
+    assert estimate.confidence == "high"
+    assert estimate.row_estimate is not None
+    assert estimate.row_estimate >= scanned

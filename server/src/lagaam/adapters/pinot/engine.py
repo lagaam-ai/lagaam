@@ -9,6 +9,7 @@ httpx exceptions and broker messages never escape.
 
 import math
 import os
+from dataclasses import dataclass
 from typing import Any
 
 import anyio
@@ -23,20 +24,24 @@ from lagaam.adapters.pinot.client import (
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
+    consuming_segment_names,
     schema_columns,
     table_facts,
     table_names,
     table_schema,
+    upsert_config_present,
 )
 from lagaam.adapters.pinot.names import (
+    has_limit,
     has_offset,
     referenced_columns,
     referenced_tables,
     two_part_sql,
 )
-from lagaam.adapters.pinot.plan import max_intermediate_rows
+from lagaam.adapters.pinot.plan import key_ordinals, max_intermediate_rows
 from lagaam.adapters.pinot.quote import quote, surviving_docs
 from lagaam.adapters.pinot.response import (
+    consuming_segments_queried,
     parse_query_result,
     result_failure,
     surviving_segments,
@@ -117,6 +122,77 @@ def _plan_cell(body: object) -> str | None:
     if not isinstance(first, list) or len(first) < 2:
         return None
     return first[1] if isinstance(first[1], str) else None
+
+
+@dataclass(frozen=True)
+class _Keycols:
+    """What the key-ordinal EXPLAIN of one table has to be spelled with.
+
+    Both spellings come from the controller — the listing for the table, the
+    schema for the columns — and never from the agent's SQL, which reaches
+    the broker case-insensitively and would name a column the plan does not.
+    """
+
+    database: str
+    table: str
+    columns: tuple[str, ...]
+
+
+def _is_bare_identifier(name: str) -> bool:
+    """Is this a name the ordinals EXPLAIN can carry as it stands?
+
+    A key column's spelling comes from the schema document and is
+    interpolated into a SELECT list, so it is checked like any other name
+    this module puts in a statement: a controller is trusted for facts, not
+    for syntax, and a name carrying a comma or a comment marker would be a
+    second clause rather than a column.
+    """
+    return bool(name) and name.isascii() and name.replace("_", "").isalnum()
+
+
+def _resolved_columns(
+    schema_json: Any, columns: frozenset[str] | None
+) -> dict[str, str]:
+    """The referenced columns this table carries, lowercase to its spelling.
+
+    The controller's `?columns=` filter is case-sensitive and SQL is not,
+    so asking for `playerid` returns nothing at all and the segment reads
+    as though the column were free. A name the schema does not carry
+    belongs to another table (or to no table) and is not asked for.
+
+    Empty when there is nothing to resolve or no schema to resolve
+    against, which charges whole segments — the fail-safe side.
+    """
+    if not columns or schema_json is None:
+        return {}
+    spellings = schema_columns(schema_json)
+    return {
+        lowered: spelling
+        for lowered, spelling in spellings.items()
+        if lowered in columns
+    }
+
+
+def _schema_name(config_json: Any, resolved: str) -> str:
+    """The schema document's own name for this table.
+
+    segmentsConfig.schemaName was absent on all four configs captured, so the
+    fallback is the path that normally runs — and it has to be the resolved
+    listing spelling, never the config's own tableName, which comes back
+    suffixed ("u12upsert_REALTIME") and would 404 as a schema path.
+    """
+    if isinstance(config_json, dict):
+        for key in ("REALTIME", "OFFLINE"):
+            half = config_json.get(key)
+            if not isinstance(half, dict):
+                continue
+            segments_config = half.get("segmentsConfig")
+            if not isinstance(segments_config, dict):
+                continue
+            name = segments_config.get("schemaName")
+            if isinstance(name, str) and name:
+                return name
+    return resolved
 
 
 class PinotEngine:
@@ -285,9 +361,17 @@ class PinotEngine:
         # One /tables listing per quotation, not one per table: every table
         # here shares a database, and a self-join reads the same name twice.
         listings: dict[str, list[str]] = {}
+        # Lowercase database.table to the keycols EXPLAIN's own subject, filled
+        # in only for a table whose keys were proven; see _key_ordinals.
+        keycols: dict[str, _Keycols] = {}
         try:
             facts = [
-                (database, await self._table_facts(database, table, columns, listings))
+                (
+                    database,
+                    await self._table_facts(
+                        database, table, columns, listings, keycols
+                    ),
+                )
                 for database, table in tables
             ]
         except PinotForbidden as exc:
@@ -296,11 +380,16 @@ class PinotEngine:
             # A quotation nobody could build is a denial at the gate, which
             # is the safe answer; an EngineError would read as an outage.
             return CostEstimate(confidence="low")
+        # The planner prices a limit the execution may not have: an OFFSET it
+        # ignores, and a missing LIMIT it supplies itself. Either way the
+        # prune describes a query that will never run (ruling 8.1).
         surviving = await self._surviving(
-            two_part, len(tables), trust_limit_prune=not has_offset(sql)
+            two_part,
+            len(tables),
+            trust_limit_prune=has_limit(sql) and not has_offset(sql),
         )
         located = [(database, fact, surviving) for database, fact in facts]
-        widest = await self._widest_rows(two_part, located)
+        widest = await self._widest_rows(two_part, located, keycols)
         # The plan folds a repeated scan into one node and referenced_tables
         # dedupes, so a table read N times would be charged once: measured,
         # a self-join quoted 9,746 rows against 19,492 scanned, and UNION ALL
@@ -327,6 +416,7 @@ class PinotEngine:
         table: str,
         columns: frozenset[str] | None,
         listings: dict[str, list[str]],
+        keycols: dict[str, _Keycols],
     ) -> TableFacts:
         """One table's config, segment metadata and size, from the controller.
 
@@ -350,56 +440,178 @@ class PinotEngine:
                     catalog=self.CATALOG, schema=database, table=table
                 )
             listings[database] = table_names(body)
-        part = PinotClient.path_part(
-            _spelled(self.CATALOG, database, table, listings[database])
-        )
-        resolved = await self._table_columns(part, database, columns)
+        spelled = _spelled(self.CATALOG, database, table, listings[database])
+        part = PinotClient.path_part(spelled)
+        # Fetched at most once: shared below with _record_keycols.
+        table_schema_json: Any = None
+        table_schema_fetched = False
+        if columns:
+            table_schema_json = await self._client.controller_get(
+                f"/tables/{part}/schema", database=database
+            )
+            table_schema_fetched = True
+            if table_schema_json is PinotClient.NotFound:
+                table_schema_json = None
+        resolved = _resolved_columns(table_schema_json, columns)
         params: dict[str, str | list[str]] | None = (
             {"columns": sorted(resolved.values())} if resolved else None
         )
         config_json = await self._client.controller_get(
             f"/tables/{part}", database=database
         )
+        config = None if config_json is PinotClient.NotFound else config_json
         seg_json = await self._client.controller_get(
             f"/segments/{part}/metadata", params=params, database=database
         )
         size_json = await self._client.controller_get(
             f"/tables/{part}/size", database=database
         )
-        return table_facts(
+        externalview_json = await self._client.controller_get(
+            f"/tables/{part}/externalview", database=database
+        )
+        externalview = (
+            None if externalview_json is PinotClient.NotFound else externalview_json
+        )
+        consuming_segments_json = await self._consuming_segments(
+            database, part, externalview
+        )
+        schema_json: Any = None
+        table_metadata_json: Any = None
+        if upsert_config_present(config):
+            # Two more documents, only where the config says they say
+            # something: primaryKeyColumns lives on the schema, and the PK
+            # count map on the table metadata has to agree with it.
+            try:
+                schema_part = PinotClient.path_part(_schema_name(config, spelled))
+            except ValueError as exc:
+                raise TableNotFoundError(
+                    catalog=self.CATALOG, schema=database, table=table
+                ) from exc
+            schema_body = await self._client.controller_get(
+                f"/schemas/{schema_part}", database=database
+            )
+            schema_json = None if schema_body is PinotClient.NotFound else schema_body
+            metadata_body = await self._client.controller_get(
+                f"/tables/{part}/metadata", database=database
+            )
+            table_metadata_json = (
+                None if metadata_body is PinotClient.NotFound else metadata_body
+            )
+        facts = table_facts(
             table,
-            None if config_json is PinotClient.NotFound else config_json,
+            config,
             None if seg_json is PinotClient.NotFound else seg_json,
             None if size_json is PinotClient.NotFound else size_json,
             frozenset(resolved),
+            externalview_json=externalview,
+            consuming_segments_json=consuming_segments_json,
+            # The upsert branch's /schemas/{name} where there was one, else the
+            # /tables/{t}/schema this call already fetched to resolve columns.
+            # Source (b)'s nullability gate reads whichever arrives; without
+            # one it establishes nothing and yields no key.
+            schema_json=schema_json or table_schema_json,
+            table_metadata_json=table_metadata_json,
         )
+        if facts.unique_keys:
+            await self._record_keycols(
+                keycols,
+                database,
+                table,
+                part,
+                spelled,
+                schema_json,
+                table_schema_json,
+                table_schema_fetched,
+                facts,
+            )
+        return facts
 
-    async def _table_columns(
-        self, part: str, database: str, columns: frozenset[str] | None
-    ) -> dict[str, str]:
-        """The referenced columns this table carries, lowercase to its spelling.
+    async def _consuming_segments(
+        self, database: str, part: str, externalview: Any
+    ) -> dict[str, Any]:
+        """Each CONSUMING segment's own ZK metadata, keyed by segment name.
 
-        The controller's `?columns=` filter is case-sensitive and SQL is not,
-        so asking for `playerid` returns nothing at all and the segment reads
-        as though the column were free. A name the schema does not carry
-        belongs to another table (or to no table) and is not asked for.
+        A consuming segment's row threshold is the one it was created with,
+        stored in its LLC segment ZK metadata, and the table config is not a
+        bound on it: measured on `u12flush`, a `PUT` lowering the config
+        100 -> 10 left the live segment's stored threshold at 100 and it
+        sealed at exactly 100, while the adapter — reading the config —
+        quoted 110 rows against 170 scanned, at `confidence="high"`.
 
-        Empty when there is nothing to resolve or no schema to resolve
-        against, which charges whole segments — the fail-safe side.
+        One GET per consuming segment, and none at all on a table with none,
+        so an OFFLINE table pays nothing for this. A segment name comes from
+        the externalview, which is the controller's own spelling, but it
+        still goes through `path_part`: a name no URL path can carry is a
+        segment whose threshold is simply unknown, not a request to make.
+
+        A 404 leaves the segment out, which charges it at nothing known and
+        takes the quote low. A refusal is not an outage and is raised, as
+        every other controller refusal in this adapter is; a transport
+        failure likewise propagates, and `estimate_cost` turns it into a low
+        quote there.
         """
-        if not columns:
-            return {}
-        schema_json = await self._client.controller_get(
-            f"/tables/{part}/schema", database=database
+        documents: dict[str, Any] = {}
+        for name in consuming_segment_names(externalview):
+            try:
+                segment_part = PinotClient.path_part(name)
+            except ValueError:
+                continue
+            body = await self._client.controller_get(
+                f"/segments/{part}/{segment_part}/metadata", database=database
+            )
+            if body is not PinotClient.NotFound:
+                documents[name] = body
+        return documents
+
+    async def _record_keycols(
+        self,
+        keycols: dict[str, _Keycols],
+        database: str,
+        table: str,
+        part: str,
+        spelled: str,
+        schema_json: Any,
+        table_schema_json: Any,
+        table_schema_fetched: bool,
+        facts: TableFacts,
+    ) -> None:
+        """Note what this table's key-ordinal EXPLAIN must be spelled with.
+
+        Only a table with a proven key is recorded, so the extra EXPLAIN is
+        never paid for by a table it could tell nothing about. The column
+        spellings come from the schema document — the plan names columns as
+        the catalog does, and the agent's SQL reaches the broker in any case.
+
+        The schema document is fetched at most once per table per quotation:
+        an upsert table's own schema_json (fetched for its key evidence) and
+        a referenced-columns table's table_schema_json (fetched by
+        _table_facts for the ?columns= filter) are both reused here, and the
+        fetch below runs only when neither call already made one.
+        """
+        spellings = schema_columns(schema_json) if schema_json is not None else {}
+        if not spellings and table_schema_json is not None:
+            spellings = schema_columns(table_schema_json)
+        if not spellings and not table_schema_fetched:
+            body = await self._client.controller_get(
+                f"/tables/{part}/schema", database=database
+            )
+            if body is PinotClient.NotFound:
+                return
+            spellings = schema_columns(body)
+        names = sorted({name for key in facts.unique_keys for name in key})
+        resolved = [spellings.get(name) for name in names]
+        if not resolved or any(name is None for name in resolved):
+            # A key column the schema does not name cannot be selected at all.
+            return
+        subject_names = [database, spelled, *(name for name in resolved if name)]
+        if not all(_is_bare_identifier(name) for name in subject_names):
+            # Database, table and every key column reach the EXPLAIN raw.
+            return
+        keycols[f"{database}.{table}".lower()] = _Keycols(
+            database=database,
+            table=spelled,
+            columns=tuple(name for name in resolved if name is not None),
         )
-        if schema_json is PinotClient.NotFound:
-            return {}
-        spellings = schema_columns(schema_json)
-        return {
-            lowered: spelling
-            for lowered, spelling in spellings.items()
-            if lowered in columns
-        }
 
     async def _surviving(
         self, two_part: str, table_count: int, *, trust_limit_prune: bool
@@ -423,7 +635,13 @@ class PinotEngine:
             raise EngineError(_CREDENTIALS_REFUSED) from exc
         except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
             return None
-        return surviving_segments(body, trust_limit_prune=trust_limit_prune)
+        sealed = surviving_segments(body, trust_limit_prune=trust_limit_prune)
+        if sealed is None:
+            return None
+        # numSegmentsQueried includes the consuming segments, so the k that
+        # applies to sealed ones is what is left after subtracting them. The
+        # consuming charge is added by quote.py, outside this k entirely.
+        return max(0, sealed - consuming_segments_queried(body))
 
     async def _explain(self, sql: str, options: str) -> Any:
         """One quotation EXPLAIN, bounded end to end rather than per operation.
@@ -440,17 +658,22 @@ class PinotEngine:
             )
 
     async def _widest_rows(
-        self, two_part: str, tables: list[tuple[str, TableFacts, int | None]]
+        self,
+        two_part: str,
+        tables: list[tuple[str, TableFacts, int | None]],
+        keycols: dict[str, _Keycols],
     ) -> int | None:
         """Rows the widest plan node would build, or None if unreadable.
 
         Keyed as the plan spells a scan's table: [database, table], lowered.
         """
         leaves: dict[str, int | None] = {}
+        keys: dict[str, frozenset[frozenset[str]]] = {}
         for database, facts, surviving in tables:
-            leaves[f"{database}.{facts.table}".lower()] = surviving_docs(
-                facts, surviving
-            )
+            name = f"{database}.{facts.table}".lower()
+            leaves[name] = surviving_docs(facts, surviving)
+            if facts.unique_keys:
+                keys[name] = facts.unique_keys
         try:
             body = await self._explain(
                 f"{_EXPLAIN_SHAPE}{two_part}",
@@ -462,8 +685,50 @@ class PinotEngine:
             return None
         cell = _plan_cell(body)
         if cell is None:
+            # A plan nobody can read spends no EXPLAIN on the ordinals either.
             return None
-        return max_intermediate_rows(cell, leaves)
+        return max_intermediate_rows(
+            cell, leaves, keys, await self._key_ordinals(keycols)
+        )
+
+    async def _key_ordinals(
+        self, keycols: dict[str, _Keycols]
+    ) -> dict[str, dict[str, int]]:
+        """Each keyed table's key-column scan ordinals, one EXPLAIN apiece.
+
+        A key column is proven by the position the scan reads it from, never
+        by the name a projection gives it: `SELECT Origin AS Carrier` is a
+        field called Carrier over another column's ordinal. So the ordinals
+        are learned from the catalog's own spelling of the key columns,
+        against a statement carrying no LIMIT and no ORDER BY — either would
+        put a Sort above the project and leave nothing to read.
+
+        A table whose EXPLAIN fails or parses to None simply gets no entry,
+        which charges its joins the product exactly as before.
+        """
+        ordinals: dict[str, dict[str, int]] = {}
+        for name, subject in keycols.items():
+            columns = ", ".join(subject.columns)
+            sql = (
+                f"{_EXPLAIN_SHAPE}SELECT {columns} "
+                f"FROM {subject.database}.{subject.table}"
+            )
+            try:
+                body = await self._explain(
+                    sql,
+                    f"{_OPT_MULTISTAGE}=true;{_OPT_TIMEOUT_MS}={_EXPLAIN_TIMEOUT_MS}",
+                )
+            except PinotForbidden as exc:
+                raise EngineError(_CREDENTIALS_REFUSED) from exc
+            except (PinotTransportError, PinotResponseTooLarge, TimeoutError):
+                continue
+            cell = _plan_cell(body)
+            if cell is None:
+                continue
+            learned = key_ordinals(cell)
+            if learned:
+                ordinals[name] = learned
+        return ordinals
 
     async def execute(
         self, sql: str, max_rows: int, timeout_seconds: float | None = None

@@ -90,3 +90,87 @@ def _pinot_answers(table: str) -> bool:
     if isinstance(count, bool) or not isinstance(count, int):
         return False
     return count > 0
+
+
+_PINOT_REALTIME_CONTROLLER = "http://localhost:9001"
+_PINOT_REALTIME_BROKER = "http://localhost:8001"
+
+
+@pytest.fixture
+def pinot_realtime_ready() -> None:
+    """Skip (don't fail) when the STREAM instance isn't up and ingesting.
+
+    Three conditions, because two of them can be true of a useless table: a
+    table answering a positive count may still be entirely consuming, and a
+    quote against an all-consuming table exercises the None path rather than
+    the charge these tests exist to prove. So a sealed segment is required
+    too, and the upsert table has to answer at all.
+    """
+    try:
+        httpx.get(
+            f"{_PINOT_REALTIME_CONTROLLER}/health", timeout=2.0
+        ).raise_for_status()
+    except httpx.HTTPError:
+        pytest.skip(
+            "Pinot STREAM instance not reachable — docker compose "
+            "--profile pinot-realtime up -d && examples/pinot-realtime/bootstrap.sh"
+        )
+
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            ready = (
+                _pinot_realtime_answers("airlineStats")
+                and _pinot_realtime_answers("u12upsert")
+                and _pinot_has_sealed_segment("airlineStats")
+            )
+        except httpx.HTTPError:
+            ready = False
+        if ready:
+            return
+        if time.monotonic() > deadline:
+            pytest.skip(
+                "the STREAM instance never had a sealed airlineStats segment "
+                "and a queryable u12upsert within 300s — run "
+                "examples/pinot-realtime/bootstrap.sh"
+            )
+        time.sleep(2)
+
+
+def _pinot_realtime_answers(table: str) -> bool:
+    """Is this table on the STREAM broker answering a positive count?"""
+    response = httpx.post(
+        f"{_PINOT_REALTIME_BROKER}/query/sql",
+        json={
+            "sql": f"SELECT count(*) AS n FROM {table} LIMIT 1",
+            "queryOptions": "useMultistageEngine=true",
+        },
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if body.get("exceptions"):
+        return False
+    rows = (body.get("resultTable") or {}).get("rows") or []
+    if not rows or not isinstance(rows[0], list) or not rows[0]:
+        return False
+    count = rows[0][0]
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    return count > 0
+
+
+def _pinot_has_sealed_segment(table: str) -> bool:
+    """Has at least one segment sealed? Only externalview carries the state."""
+    response = httpx.get(
+        f"{_PINOT_REALTIME_CONTROLLER}/tables/{table}/externalview", timeout=10.0
+    )
+    response.raise_for_status()
+    half = response.json().get("REALTIME")
+    if not isinstance(half, dict):
+        return False
+    return any(
+        "ONLINE" in states.values()
+        for states in half.values()
+        if isinstance(states, dict)
+    )

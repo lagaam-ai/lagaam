@@ -1,0 +1,72 @@
+{
+  "resultTable": {
+    "dataSchema": {
+      "columnNames": [
+        "SQL",
+        "PLAN",
+        "RULE_TIMINGS"
+      ],
+      "columnDataTypes": [
+        "STRING",
+        "STRING",
+        "STRING"
+      ]
+    },
+    "rows": [
+      [
+        "EXPLAIN PLAN INCLUDING ALL ATTRIBUTES AS JSON FOR SELECT a.playerID FROM default.baseballStats a JOIN default.baseballStats b ON a.playerID = b.playerID LIMIT 10",
+        "{\n  \"rels\": [\n    {\n      \"id\": \"0\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\",\n      \"table\": [\n        \"default\",\n        \"baseballStats\"\n      ],\n      \"inputs\": [],\n      \"type\": \"PinotLogicalTableScan\"\n    },\n    {\n      \"id\": \"1\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"playerID\"\n      ],\n      \"exprs\": [\n        {\n          \"input\": 17,\n          \"name\": \"$17\"\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"2\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\",\n        \"keys\": [\n          0\n        ]\n      },\n      \"type\": \"PinotLogicalExchange\"\n    },\n    {\n      \"id\": \"3\",\n      \"relOp\": \"LogicalJoin\",\n      \"condition\": {\n        \"op\": {\n          \"name\": \"=\",\n          \"kind\": \"EQUALS\",\n          \"syntax\": \"BINARY\"\n        },\n        \"operands\": [\n          {\n            \"input\": 0,\n            \"name\": \"$0\"\n          },\n          {\n            \"input\": 1,\n            \"name\": \"$1\"\n          }\n        ]\n      },\n      \"joinType\": \"inner\",\n      \"inputs\": [\n        \"2\",\n        \"2\"\n      ],\n      \"type\": \"LogicalJoin\"\n    },\n    {\n      \"id\": \"4\",\n      \"relOp\": \"LogicalProject\",\n      \"fields\": [\n        \"playerID\"\n      ],\n      \"exprs\": [\n        {\n          \"input\": 0,\n          \"name\": \"$0\"\n        }\n      ],\n      \"type\": \"LogicalProject\"\n    },\n    {\n      \"id\": \"5\",\n      \"relOp\": \"LogicalSort\",\n      \"collation\": [],\n      \"fetch\": {\n        \"literal\": 10,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"type\": \"LogicalSort\"\n    },\n    {\n      \"id\": \"6\",\n      \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalSortExchange\",\n      \"distribution\": {\n        \"type\": \"HASH_DISTRIBUTED\"\n      },\n      \"collation\": [],\n      \"isSortOnSender\": false,\n      \"isSortOnReceiver\": false,\n      \"type\": \"PinotLogicalSortExchange\"\n    },\n    {\n      \"id\": \"7\",\n      \"relOp\": \"LogicalSort\",\n      \"collation\": [],\n      \"offset\": {\n        \"literal\": 0,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"fetch\": {\n        \"literal\": 10,\n        \"type\": {\n          \"type\": \"INTEGER\",\n          \"nullable\": false\n        }\n      },\n      \"type\": \"LogicalSort\"\n    }\n  ]\n}",
+        "{\n  \"ruleExecutionTimes\": [\n    {\n      \"rule\": \"ProjectJoinTranspose\", \n      \"time\": 0.04\n    },\n    {\n      \"rule\": \"SortRemove\", \n      \"time\": 0.01\n    },\n    {\n      \"rule\": \"JoinPushExpressions\", \n      \"time\": 0.01\n    },\n    {\n      \"rule\": \"JoinConditionPush\", \n      \"time\": 0.04\n    },\n    {\n      \"rule\": \"EvaluateProjectLiteral\", \n      \"time\": 0.00\n    }  ]\n}\n"
+      ]
+    ]
+  },
+  "numRowsResultSet": 1,
+  "partialResult": false,
+  "exceptions": [],
+  "numGroupsLimitReached": false,
+  "numGroupsWarningLimitReached": false,
+  "timeUsedMs": 0,
+  "requestId": "1146010015000002444",
+  "clientRequestId": null,
+  "brokerId": "Broker_172.17.0.2_8000",
+  "numDocsScanned": 0,
+  "totalDocs": 0,
+  "numEntriesScannedInFilter": 0,
+  "numEntriesScannedPostFilter": 0,
+  "numServersQueried": 0,
+  "numServersResponded": 0,
+  "numSegmentsQueried": 0,
+  "numSegmentsProcessed": 0,
+  "numSegmentsMatched": 0,
+  "numConsumingSegmentsQueried": 0,
+  "numConsumingSegmentsProcessed": 0,
+  "numConsumingSegmentsMatched": 0,
+  "minConsumingFreshnessTimeMs": 0,
+  "numSegmentsPrunedByBroker": 0,
+  "numSegmentsPrunedByServer": 0,
+  "numSegmentsPrunedInvalid": 0,
+  "numSegmentsPrunedByLimit": 0,
+  "numSegmentsPrunedByValue": 0,
+  "brokerReduceTimeMs": 0,
+  "offlineThreadCpuTimeNs": 0,
+  "realtimeThreadCpuTimeNs": 0,
+  "offlineSystemActivitiesCpuTimeNs": 0,
+  "realtimeSystemActivitiesCpuTimeNs": 0,
+  "offlineResponseSerializationCpuTimeNs": 0,
+  "realtimeResponseSerializationCpuTimeNs": 0,
+  "offlineTotalCpuTimeNs": 0,
+  "realtimeTotalCpuTimeNs": 0,
+  "explainPlanNumEmptyFilterSegments": 0,
+  "explainPlanNumMatchAllFilterSegments": 0,
+  "traceInfo": {},
+  "tablesQueried": [],
+  "offlineThreadMemAllocatedBytes": 0,
+  "realtimeThreadMemAllocatedBytes": 0,
+  "offlineResponseSerMemAllocatedBytes": 0,
+  "realtimeResponseSerMemAllocatedBytes": 0,
+  "offlineTotalMemAllocatedBytes": 0,
+  "realtimeTotalMemAllocatedBytes": 0,
+  "pools": [],
+  "rlsFiltersApplied": false,
+  "groupsTrimmed": false
+}

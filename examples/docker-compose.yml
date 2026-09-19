@@ -29,3 +29,63 @@ services:
       timeout: 3s
       # First query answers at ~42s; the sample tables keep loading for ~20min.
       retries: 60
+  # The STREAM instance, for the U12 realtime and upsert tests. Deliberately not
+  # on 9000/8000: the OFFLINE suite needs the batch profile up at the same time,
+  # and both Pinots plus Kafka and Trino fit in 7.653 GiB only at ~6.4 GiB, so
+  # the heap cap is not optional. Bootstrap the tables afterwards:
+  #   docker compose --profile pinot-realtime up -d && examples/pinot-realtime/bootstrap.sh
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: lagaam-kafka
+    hostname: kafka
+    profiles: ["pinot-realtime"]
+    mem_limit: 1g
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      # The hostname, never 0.0.0.0: the entrypoint copies this into
+      # advertised.listeners during storage format and dies on the meta-address.
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
+      CLUSTER_ID: "u12ClusterIdXXXXXXXXXX"
+    healthcheck:
+      test:
+        - "CMD"
+        - "/opt/kafka/bin/kafka-topics.sh"
+        - "--bootstrap-server"
+        - "kafka:9092"
+        - "--list"
+      interval: 5s
+      timeout: 5s
+      retries: 30
+  pinot-realtime:
+    image: apachepinot/pinot:release-1.5.1
+    container_name: lagaam-pinot-realtime
+    profiles: ["pinot-realtime"]
+    mem_limit: 3g
+    # A Pinot that starts before Kafka is reachable falls back to its own
+    # embedded broker, and then no table this profile creates ever ingests.
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: ["QuickStart", "-type", "STREAM", "-kafkaBrokerList", "kafka:9092"]
+    environment:
+      # The STREAM quickstart runs 4 servers, a broker, a controller and a
+      # minion in one container and peaks near 1.2 GiB with this cap.
+      JAVA_OPTS: "-Xms512M -Xmx2G -XX:+UseG1GC -Dlog4j2.configurationFile=/opt/pinot/conf/quickstart-log4j2.xml"
+    ports:
+      - "9001:9000"
+      - "8001:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 60

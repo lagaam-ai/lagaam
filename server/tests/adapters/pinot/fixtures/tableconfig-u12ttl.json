@@ -1,0 +1,53 @@
+{
+  "REALTIME": {
+    "tableName": "u12ttl",
+    "tableType": "REALTIME",
+    "tenants": {},
+    "segmentsConfig": {
+      "timeColumnName": "ts",
+      "replication": "1"
+    },
+    "tableIndexConfig": {
+      "nullHandlingEnabled": false
+    },
+    "upsertConfig": {
+      "mode": "FULL",
+      "metadataTTL": 60000,
+      "enableSnapshot": true
+    },
+    "routing": {
+      "instanceSelectorType": "strictReplicaGroup"
+    },
+    "ingestionConfig": {
+      "streamIngestionConfig": {
+        "streamConfigMaps": [
+          {
+            "streamType": "kafka",
+            "stream.kafka.topic.name": "u12ttl",
+            "stream.kafka.decoder.class.name": "org.apache.pinot.plugin.stream.kafka.KafkaJSONMessageDecoder",
+            "stream.kafka.consumer.factory.class.name": "org.apache.pinot.plugin.stream.kafka30.KafkaConsumerFactory",
+            "stream.kafka.consumer.prop.auto.offset.reset": "smallest",
+            "stream.kafka.broker.list": "kafka:9092",
+            "realtime.segment.flush.threshold.rows": "2",
+            "realtime.segment.flush.threshold.time": "24h"
+          }
+        ]
+      }
+    },
+    "instanceAssignmentConfigMap": {
+      "CONSUMING": {
+        "tagPoolConfig": {
+          "tag": "DefaultTenant_REALTIME"
+        },
+        "replicaGroupPartitionConfig": {
+          "replicaGroupBased": true,
+          "numReplicaGroups": 1,
+          "numInstancesPerReplicaGroup": 1
+        }
+      }
+    },
+    "metadata": {
+      "customConfigs": {}
+    }
+  }
+}

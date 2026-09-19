@@ -9,7 +9,7 @@ missing number fails safe at the budget gate anyway.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
 from lagaam.core.models import ColumnInfo, TableSchema
 
@@ -138,6 +138,31 @@ class TableFacts:
     # empty when none was asked for or the schema could not be read. A
     # segment missing any of them is priced whole rather than per column.
     columns: frozenset[str] = frozenset()
+    # How many CONSUMING segments this table has, and the row bound on each.
+    # A consuming segment reports nothing (0 docs, -1 bytes) until it seals,
+    # so it is charged at the flush threshold stored in its own ZK metadata
+    # at creation — never the table config's, which an operator can lower
+    # under a segment already consuming. One entry per consuming segment,
+    # None where that segment's threshold could not be read, and a None
+    # takes the whole quote low.
+    consuming: int = 0
+    consuming_rows: tuple[int | None, ...] = ()
+    # False when the metadata response did not cover every sealed segment the
+    # size report names: a confident sum over half a table is the one failure
+    # the gate exists to prevent.
+    complete: bool = True
+    # Column sets proved unique on this table, lowercase. Empty is "no
+    # evidence", which charges a join the product exactly as before.
+    unique_keys: frozenset[frozenset[str]] = frozenset()
+
+
+# Long.MIN_VALUE: what a consuming segment reports where a CRC would be.
+_CONSUMING_CRC = -9223372036854775808
+
+# The row threshold a consuming segment was created with, in its own LLC
+# segment ZK metadata. `sizeThresholdToFlushSegment` is the in-JVM field name
+# and appears in no controller response; this is the ZK simpleField spelling.
+_STORED_FLUSH_KEY: Final = "segment.flush.threshold.size"
 
 
 def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
@@ -145,10 +170,17 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
 
     Bytes come from a different endpoint than docs, keyed by segment name, so
     a segment missing from the size report keeps its docs and loses its bytes.
+
+    A consuming segment is dropped rather than kept as a zero: it reports 0
+    docs and -1 bytes permanently, and one None bytes makes the whole table's
+    byte sum unknown. Only all four markers together identify it — an
+    unreadable sealed segment keeps its Nones and poisons the sum, because an
+    unreadable segment is not a free one.
     """
     if not isinstance(seg_metadata_json, dict):
         return []
     sizes = _segment_sizes(size_json)
+    reported = _reported_sizes(size_json)
     facts: list[SegmentFact] = []
     for key, body in seg_metadata_json.items():
         if not isinstance(body, dict):
@@ -157,6 +189,8 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
         if not isinstance(name, str) or not name:
             name = key if isinstance(key, str) else ""
         if not name:
+            continue
+        if _is_consuming(body, reported.get(name)):
             continue
         facts.append(
             SegmentFact(
@@ -169,6 +203,152 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
             )
         )
     return facts
+
+
+def consuming_count(externalview_json: Any, size_json: Any) -> int:
+    """How many CONSUMING segments this table has, charged at the larger count.
+
+    Externalview is the state of record but can lag, and missingSegments also
+    counts a segment a server failed to report, so neither is authoritative
+    and only the larger cannot under-charge. Neither readable is 0, which is
+    the pre-U12 behaviour and is caught by the completeness check where it
+    matters.
+    """
+    return max(_externalview_consuming(externalview_json), _missing_segments(size_json))
+
+
+def stored_flush_rows(segment_zk_json: Any) -> int | None:
+    """The row bound on one consuming segment, from that segment's own metadata.
+
+    A consuming segment's row threshold is stored in its LLC segment ZK
+    metadata at creation, and the table config is not a bound on it. Measured
+    on `u12flush`: after a `PUT` lowering the config 100 -> 10, the live
+    consuming segment's `segment.flush.threshold.size` stayed 100 and the
+    segment sealed at exactly 100 — while the adapter, reading the config,
+    charged 10. No reload changes it; only a `forceCommit` does, by sealing
+    the segment so its replacement is born with the new value. Autotune
+    (`...threshold.segment.size`) reaches the same place from the other end:
+    it stores a row threshold the config never states at all.
+
+    `GET /segments/{table}/{segmentName}/metadata` serves it, as a direct
+    view of the ZK simpleFields. Values are JSON strings there; a plain int
+    is accepted too. Anything that is not a positive int — a float, a
+    byte-suffixed size, a negative, zero, absent — is None, and a None here
+    takes the whole quote low rather than guessing.
+    """
+    if not isinstance(segment_zk_json, dict):
+        return None
+    return _positive_int_or_digits(segment_zk_json.get(_STORED_FLUSH_KEY))
+
+
+def consuming_segment_names(externalview_json: Any) -> tuple[str, ...]:
+    """The names of the REALTIME segments any server calls CONSUMING.
+
+    The addresses the per-segment metadata fetch is made with, in the
+    externalview's own order so a table's thresholds line up with its
+    segments. `consuming_count` stays the count, because `missingSegments`
+    can name more than the externalview does.
+    """
+    if not isinstance(externalview_json, dict):
+        return ()
+    half = externalview_json.get("REALTIME")
+    if not isinstance(half, dict):
+        return ()
+    return tuple(
+        name
+        for name, states in half.items()
+        if isinstance(name, str)
+        and name
+        and isinstance(states, dict)
+        and "CONSUMING" in states.values()
+    )
+
+
+def metadata_is_complete(seg_metadata_json: Any, size_json: Any) -> bool:
+    """Does the metadata response cover every sealed segment the size report names?
+
+    Measured: on a 2-server table /segments/{t}/metadata returns one server's
+    half and alternates which half between identical calls, so a sum over it
+    is a confident sum over a subset — an under-quote at confidence="high",
+    the one failure mode the gate exists to prevent. A segment reporting -1
+    bytes is consuming and is expected to carry no useful entry, so it is
+    exempt.
+    """
+    named = {
+        name
+        for name, size in _reported_sizes(size_json).items()
+        if size is not None and size >= 0
+    }
+    if not named:
+        return True
+    if not isinstance(seg_metadata_json, dict):
+        return False
+    present: set[str] = set()
+    for key, body in seg_metadata_json.items():
+        if isinstance(key, str):
+            present.add(key)
+        if isinstance(body, dict) and isinstance(body.get("segmentName"), str):
+            present.add(body["segmentName"])
+    return named <= present
+
+
+def _is_consuming(body: dict[str, Any], reported: int | None) -> bool:
+    """Rule 5's conjunction, all four markers together and never fewer."""
+    return (
+        body.get("totalDocs") == 0
+        and "columns" not in body
+        and body.get("crc") == _CONSUMING_CRC
+        and reported == -1
+    )
+
+
+def _externalview_consuming(externalview_json: Any) -> int:
+    """Segments of the REALTIME map any server calls CONSUMING."""
+    return len(consuming_segment_names(externalview_json))
+
+
+def _missing_segments(size_json: Any) -> int:
+    """realtimeSegments.missingSegments, measured to equal the consuming count."""
+    if not isinstance(size_json, dict):
+        return 0
+    half = size_json.get("realtimeSegments")
+    if not isinstance(half, dict):
+        return 0
+    missing = _positive_int(half.get("missingSegments"), allow_zero=True)
+    return missing or 0
+
+
+def _reported_sizes(size_json: Any) -> dict[str, int]:
+    """Segment name to reportedSizeInBytes verbatim, -1 included.
+
+    _segment_sizes drops the -1 as "unknown"; this keeps it, because -1 is
+    how a consuming segment is recognised and how a sealed one is named.
+    """
+    if not isinstance(size_json, dict):
+        return {}
+    reported: dict[str, int] = {}
+    for key in ("offlineSegments", "realtimeSegments"):
+        half = size_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        segments = half.get("segments")
+        if not isinstance(segments, dict):
+            continue
+        for name, body in segments.items():
+            if not isinstance(name, str) or not isinstance(body, dict):
+                continue
+            value = body.get("reportedSizeInBytes")
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            reported[name] = value
+    return reported
+
+
+def _positive_int_or_digits(value: Any) -> int | None:
+    """A positive int, or a string of digits meaning one. Nothing else."""
+    if isinstance(value, str):
+        return int(value) if value.isdigit() and int(value) > 0 else None
+    return _positive_int(value)
 
 
 def time_column(config_json: Any) -> str | None:
@@ -205,15 +385,63 @@ def table_facts(
     seg_metadata_json: Any,
     size_json: Any,
     columns: frozenset[str] = frozenset(),
+    *,
+    externalview_json: Any = None,
+    schema_json: Any = None,
+    table_metadata_json: Any = None,
+    consuming_segments_json: Mapping[str, Any] | None = None,
 ) -> TableFacts:
-    """One table's type, time column and segments, from three documents."""
+    """One table's type, time column, segments and realtime facts.
+
+    The four keyword documents are the U12 additions and default to None, so
+    an OFFLINE caller that fetches none of them gets exactly the pre-U12
+    facts: no consuming segments, no threshold, complete, no key evidence.
+
+    `consuming_segments_json` maps a consuming segment's name to its own ZK
+    metadata, as `GET /segments/{table}/{segmentName}/metadata` serves it. A
+    segment the caller could not read is absent from the mapping and is
+    charged at nothing known, which takes the quote low.
+    """
+    consuming = consuming_count(externalview_json, size_json)
     return TableFacts(
         table=table,
         types=table_types(config_json),
         time_column=time_column(config_json),
         segments=tuple(segment_facts(seg_metadata_json, size_json)),
         columns=columns,
+        consuming=consuming,
+        consuming_rows=_consuming_rows(
+            consuming, externalview_json, consuming_segments_json
+        ),
+        complete=metadata_is_complete(seg_metadata_json, size_json),
+        unique_keys=upsert_keys(config_json, schema_json, table_metadata_json)
+        or single_segment_unique_columns(
+            seg_metadata_json, config_json, schema_json, size_json
+        ),
     )
+
+
+def _consuming_rows(
+    consuming: int,
+    externalview_json: Any,
+    consuming_segments_json: Mapping[str, Any] | None,
+) -> tuple[int | None, ...]:
+    """One stored row threshold per consuming segment, None where unknown.
+
+    The count is `consuming_count`'s, which is the larger of the externalview
+    and `missingSegments`. Where `missingSegments` names more segments than
+    the externalview does, the surplus has no name to fetch a threshold with
+    and so is charged at nothing known — a None, which takes the quote low.
+    """
+    if consuming <= 0:
+        return ()
+    documents = consuming_segments_json or {}
+    rows = [
+        stored_flush_rows(documents.get(name))
+        for name in consuming_segment_names(externalview_json)[:consuming]
+    ]
+    rows.extend([None] * (consuming - len(rows)))
+    return tuple(rows)
 
 
 def _segment_sizes(size_json: Any) -> dict[str, int]:
@@ -272,3 +500,287 @@ def _positive_int(value: Any, allow_zero: bool = False) -> int | None:
     if value < 0 or (value == 0 and not allow_zero):
         return None
     return value
+
+
+def upsert_keys(
+    config_json: Any, schema_json: Any, table_metadata_json: Any
+) -> frozenset[frozenset[str]]:
+    """An upsert table's primary key, as the one column set proved unique.
+
+    Measured: GROUP BY pk HAVING count(*) > 1 returns nothing on the upsert
+    table and 6-version rows on a byte-identical non-upsert table reading the
+    same topic, and the PK self-join returns exactly the distinct-key count
+    against 3,600 for the twin.
+
+    Three documents have to agree. The config's upsertConfig and the
+    metadata's PK map are each independently proof of an upsert table — the
+    map is {} on every non-upsert table — so a disagreement between them is
+    two documents contradicting each other about what this table is, which is
+    not a basis for admitting a join. The full column list is the key and
+    never a subset: a composite primary key is unique as a tuple.
+
+    The upsertConfig has to say the key is still unique, and not merely that
+    the table is an upsert one. An `upsertConfig` whose `mode` is not FULL or
+    PARTIAL, or which carries a `metadataTTL` or `deletedKeysTTL` greater
+    than zero, yields nothing: measured on a FULL table at
+    `metadataTTL: 60000`, key `K1` had two visible rows and the pk self-join
+    returned 10 pairs against the 8 a unique pk gives. See
+    `_has_upsert_config` for why a zero TTL is not a TTL.
+
+    The PK-count map is not a correctness signal on that table either: it
+    reported 6 against 8 rows and 7 distinct visible keys — wrong in both
+    directions — while staying non-empty. It says "upsert table", nothing more.
+    """
+    if not isinstance(schema_json, dict):
+        return frozenset()
+    declared = _has_upsert_config(config_json)
+    counted = _has_primary_key_counts(table_metadata_json)
+    if not declared or not counted:
+        return frozenset()
+    columns = schema_json.get("primaryKeyColumns")
+    if not isinstance(columns, list) or not columns:
+        return frozenset()
+    names = {
+        column.lower()
+        for column in columns
+        if isinstance(column, str) and column and not isinstance(column, bool)
+    }
+    if len(names) != len(columns):
+        return frozenset()
+    return frozenset({frozenset(names)})
+
+
+def upsert_config_present(config_json: Any) -> bool:
+    """Could this table config's upsertConfig prove a unique primary key?
+
+    The caller fetches two more documents on the strength of this, so it is
+    public: an adapter that guessed would pay two controller calls per table.
+    A config whose upsert mode or TTL already rules the key out is False
+    here, and the two documents are not fetched at all.
+    """
+    return _has_upsert_config(config_json)
+
+
+def single_segment_unique_columns(
+    seg_metadata_json: Any, config_json: Any, schema_json: Any, size_json: Any
+) -> frozenset[frozenset[str]]:
+    """Columns whose cardinality equals their docs, on a one-sealed-segment table.
+
+    cardinality is exactly count(DISTINCT col) — verified against the engine
+    on four columns — and count(DISTINCT col) <= count(col) <= totalDocs, so
+    equality forces every doc to be counted and every value to differ. That
+    argument is the segment's, and it is the table's only where the two are
+    the same rows: one sealed segment and nothing consuming.
+
+    Measured: /segments/{t}/metadata on a multi-server table can return only
+    one server's half, so counting sealed segments in that response alone
+    lets a 2-segment table read as single-segment. The size report is the
+    independent count: it must name exactly one sealed segment (a
+    reportedSizeInBytes >= 0 entry), the metadata response must be complete
+    against it, and the one metadata entry must be that same segment.
+
+    A consuming segment can be invisible to metadata entirely — named only
+    by a reportedSizeInBytes -1 entry in the size report, with no body at
+    all on the metadata side. metadata_is_complete does not catch this (it
+    only requires every *sealed* name to be present), so this function
+    checks the size report for any -1 entry itself: such a segment holds
+    rows the one sealed segment does not, so its presence alone voids the
+    key regardless of what metadata says.
+
+    Gated on nullability because the null caveat is unclosed (log §6): if
+    cardinality counts a null or a default as a distinct value, a column with
+    one null could report cardinality == totalDocs while two rows share the
+    default. Where nullability cannot be established, nothing is yielded.
+
+    A `schema_json` of None is a schema nobody read, and it yields nothing at
+    all: the second gate clears a column that null handling is off for and the
+    schema does not mark nullable, but an unread schema marks nothing nullable
+    for want of evidence rather than for want of nullable columns. Reading
+    absence as proof would let a plainly nullable column pass as a key.
+
+    A multi-value column's cardinality counts distinct entries, not rows —
+    totalNumberOfEntries and maxNumberOfMultiValues are reported separately —
+    so equality to totalDocs proves nothing there; such a column is never
+    evidence.
+    """
+    if not isinstance(seg_metadata_json, dict) or schema_json is None:
+        return frozenset()
+    reported = _reported_sizes(size_json)
+    if any(size < 0 for size in reported.values()):
+        return frozenset()
+    sealed_names = {name for name, size in reported.items() if size is not None and size >= 0}
+    if len(sealed_names) != 1:
+        return frozenset()
+    if not metadata_is_complete(seg_metadata_json, size_json):
+        return frozenset()
+    sealed = [
+        (key, body)
+        for key, body in seg_metadata_json.items()
+        if isinstance(body, dict) and isinstance(body.get("columns"), list)
+    ]
+    consuming = [
+        body
+        for body in seg_metadata_json.values()
+        if isinstance(body, dict) and not isinstance(body.get("columns"), list)
+    ]
+    if len(sealed) != 1 or consuming:
+        return frozenset()
+    (sole_name,) = sealed_names
+    sole_key, sole_body = sealed[0]
+    name_candidate = sole_body.get("segmentName")
+    if not isinstance(name_candidate, str) or not name_candidate:
+        name_candidate = sole_key if isinstance(sole_key, str) else ""
+    if name_candidate != sole_name:
+        return frozenset()
+    docs = _positive_int(sole_body.get("totalDocs"))
+    if docs is None:
+        return frozenset()
+    nullable_off = _null_handling_disabled(config_json)
+    schema_nullable = _schema_nullable_columns(schema_json)
+    keys: set[frozenset[str]] = set()
+    for column in sole_body["columns"]:
+        if not isinstance(column, dict):
+            continue
+        name = column.get("columnName")
+        cardinality = _positive_int(column.get("cardinality"))
+        if not isinstance(name, str) or not name or cardinality != docs:
+            continue
+        if _is_multi_valued(column, docs):
+            continue
+        spec = column.get("fieldSpec")
+        not_null = isinstance(spec, dict) and spec.get("notNull") is True
+        if not not_null and not (
+            nullable_off and name.lower() not in schema_nullable
+        ):
+            continue
+        keys.add(frozenset({name.lower()}))
+    return frozenset(keys)
+
+
+def _is_multi_valued(column: dict[str, Any], docs: int) -> bool:
+    """A column whose per-row value count is not knowable as exactly one.
+
+    `docs` is the segment's own validated totalDocs, not the column entry's
+    copy of it, so a column entry missing or lying about its own totalDocs
+    cannot dodge this gate.
+    """
+    spec = column.get("fieldSpec")
+    if isinstance(spec, dict) and spec.get("singleValueField") is False:
+        return True
+    entries = column.get("totalNumberOfEntries")
+    if isinstance(entries, int) and not isinstance(entries, bool) and entries != docs:
+        return True
+    max_mv = column.get("maxNumberOfMultiValues")
+    return isinstance(max_mv, int) and not isinstance(max_mv, bool) and max_mv > 0
+
+
+def _has_upsert_config(config_json: Any) -> bool:
+    """Does either half carry an upsertConfig that keeps the key unique?
+
+    Two ways an `upsertConfig` object is present and the primary key is still
+    not unique in the query-visible view, both measured live on 1.5.1:
+
+    `mode: NONE` is a valid Mode value that disables upsert entirely while
+    the object stays in the config, so the mode must say FULL or PARTIAL
+    (case-insensitively) and nothing else qualifies.
+
+    A **set** `metadataTTL` or `deletedKeysTTL` evicts a key from the
+    primary-key lookup map while the rows it pointed at stay queryable, so a
+    key re-ingested after its window has two visible rows. Measured on
+    `u12ttl` (`mode: FULL`, `metadataTTL: 60000`): 8 rows, 7 distinct pks,
+    `GROUP BY pk HAVING count(*) > 1` returning `K1 -> 2`, both versions
+    visible, and the pk self-join returning 10 pairs where a unique pk gives
+    8 — while the adapter cut the widest join step from 80 to 24 on the
+    strength of that key.
+
+    Set means greater than zero. 1.5.1's `isTTLEnabled()` is
+    `_metadataTTL > 0 || _deletedKeysTTL > 0` and `isOutOfMetadataTTL`
+    returns false outright at `_metadataTTL <= 0`, and the controller
+    materialises `metadataTTL: 0.0, deletedKeysTTL: 0.0` on every upsert
+    config it serves — so reading a zero as a TTL would withhold the key
+    from every upsert table there is, including the one the evidence was
+    proved on.
+    """
+    if not isinstance(config_json, dict):
+        return False
+    for key in ("REALTIME", "OFFLINE"):
+        half = config_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        upsert = half.get("upsertConfig")
+        if not isinstance(upsert, dict):
+            continue
+        mode = upsert.get("mode")
+        if not isinstance(mode, str) or mode.upper() not in ("FULL", "PARTIAL"):
+            continue
+        if any(_ttl_is_set(upsert.get(name)) for name in _UPSERT_TTL_KEYS):
+            continue
+        return True
+    return False
+
+
+# The two retention windows that let a primary key have two visible rows.
+_UPSERT_TTL_KEYS: Final = ("metadataTTL", "deletedKeysTTL")
+
+
+def _ttl_is_set(value: Any) -> bool:
+    """Is this TTL a positive duration, and so actually in force?
+
+    Anything that is not a number Pinot could read as one is treated as set:
+    a value this adapter cannot interpret is not a value it may clear a key
+    on. A bool is not a duration and is read the same way.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return value > 0
+    return True
+
+
+def _has_primary_key_counts(table_metadata_json: Any) -> bool:
+    """Is upsertPartitionToServerPrimaryKeyCountMap non-empty?
+
+    It is {} on every non-upsert table, so a non-empty map is itself proof.
+    It is never read as a count: it is per server, and replication > 1 is
+    unmeasured (spec decision 6).
+    """
+    if not isinstance(table_metadata_json, dict):
+        return False
+    counts = table_metadata_json.get("upsertPartitionToServerPrimaryKeyCountMap")
+    return isinstance(counts, dict) and bool(counts)
+
+
+def _null_handling_disabled(config_json: Any) -> bool:
+    """Is tableIndexConfig.nullHandlingEnabled explicitly false on a half?"""
+    if not isinstance(config_json, dict):
+        return False
+    for key in ("REALTIME", "OFFLINE"):
+        half = config_json.get(key)
+        if not isinstance(half, dict):
+            continue
+        index_config = half.get("tableIndexConfig")
+        if isinstance(index_config, dict) and index_config.get(
+            "nullHandlingEnabled"
+        ) is False:
+            return True
+    return False
+
+
+def _schema_nullable_columns(schema_json: Any) -> frozenset[str]:
+    """Lowercase names the schema marks nullable, which no gate may pass."""
+    if not isinstance(schema_json, dict):
+        return frozenset()
+    nullable: set[str] = set()
+    for key in _FIELD_SPEC_KEYS:
+        specs = schema_json.get(key)
+        if not isinstance(specs, list):
+            continue
+        for spec in specs:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name")
+            if isinstance(name, str) and name and spec.get("nullable") is True:
+                nullable.add(name.lower())
+    return frozenset(nullable)

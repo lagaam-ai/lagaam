@@ -1,0 +1,18 @@
+{
+  "tableName" : "u12upsert_REALTIME",
+  "diskSizeInBytes" : 14864,
+  "numSegments" : 4,
+  "numRows" : 400,
+  "columnLengthMap" : { },
+  "columnCardinalityMap" : { },
+  "maxNumMultiValuesMap" : { },
+  "columnIndexSizeMap" : { },
+  "upsertPartitionToServerPrimaryKeyCountMap" : {
+    "0" : {
+      "Server_172.19.0.3_7051" : 50
+    },
+    "1" : {
+      "Server_172.19.0.3_7052" : 50
+    }
+  }
+}

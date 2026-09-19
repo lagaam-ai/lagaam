@@ -1,0 +1,83 @@
+{
+  "tableName": "airlineStats",
+  "tableType": "REALTIME",
+  "tenants": {},
+  "segmentsConfig": {
+    "timeColumnName": "DaysSinceEpoch",
+    "replication": "1"
+  },
+  "tableIndexConfig": {},
+  "routing": {
+    "segmentPrunerTypes": [
+      "time"
+    ],
+    "instanceSelectorType": "strictReplicaGroup"
+  },
+  "ingestionConfig": {
+    "streamIngestionConfig": {
+      "streamConfigMaps": [
+        {
+          "streamType": "kafka",
+          "stream.kafka.topic.name": "u12-flights",
+          "stream.kafka.decoder.class.name": "org.apache.pinot.plugin.stream.kafka.KafkaJSONMessageDecoder",
+          "stream.kafka.consumer.factory.class.name": "org.apache.pinot.plugin.stream.kafka30.KafkaConsumerFactory",
+          "stream.kafka.consumer.prop.auto.offset.reset": "smallest",
+          "stream.kafka.broker.list": "kafka:9092",
+          "realtime.segment.flush.threshold.time": "24h",
+          "realtime.segment.flush.threshold.rows": "100"
+        }
+      ]
+    },
+    "transformConfigs": [
+      {
+        "columnName": "ts",
+        "transformFunction": "fromEpochDays(DaysSinceEpoch)"
+      },
+      {
+        "columnName": "tsRaw",
+        "transformFunction": "fromEpochDays(DaysSinceEpoch)"
+      }
+    ]
+  },
+  "fieldConfigList": [
+    {
+      "name": "ts",
+      "encodingType": "DICTIONARY",
+      "indexTypes": [
+        "TIMESTAMP"
+      ],
+      "timestampConfig": {
+        "granularities": [
+          "DAY",
+          "WEEK",
+          "MONTH"
+        ]
+      }
+    }
+  ],
+  "instanceAssignmentConfigMap": {
+    "CONSUMING": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    },
+    "COMPLETED": {
+      "tagPoolConfig": {
+        "tag": "DefaultTenant_REALTIME"
+      },
+      "replicaGroupPartitionConfig": {
+        "replicaGroupBased": true,
+        "numReplicaGroups": 1,
+        "numInstancesPerReplicaGroup": 1
+      }
+    }
+  },
+  "metadata": {
+    "customConfigs": {}
+  }
+}

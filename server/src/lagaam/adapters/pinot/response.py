@@ -124,11 +124,15 @@ def surviving_segments(
     again would under-count survivors. Leaving a counter unread can only
     charge more segments, never fewer, which is the fail-safe side.
 
-    `trust_limit_prune` is False when the statement carries an OFFSET, which
-    the planner prices as though it were absent: measured, `LIMIT 10 OFFSET
+    `trust_limit_prune` is False whenever the limit the planner priced is not
+    the one the execution will honour. Two shapes: an OFFSET, which the
+    planner prices as though it were absent — measured, `LIMIT 10 OFFSET
     9000` reports the same 30-of-31 limit prune as the bare `LIMIT 10` and
-    then walks 9,117 docs over 29 segments. The caller decides, because only
-    it has the SQL; this module sees a broker answer and nothing else.
+    then walks 9,117 docs over 29 segments — and a statement with no LIMIT at
+    all, which is EXPLAINed under Pinot's own implicit default while the
+    multi-stage engine that runs it scans every segment. The caller decides,
+    because only it has the SQL; this module sees a broker answer and nothing
+    else.
 
     None means "no oracle" — the caller then charges every segment.
     """
@@ -151,3 +155,28 @@ def surviving_segments(
             continue
         pruned = max(pruned, value)
     return max(1, queried - min(pruned, queried))
+
+
+def consuming_segments_queried(explain_json: Any) -> int:
+    """How many of the queried segments were CONSUMING, from the same EXPLAIN.
+
+    numSegmentsQueried includes consuming segments, so this is what has to be
+    subtracted before the k-largest charge is applied to the sealed ones.
+
+    Unreadable is 0 rather than None, deliberately: 0 leaves the sealed k
+    larger and charges more segments, and the consuming segments themselves
+    are charged unconditionally elsewhere — measured against the live
+    instance, this counter stayed 1 both with no filter (26 segments queried,
+    25 pruned ByServer, 24 ByLimit) and under a filter excluding every value
+    (1 segment queried, the other 25 broker-pruned), so no predicate may ever
+    reduce it.
+    """
+    if not isinstance(explain_json, dict) or explain_json.get("exceptions"):
+        return 0
+    scanned = explain_json.get("numDocsScanned")
+    if isinstance(scanned, bool) or not isinstance(scanned, int) or scanned != 0:
+        return 0
+    consuming = explain_json.get("numConsumingSegmentsQueried")
+    if isinstance(consuming, bool) or not isinstance(consuming, int):
+        return 0
+    return max(0, consuming)

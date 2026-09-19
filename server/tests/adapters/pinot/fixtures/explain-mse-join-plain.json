@@ -1,0 +1,71 @@
+{
+  "resultTable": {
+    "dataSchema": {
+      "columnNames": [
+        "SQL",
+        "PLAN",
+        "RULE_TIMINGS"
+      ],
+      "columnDataTypes": [
+        "STRING",
+        "STRING",
+        "STRING"
+      ]
+    },
+    "rows": [
+      [
+        "LogicalProject",
+        "{\"rels\": [{\"id\": \"0\", \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\", \"table\": [\"default\", \"airlineStats\"], \"inputs\": [], \"type\": \"PinotLogicalTableScan\"}, {\"id\": \"1\", \"relOp\": \"LogicalProject\", \"fields\": [\"Carrier\"], \"exprs\": [{\"input\": 18, \"name\": \"$18\"}], \"type\": \"LogicalProject\"}, {\"id\": \"2\", \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\", \"distribution\": {\"type\": \"HASH_DISTRIBUTED\", \"keys\": [0]}, \"type\": \"PinotLogicalExchange\"}, {\"id\": \"3\", \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalTableScan\", \"table\": [\"default\", \"baseballStats\"], \"inputs\": [], \"type\": \"PinotLogicalTableScan\"}, {\"id\": \"4\", \"relOp\": \"LogicalProject\", \"fields\": [\"teamID\"], \"exprs\": [{\"input\": 26, \"name\": \"$26\"}], \"type\": \"LogicalProject\"}, {\"id\": \"5\", \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalExchange\", \"distribution\": {\"type\": \"HASH_DISTRIBUTED\", \"keys\": [0]}, \"type\": \"PinotLogicalExchange\"}, {\"id\": \"6\", \"relOp\": \"LogicalJoin\", \"condition\": {\"op\": {\"name\": \"=\", \"kind\": \"EQUALS\", \"syntax\": \"BINARY\"}, \"operands\": [{\"input\": 0, \"name\": \"$0\"}, {\"input\": 1, \"name\": \"$1\"}]}, \"joinType\": \"inner\", \"inputs\": [\"2\", \"5\"], \"type\": \"LogicalJoin\"}, {\"id\": \"7\", \"relOp\": \"LogicalProject\", \"fields\": [\"Carrier\"], \"exprs\": [{\"input\": 0, \"name\": \"$0\"}], \"type\": \"LogicalProject\"}, {\"id\": \"8\", \"relOp\": \"LogicalSort\", \"collation\": [], \"fetch\": {\"literal\": 10, \"type\": {\"type\": \"INTEGER\", \"nullable\": false}}, \"type\": \"LogicalSort\"}, {\"id\": \"9\", \"relOp\": \"org.apache.pinot.calcite.rel.logical.PinotLogicalSortExchange\", \"distribution\": {\"type\": \"HASH_DISTRIBUTED\"}, \"collation\": [], \"isSortOnSender\": false, \"isSortOnReceiver\": false, \"type\": \"PinotLogicalSortExchange\"}, {\"id\": \"10\", \"relOp\": \"LogicalSort\", \"collation\": [], \"offset\": {\"literal\": 0, \"type\": {\"type\": \"INTEGER\", \"nullable\": false}}, \"fetch\": {\"literal\": 10, \"type\": {\"type\": \"INTEGER\", \"nullable\": false}}, \"type\": \"LogicalSort\"}]}"
+      ]
+    ]
+  },
+  "numRowsResultSet": 1,
+  "partialResult": false,
+  "exceptions": [],
+  "numGroupsLimitReached": false,
+  "numGroupsWarningLimitReached": false,
+  "timeUsedMs": 0,
+  "requestId": "1146010015000001729",
+  "clientRequestId": null,
+  "brokerId": "Broker_172.17.0.2_8000",
+  "numDocsScanned": 0,
+  "totalDocs": 0,
+  "numEntriesScannedInFilter": 0,
+  "numEntriesScannedPostFilter": 0,
+  "numServersQueried": 0,
+  "numServersResponded": 0,
+  "numSegmentsQueried": 0,
+  "numSegmentsProcessed": 0,
+  "numSegmentsMatched": 0,
+  "numConsumingSegmentsQueried": 0,
+  "numConsumingSegmentsProcessed": 0,
+  "numConsumingSegmentsMatched": 0,
+  "minConsumingFreshnessTimeMs": 0,
+  "numSegmentsPrunedByBroker": 0,
+  "numSegmentsPrunedByServer": 0,
+  "numSegmentsPrunedInvalid": 0,
+  "numSegmentsPrunedByLimit": 0,
+  "numSegmentsPrunedByValue": 0,
+  "brokerReduceTimeMs": 0,
+  "offlineThreadCpuTimeNs": 0,
+  "realtimeThreadCpuTimeNs": 0,
+  "offlineSystemActivitiesCpuTimeNs": 0,
+  "realtimeSystemActivitiesCpuTimeNs": 0,
+  "offlineResponseSerializationCpuTimeNs": 0,
+  "realtimeResponseSerializationCpuTimeNs": 0,
+  "offlineTotalCpuTimeNs": 0,
+  "realtimeTotalCpuTimeNs": 0,
+  "explainPlanNumEmptyFilterSegments": 0,
+  "explainPlanNumMatchAllFilterSegments": 0,
+  "traceInfo": {},
+  "tablesQueried": [],
+  "offlineThreadMemAllocatedBytes": 0,
+  "realtimeThreadMemAllocatedBytes": 0,
+  "offlineResponseSerMemAllocatedBytes": 0,
+  "realtimeResponseSerMemAllocatedBytes": 0,
+  "offlineTotalMemAllocatedBytes": 0,
+  "realtimeTotalMemAllocatedBytes": 0,
+  "pools": [],
+  "rlsFiltersApplied": false,
+  "groupsTrimmed": false
+}

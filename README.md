@@ -64,6 +64,11 @@ LAGAAM_ALLOWED_TABLES=tpch.tiny.orders,tpch.tiny.lineitem \
 Or point it at the Trino you already have with `TRINO_HOST` / `TRINO_PORT` /
 `TRINO_USER`.
 
+For Pinot, `--profile pinot` brings up the batch quickstart and
+`--profile pinot-realtime up -d` brings up a Kafka-fed streaming one —
+run `examples/pinot-realtime/bootstrap.sh` after it to create the topics,
+tables and feed. Then start the server with `LAGAAM_ENGINE=pinot`.
+
 Wire it into any MCP client (Claude Code, Claude Desktop, or your own agent):
 
 ```json
@@ -137,12 +142,15 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 `v0.1.4` — Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
-audit log. 706 unit + 118 integration tests (live Trino 476 and Pinot
-1.5.1), mypy strict. `LAGAAM_ENGINE=pinot` starts the native Pinot adapter
-in its experimental state: grounding and execution work, but the quotation
-is not built yet, so `query_data` is denied under the default budget until
-it is. On deck ([roadmap](docs/roadmap.md)): the Pinot quotation from
-segment metadata, then a Kubernetes control plane — agents as CRDs with
-token/dollar budgets and kill switches.
+audit log. 976 unit + 144 integration tests (live Trino 476 and Pinot
+1.5.1, batch and realtime), mypy strict. `LAGAAM_ENGINE=pinot` starts the
+native Pinot adapter: grounding, execution and a quotation synthesised from
+segment metadata and the broker's own pruning oracle, for OFFLINE and
+REALTIME tables alike — a consuming segment is charged at the stream's
+flush threshold, and a join is charged its bound rather than the product
+wherever the catalog proves the key. On deck
+([roadmap](docs/roadmap.md)): post-execution actuals on the audit line,
+then a Kubernetes control plane — agents as CRDs with token/dollar budgets
+and kill switches.
 
 Apache 2.0.

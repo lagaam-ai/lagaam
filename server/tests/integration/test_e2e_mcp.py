@@ -210,3 +210,104 @@ async def test_a_cte_declared_before_its_reference_still_grounds_on_pinot(
         assert not answer.isError
         assert answer.structuredContent is not None
         assert len(answer.structuredContent["rows"]) == 1
+
+
+# U12's demo, against the STREAM instance on :9001/:8001. Three assertions
+# through the same MCP round-trip the shipped demos use: data that landed
+# seconds ago runs, a proven key admits a self-join, and the byte-identical
+# twin without that key is denied on the row work it would build.
+
+_REALTIME_GRANT = AgentIdentity(
+    name="lagaam-e2e", allowed_tables=frozenset({"pinot.default.airlinestats"})
+)
+
+_UPSERT_PAIR_GRANT = AgentIdentity(
+    name="lagaam-e2e",
+    allowed_tables=frozenset({"pinot.default.u12upsert", "pinot.default.u12plain"}),
+)
+
+
+def _pinot_realtime_engine() -> PinotEngine:
+    return PinotEngine(
+        controller_url="http://localhost:9001", broker_url="http://localhost:8001"
+    )
+
+
+def _key_evidence_budget() -> QueryBudget:
+    """The default budget with only the row ceiling lowered.
+
+    Both self-joins scan the same handful of kilobytes and finish instantly,
+    so scan bytes and timeout stay at their defaults: the row ceiling is the
+    only dimension the key evidence moves, and it is the only one narrowed.
+    """
+    return QueryBudget(
+        max_scan_bytes=DEFAULT_MAX_SCAN_BYTES,
+        max_intermediate_rows=10_000,
+        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+    )
+
+
+async def test_a_query_over_freshly_landed_realtime_rows_runs(
+    pinot_realtime_ready: None,
+) -> None:
+    """The default budget, because fresh rows need no special dispensation."""
+    async with lagaam_client(
+        _pinot_realtime_engine(), budget=_default_budget(), identity=_REALTIME_GRANT
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": "SELECT Carrier, count(*) AS flights "
+                "FROM pinot.default.airlineStats "
+                "GROUP BY Carrier LIMIT 5"
+            },
+        )
+        assert not answer.isError
+        assert answer.structuredContent is not None
+        assert answer.structuredContent["row_count"] > 0
+        assert "Carrier" in answer.structuredContent["columns"]
+
+
+async def test_an_upsert_primary_key_admits_the_self_join(
+    pinot_realtime_ready: None,
+) -> None:
+    """A row ceiling below the product, so only the key's bound can clear it."""
+    async with lagaam_client(
+        _pinot_realtime_engine(),
+        budget=_key_evidence_budget(),
+        identity=_UPSERT_PAIR_GRANT,
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": "SELECT a.pk FROM pinot.default.u12upsert a "
+                "JOIN pinot.default.u12upsert b ON a.pk = b.pk LIMIT 10"
+            },
+        )
+        assert not answer.isError
+        assert answer.structuredContent is not None
+        assert answer.structuredContent["row_count"] > 0
+
+
+async def test_the_same_join_without_the_key_is_denied(
+    pinot_realtime_ready: None,
+) -> None:
+    """The same ceiling: same rows, same topic, same shape, no upsertConfig."""
+    async with lagaam_client(
+        _pinot_realtime_engine(),
+        budget=_key_evidence_budget(),
+        identity=_UPSERT_PAIR_GRANT,
+    ) as client:
+        answer = await client.call_tool(
+            "query_data",
+            {
+                "sql": "SELECT a.pk FROM pinot.default.u12plain a "
+                "JOIN pinot.default.u12plain b ON a.pk = b.pk LIMIT 10"
+            },
+        )
+        assert answer.isError
+        text = " ".join(
+            block.text for block in answer.content if hasattr(block, "text")
+        )
+        assert "rows at its widest step" in text
+        assert "LIMIT will not help" in text
