@@ -91,7 +91,33 @@ where the scan ordinal agrees.** Two sources of evidence:
 (a) **An upsert table's full primary key**, where the table config's
 `upsertConfig` and a non-empty `upsertPartitionToServerPrimaryKeyCountMap`
 in the table metadata agree that the table is one — two documents
-disagreeing about what a table is withholds the evidence. Measured,
+disagreeing about what a table is withholds the evidence — **and the
+`upsertConfig` is one under which the key is still unique**: `mode`
+(case-insensitive) is `FULL` or `PARTIAL`, and neither `metadataTTL` nor
+`deletedKeysTTL` is greater than zero.
+
+*The TTL condition was added after review, on a live reproduction.* A set
+`metadataTTL` evicts a key from the primary-key lookup map while the rows it
+pointed at stay queryable, so a key re-ingested after its window has two
+visible rows. On table `u12ttl` (`mode: FULL, metadataTTL: 60000`): 8 rows,
+7 distinct `pk`, `GROUP BY pk HAVING count(*) > 1` returning `K1 -> 2` with
+**both versions visible**, and the `pk` self-join returning **10 pairs**
+against the 8 a unique `pk` gives — while the adapter cut the widest join
+step from 80 to 24 on the strength of that key. `mode: NONE` is the other
+way in: a valid `Mode` value that disables upsert while the object stays.
+`deletedKeysTTL` opens the same window through dropped delete tombstones.
+The PK-count map is no help here either — it reported **6** against those 8
+rows and 7 distinct visible keys, wrong in both directions, while staying
+non-empty, so it confirms "upsert table" and never correctness.
+
+**Zero is not a TTL.** 1.5.1's `isTTLEnabled()` is
+`_metadataTTL > 0 || _deletedKeysTTL > 0`, `isOutOfMetadataTTL` returns
+false outright at `_metadataTTL <= 0`, and the controller materialises
+`metadataTTL: 0.0, deletedKeysTTL: 0.0` on every upsert config it serves, so
+reading a zero as set would withhold every upsert key there is. A TTL value
+the adapter cannot read as a number is treated as set.
+
+Measured,
 `GROUP BY pk HAVING count(*) > 1` returns nothing on the upsert table and
 six versions per key on a byte-identical non-upsert twin reading the same
 topic, and the PK self-join returns exactly the distinct-key count against
@@ -164,6 +190,12 @@ union, plus the consuming charge — and this path is unit-tested only.
   `count(*)` of 100. The PK-count map is not substituted for it — it is per
   server, unmeasured under replication > 1, and counts distinct keys rather
   than rows scanned.
+- **A TTL'd upsert table joins at the product.** Its primary key is not
+  provable unique from metadata at all — the lookup map has forgotten keys
+  whose rows are still queryable, and no endpoint reports which — so the
+  evidence is withheld rather than weakened. The same holds for
+  `mode: NONE`. An operator who wants the key priced as a key must run
+  without a TTL.
 - **A join of two real-sized tables without a key is still denied.** The
   product rule survives wherever the catalog proves nothing, which is most
   places: the e2e demo has to lower the row ceiling to 10,000 to show the

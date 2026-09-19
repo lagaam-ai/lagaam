@@ -9,7 +9,7 @@ missing number fails safe at the budget gate anyway.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
 from lagaam.core.models import ColumnInfo, TableSchema
 
@@ -484,6 +484,18 @@ def upsert_keys(
     two documents contradicting each other about what this table is, which is
     not a basis for admitting a join. The full column list is the key and
     never a subset: a composite primary key is unique as a tuple.
+
+    The upsertConfig has to say the key is still unique, and not merely that
+    the table is an upsert one. An `upsertConfig` whose `mode` is not FULL or
+    PARTIAL, or which carries a `metadataTTL` or `deletedKeysTTL` greater
+    than zero, yields nothing: measured on a FULL table at
+    `metadataTTL: 60000`, key `K1` had two visible rows and the pk self-join
+    returned 10 pairs against the 8 a unique pk gives. See
+    `_has_upsert_config` for why a zero TTL is not a TTL.
+
+    The PK-count map is not a correctness signal on that table either: it
+    reported 6 against 8 rows and 7 distinct visible keys — wrong in both
+    directions — while staying non-empty. It says "upsert table", nothing more.
     """
     if not isinstance(schema_json, dict):
         return frozenset()
@@ -505,10 +517,12 @@ def upsert_keys(
 
 
 def upsert_config_present(config_json: Any) -> bool:
-    """Does either half of this table config carry an upsertConfig object?
+    """Could this table config's upsertConfig prove a unique primary key?
 
     The caller fetches two more documents on the strength of this, so it is
     public: an adapter that guessed would pay two controller calls per table.
+    A config whose upsert mode or TTL already rules the key out is False
+    here, and the two documents are not fetched at all.
     """
     return _has_upsert_config(config_json)
 
@@ -627,14 +641,68 @@ def _is_multi_valued(column: dict[str, Any], docs: int) -> bool:
 
 
 def _has_upsert_config(config_json: Any) -> bool:
-    """Does either half's config carry an upsertConfig object?"""
+    """Does either half carry an upsertConfig that keeps the key unique?
+
+    Two ways an `upsertConfig` object is present and the primary key is still
+    not unique in the query-visible view, both measured live on 1.5.1:
+
+    `mode: NONE` is a valid Mode value that disables upsert entirely while
+    the object stays in the config, so the mode must say FULL or PARTIAL
+    (case-insensitively) and nothing else qualifies.
+
+    A **set** `metadataTTL` or `deletedKeysTTL` evicts a key from the
+    primary-key lookup map while the rows it pointed at stay queryable, so a
+    key re-ingested after its window has two visible rows. Measured on
+    `u12ttl` (`mode: FULL`, `metadataTTL: 60000`): 8 rows, 7 distinct pks,
+    `GROUP BY pk HAVING count(*) > 1` returning `K1 -> 2`, both versions
+    visible, and the pk self-join returning 10 pairs where a unique pk gives
+    8 — while the adapter cut the widest join step from 80 to 24 on the
+    strength of that key.
+
+    Set means greater than zero. 1.5.1's `isTTLEnabled()` is
+    `_metadataTTL > 0 || _deletedKeysTTL > 0` and `isOutOfMetadataTTL`
+    returns false outright at `_metadataTTL <= 0`, and the controller
+    materialises `metadataTTL: 0.0, deletedKeysTTL: 0.0` on every upsert
+    config it serves — so reading a zero as a TTL would withhold the key
+    from every upsert table there is, including the one the evidence was
+    proved on.
+    """
     if not isinstance(config_json, dict):
         return False
     for key in ("REALTIME", "OFFLINE"):
         half = config_json.get(key)
-        if isinstance(half, dict) and isinstance(half.get("upsertConfig"), dict):
-            return True
+        if not isinstance(half, dict):
+            continue
+        upsert = half.get("upsertConfig")
+        if not isinstance(upsert, dict):
+            continue
+        mode = upsert.get("mode")
+        if not isinstance(mode, str) or mode.upper() not in ("FULL", "PARTIAL"):
+            continue
+        if any(_ttl_is_set(upsert.get(name)) for name in _UPSERT_TTL_KEYS):
+            continue
+        return True
     return False
+
+
+# The two retention windows that let a primary key have two visible rows.
+_UPSERT_TTL_KEYS: Final = ("metadataTTL", "deletedKeysTTL")
+
+
+def _ttl_is_set(value: Any) -> bool:
+    """Is this TTL a positive duration, and so actually in force?
+
+    Anything that is not a number Pinot could read as one is treated as set:
+    a value this adapter cannot interpret is not a value it may clear a key
+    on. A bool is not a duration and is read the same way.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return True
+    if isinstance(value, (int, float)):
+        return value > 0
+    return True
 
 
 def _has_primary_key_counts(table_metadata_json: Any) -> bool:

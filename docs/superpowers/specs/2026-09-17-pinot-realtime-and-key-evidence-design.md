@@ -365,8 +365,38 @@ row whatever its expression value.
 of column sets known unique on that table. Two sources:
 
 **(a) An upsert table's primary key.** When the table config carries an
-`upsertConfig` object (any mode), the schema's `primaryKeyColumns` is a
-unique key set. The schema is a separate document — `GET /schemas/{schemaName}`, where
+`upsertConfig` object **that keeps the key unique**, the schema's
+`primaryKeyColumns` is a unique key set.
+
+*Corrected after review.* "Any mode" was wrong twice, and both ways were
+reproduced live on 1.5.1. `mode: NONE` is a valid `Mode` value that disables
+upsert entirely while the object stays in the config. And a **set**
+`metadataTTL` or `deletedKeysTTL` evicts a key from the primary-key lookup
+map while the rows it pointed at stay queryable, so a key re-ingested after
+its window has two visible rows. Measured on table `u12ttl`
+(`mode: FULL, metadataTTL: 60000, enableSnapshot: true`): 8 rows, 7 distinct
+`pk`, `GROUP BY pk HAVING count(*) > 1` returning `K1 -> 2` with **both
+versions visible**, and `a JOIN b ON a.pk = b.pk` returning **10 pairs**
+where a unique `pk` gives 8 — while the adapter cut the widest join step
+from 80 to 24 on the strength of that key. The gate is therefore: `mode`
+(case-insensitive) is `FULL` or `PARTIAL`, **and** neither TTL is greater
+than zero; anything else yields no evidence.
+
+**Zero is not a TTL.** 1.5.1's `isTTLEnabled()` is
+`_metadataTTL > 0 || _deletedKeysTTL > 0` and `isOutOfMetadataTTL` returns
+false outright at `_metadataTTL <= 0` (bytecode, `BasePartitionUpsertMetadataManager`),
+and the controller materialises `metadataTTL: 0.0, deletedKeysTTL: 0.0` on
+every upsert config it serves — including `u12upsert`'s. Reading a zero as a
+TTL would withhold the key from every upsert table there is. A TTL value
+that is not a number the adapter can read as one is treated as set, because
+a value it cannot interpret is not one it may clear a key on.
+
+`upsertPartitionToServerPrimaryKeyCountMap` stays a "this is an upsert
+table" signal and nothing more: on `u12ttl` it reported **6** against 8 rows
+and 7 distinct visible keys — wrong in both directions — while staying
+non-empty.
+
+The schema is a separate document — `GET /schemas/{schemaName}`, where
 `schemaName` is the table config's `segmentsConfig.schemaName` when present
 and **the controller's own spelling of the table name** otherwise.
 `segmentsConfig.schemaName` was absent on all four configs captured, so the

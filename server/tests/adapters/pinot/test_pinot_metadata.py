@@ -581,6 +581,99 @@ def test_upsert_keys_never_raises_on_a_shape_it_cannot_read(body: Any) -> None:
     assert upsert_keys(body, body, body) == frozenset()
 
 
+def _upsert_config(**upsert: Any) -> dict[str, Any]:
+    """A table config whose REALTIME half carries exactly this upsertConfig."""
+    config = load("tableconfig-u12upsert.json")
+    config["REALTIME"]["upsertConfig"] = upsert
+    return config
+
+
+@pytest.mark.parametrize("mode", ["FULL", "PARTIAL", "full", "Partial"])
+def test_an_upserting_mode_still_proves_the_key(mode: str) -> None:
+    """The mode is compared case-insensitively; both upserting modes qualify."""
+    assert upsert_keys(
+        _upsert_config(mode=mode),
+        load("schema-u12upsert.json"),
+        load("metadata-u12upsert.json"),
+    ) == frozenset({frozenset({"pk"})})
+
+
+@pytest.mark.parametrize("mode", ["NONE", "none", None, 1, "", "SOMETHING"])
+def test_a_mode_that_is_not_an_upserting_one_proves_nothing(mode: Any) -> None:
+    """Measured: `{"mode": "NONE"}` disables upsert while the object stays."""
+    assert (
+        upsert_keys(
+            _upsert_config(mode=mode),
+            load("schema-u12upsert.json"),
+            load("metadata-u12upsert.json"),
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("ttl", ["metadataTTL", "deletedKeysTTL"])
+@pytest.mark.parametrize("value", [60000, 60000.0, 1, 0.5, "60000"])
+def test_a_set_ttl_withholds_the_key(ttl: str, value: Any) -> None:
+    """A TTL'd key is evicted from the lookup map while its old row stays
+    visible, so the key is not unique in the query-visible view."""
+    assert (
+        upsert_keys(
+            _upsert_config(mode="FULL", **{ttl: value}),
+            load("schema-u12upsert.json"),
+            load("metadata-u12upsert.json"),
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("ttl", ["metadataTTL", "deletedKeysTTL"])
+@pytest.mark.parametrize("value", [0, 0.0, -1, -1.0])
+def test_a_ttl_of_zero_is_a_ttl_that_is_off(ttl: str, value: Any) -> None:
+    """1.5.1's `isTTLEnabled()` is `_metadataTTL > 0 || _deletedKeysTTL > 0`
+    and `isOutOfMetadataTTL` returns false outright at `_metadataTTL <= 0`,
+    and the controller materialises `0.0` for both on every upsert config it
+    serves — so treating 0 as set would withhold every upsert key there is.
+    """
+    assert upsert_keys(
+        _upsert_config(mode="FULL", **{ttl: value}),
+        load("schema-u12upsert.json"),
+        load("metadata-u12upsert.json"),
+    ) == frozenset({frozenset({"pk"})})
+
+
+def test_the_live_u12upsert_config_carries_both_ttls_as_zero() -> None:
+    """The captured config is the controller's own, defaults materialised."""
+    upsert = load("tableconfig-u12upsert.json")["REALTIME"]["upsertConfig"]
+    assert upsert["metadataTTL"] == 0.0
+    assert upsert["deletedKeysTTL"] == 0.0
+
+
+def test_the_measured_ttl_table_proves_no_key() -> None:
+    """u12ttl, as captured live: `metadataTTL` 60 000 on a FULL upsert table
+    where `SELECT pk, count(*) ... HAVING count(*) > 1` returned K1 -> 2 and
+    the self-join returned 10 pairs against the 8 a unique pk would give."""
+    assert (
+        upsert_keys(
+            load("tableconfig-u12ttl.json"),
+            load("schema-u12upsert.json"),
+            load("metadata-u12upsert.json"),
+        )
+        == frozenset()
+    )
+
+
+@pytest.mark.parametrize("upsert", [None, [], "FULL", 1])
+def test_an_upsert_config_that_is_not_an_object_proves_nothing(upsert: Any) -> None:
+    config = load("tableconfig-u12upsert.json")
+    config["REALTIME"]["upsertConfig"] = upsert
+    assert (
+        upsert_keys(
+            config, load("schema-u12upsert.json"), load("metadata-u12upsert.json")
+        )
+        == frozenset()
+    )
+
+
 def _size_naming(*names: str) -> dict[str, Any]:
     """A minimal size report naming exactly the given segments as sealed."""
     return {
