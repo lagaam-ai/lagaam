@@ -25,7 +25,8 @@ One unit at a time; each unit ends in something demoable or a failing test.
 ## Phase 3 — Depth
 - Native Pinot adapter (realtime tables, upserts — the signature demo:
   "agent answers on data that landed 2 seconds ago") — **done** (U9-U12,
-  ADR 0008/0009); the signature demo GIF is still open
+  ADR 0008/0009), and the signature demo GIF with it — **done** (U13,
+  `examples/demo_pinot.py` → `docs/demo-pinot.gif`)
 - Operator v0: Agent CRD + reconcile → pod + identity + limits ConfigMap
 - LiteLLM proxy wiring: token/dollar meter per agent
 - `kubectl get agents` demo GIF

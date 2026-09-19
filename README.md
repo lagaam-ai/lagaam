@@ -11,6 +11,11 @@ exactly how to fix its SQL.
 *Real session, real Trino, nothing mocked — reproduce it with
 `uv run --project server python examples/demo.py`.*
 
+![Lagaam demo: a consuming Pinot segment priced at its flush threshold, a keyless join blocked, the same join admitted on a proven upsert key](docs/demo-pinot.gif)
+
+*Real session, real Pinot 1.5.1 realtime table, nothing mocked — reproduce it
+with `uv run --project server python examples/demo_pinot.py`.*
+
 ## The problem
 
 Agents write syntactically-valid, catastrophic SQL. A missing partition

@@ -70,6 +70,6 @@ v0.1 = Trino adapter + schema tools + EXPLAIN cost guard + query budget +
 read-only enforcement + audit log — shipped. Native Pinot adapter (grounding,
 execution, quotation, realtime/join-key evidence — U9-U12, ADR 0008/0009) —
 shipped.
-Still deferred: operator/CRDs (month 3+), the Pinot demo GIF,
+Still deferred: operator/CRDs (month 3+),
 UI/dashboard, multi-tenancy, RBAC beyond per-agent allowlists, GraphRAG.
 If a task expands scope, say so and push back before implementing.
