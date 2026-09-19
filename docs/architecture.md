@@ -19,7 +19,7 @@ flowchart TB
     end
 
     exec --> trino["Trino"]
-    exec -.-> pinot["Pinot (native, v0.2)"]
+    exec --> pinot["Pinot (native)"]
     trino --> storage["Iceberg, Mongo, ..."]
 
     operator["Control plane operator (month 3+)<br/>reconciles Agent CRDs → identity + limits"] -.-> proxy
@@ -57,7 +57,8 @@ class QueryEngine(Protocol):
 ```
 - Core depends only on this protocol. Adapters implement it.
 - `CostEstimate` carries a confidence level: Trino EXPLAIN gives rich
-  estimates; Pinot adapter will use segment-metadata heuristics.
+  estimates; the Pinot adapter synthesises its quote from segment metadata
+  and the broker's pruning oracle instead (see Pinot adapter, below).
 - `DialectCard` = structured summary of the engine's SQL dialect (functions,
   quirks, unsupported features) injected into the generation prompt.
   Primary dialect strategy is generate-in-target-dialect; sqlglot transpile
@@ -153,6 +154,56 @@ explosion is 225,000,000 at any scale. The default of 50,000,000 sits
 between — 8.3x above real sf1 work, 4.5x below the cheapest attack.
 Operators at larger scale should raise it; the bands above are the ruler.
 
+## Pinot adapter
+
+`server/src/lagaam/adapters/pinot/`. Pinot has no catalog hierarchy, no
+`SHOW TABLES`, no `information_schema`, and its multi-stage `EXPLAIN`
+reports no usable sizes — every table scan plans at a fixed placeholder
+row count regardless of the table's real size. The adapter is grounding,
+execution, and quotation built around those constraints, not a port of the
+Trino approach:
+
+| Module | Does |
+|---|---|
+| `client.py` | httpx wiring; the only module with an HTTP verb, threading basic auth to both the controller and the broker |
+| `metadata.py` | controller JSON → domain values; pure, never raises — an unreadable shape is "no fact," not a crash |
+| `names.py` | three-part names for the agent (`pinot.<db>.<table>`) to two-part names for Pinot (`<db>.<table>`) |
+| `response.py` | broker JSON → a `QueryResult`, its failure, or its pruning counters; every Pinot error is an HTTP 200, so the body is the only signal |
+| `plan.py` | the widest row count anywhere in the multi-stage plan, read for shape only (which tables, joins, conditions) since the plan carries no real sizes |
+| `quote.py` | table facts → `CostEstimate`, synthesised from segment metadata plus the broker's own pruning oracle; a number that cannot be bounded is `None`, which the budget gate denies |
+| `engine.py` | the `QueryEngine` port itself: grounding (`list_catalogs`/`describe_table`), execution, and quotation, with a synthetic single catalog named `pinot` since Pinot has none |
+
+Names are three-part to the agent and core (matching Trino's shape, so the
+allowlist and cache key stay engine-agnostic) and two-part to Pinot itself
+— `names.py` strips the synthetic catalog segment after `validate_query`
+and the allowlist check have already run, so a name it does not recognise
+is refused rather than sent.
+
+The quotation has three sources, in order of what it can prove:
+1. **Segment metadata** — sizes for OFFLINE segments and for REALTIME
+   segments already flushed to disk.
+2. **A consuming segment's flush threshold** — a REALTIME segment still
+   being written reports zero size from the controller; charging that as
+   written would price the newest data free, so it is charged at the
+   segment's own stored flush threshold, read from its segment metadata,
+   never the table config (ADR 0009).
+3. **The broker's pruning oracle plus a proven join key** — how many
+   segments survive a predicate, and, where the catalog can prove a join
+   column is a primary key, the join is charged its bound rather than the
+   product of its inputs (ADR 0009).
+
+Design record: [ADR 0008](adr/0008-pinot-quotation-is-adapter-synthesised.md)
+and [ADR 0009](adr/0009-consuming-segments-and-proven-join-keys.md) for the
+accepted decisions; the fuller design and the measurements behind each
+number live in
+[`docs/superpowers/specs/2026-09-11-pinot-adapter-design.md`](superpowers/specs/2026-09-11-pinot-adapter-design.md)
++
+[`2026-09-11-pinot-measurements.md`](superpowers/specs/2026-09-11-pinot-measurements.md)
+and
+[`2026-09-17-pinot-realtime-and-key-evidence-design.md`](superpowers/specs/2026-09-17-pinot-realtime-and-key-evidence-design.md)
++
+[`2026-09-17-pinot-realtime-measurements.md`](superpowers/specs/2026-09-17-pinot-realtime-measurements.md).
+
 ## Identity flow
 Operator creates agent pod → issues identity (service account / token) →
 MCP server maps identity → permission set (schemas/tables allowlist) and
@@ -162,7 +213,8 @@ post-v1 as standards mature.
 
 ## Local development
 - Trino: single Docker container, TPC-H catalog for instant test data.
-- Pinot: official quickstart image (v0.2).
+- Pinot: official quickstart image, batch and streaming profiles
+  (`examples/docker-compose.yml`, `examples/pinot-realtime/bootstrap.sh`).
 - kind for operator work (month 3+).
 - Docker Compose profiles so only the needed engine runs.
 - LLM: Bedrock via LiteLLM; Ollama profile for offline mock runs.
