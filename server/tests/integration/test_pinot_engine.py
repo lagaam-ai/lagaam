@@ -7,6 +7,7 @@ Then: uv run pytest -m integration
 import pytest
 
 from lagaam.adapters.pinot.client import PinotClient
+from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.engine import (
     _EXPLAIN_PRUNING,
     _EXPLAIN_TIMEOUT_MS,
@@ -56,7 +57,7 @@ def test_pinot_engine_satisfies_the_port(engine: PinotEngine) -> None:
 def test_dialect_card_targets_pinot(engine: PinotEngine) -> None:
     card = engine.dialect()
     assert card.engine == "Pinot"
-    assert card.sqlglot_dialect == ""
+    assert card.sqlglot_dialect == "pinot"
     assert card.rules
 
 
@@ -1018,3 +1019,78 @@ async def test_a_bare_select_bounds_its_own_execution_on_the_batch_instance(
     assert estimate.confidence == "high"
     assert estimate.row_estimate is not None
     assert estimate.row_estimate >= scanned
+
+
+# The fifteen shapes the generic dialect broke, plus four controls that the
+# generic dialect rendered correctly — every one run raw and re-rendered, on
+# both engines. Full before/after tables:
+# docs/superpowers/specs/2026-09-20-pinot-dialect-measurements.md.
+_T = "pinot.default.airlineStats"
+_ROUNDTRIP = [
+    ("CAST STRING", f"SELECT CAST(ArrDelay AS STRING) AS y FROM {_T} LIMIT 1"),
+    ("JSON_EXTRACT_SCALAR",
+     f"SELECT JSON_EXTRACT_SCALAR(Carrier, '$.a', 'STRING', 'x') AS y FROM {_T} LIMIT 1"),
+    ("SUBSTR 3", f"SELECT SUBSTR(Carrier, 0, 1) AS y FROM {_T} WHERE Carrier = 'AA' LIMIT 1"),
+    ("SUBSTR 2", f"SELECT SUBSTR(Carrier, 1) AS y FROM {_T} WHERE Carrier = 'AA' LIMIT 1"),
+    ("STRPOS", f"SELECT STRPOS(Carrier, 'A') AS y FROM {_T} WHERE Carrier = 'AA' LIMIT 1"),
+    ("LOG10", f"SELECT LOG10(100) AS y FROM {_T} LIMIT 1"),
+    ("LOG2", f"SELECT LOG2(8) AS y FROM {_T} LIMIT 1"),
+    ("TRUNCATE 2", f"SELECT TRUNCATE(1.234, 2) AS y FROM {_T} LIMIT 1"),
+    ("TRUNCATE 1", f"SELECT TRUNCATE(1.234) AS y FROM {_T} LIMIT 1"),
+    ("VAR_POP", f"SELECT VAR_POP(ArrDelay) AS y FROM {_T}"),
+    ("VAR_SAMP", f"SELECT VAR_SAMP(ArrDelay) AS y FROM {_T}"),
+    ("BOOL_AND", f"SELECT BOOL_AND(ArrDelay > -1000) AS y FROM {_T}"),
+    ("BOOL_OR", f"SELECT BOOL_OR(ArrDelay > 0) AS y FROM {_T}"),
+    ("ARRAY literal", f"SELECT ARRAY['a','b'] AS y FROM {_T} LIMIT 1"),
+    ("ARRAY_AGG 2", f"SELECT ARRAY_AGG(Carrier, 'STRING') AS y FROM {_T} WHERE ArrDelay > 500"),
+    ("ARRAY_AGG 3",
+     f"SELECT ARRAY_AGG(Carrier, 'STRING', true) AS y FROM {_T} WHERE ArrDelay > 500"),
+    ("control CEILING", f"SELECT CEILING(1.2) AS y FROM {_T} LIMIT 1"),
+    ("control STARTSWITH",
+     f"SELECT STARTSWITH(Carrier, 'A') AS y FROM {_T} WHERE Carrier = 'AA' LIMIT 1"),
+    ("control REGEXP_EXTRACT",
+     f"SELECT REGEXP_EXTRACT(Carrier, '(A)', 1) AS y FROM {_T} WHERE Carrier = 'AA' LIMIT 1"),
+    ("control count", f"SELECT Carrier, count(*) AS n FROM {_T} GROUP BY Carrier LIMIT 5"),
+]
+
+# Pinot sums floats in whatever order the segments arrive, so two runs of the
+# same variance query differ in the last digits — measured, raw against raw.
+_FLOAT_NOISE = {"VAR_POP", "VAR_SAMP"}
+
+
+@pytest.mark.parametrize(
+    ("shape", "sql"), _ROUNDTRIP, ids=[name for name, _ in _ROUNDTRIP]
+)
+@pytest.mark.parametrize("multistage", [False, True], ids=["sse", "mse"])
+async def test_the_rerendered_sql_answers_exactly_as_the_raw_sql_does(
+    pinot_ready: None, shape: str, sql: str, multistage: bool
+) -> None:
+    """What the agent wrote and what the broker receives must agree.
+
+    Raw is the agent's own SQL with only the synthetic catalog stripped;
+    re-rendered is the same statement through validate_query and two_part_sql,
+    which is the string the server actually sends.
+    """
+    rendered = two_part_sql(validate_query(sql, PINOT_DIALECT_CARD.sqlglot_dialect, 5))
+    raw = sql.replace("pinot.default.", "")
+    options = f"useMultistageEngine={'true' if multistage else 'false'}"
+    client = PinotClient(
+        controller_url="http://localhost:9000", broker_url="http://localhost:8000"
+    )
+    try:
+        raw_body = await client.broker_query(raw, options)
+        rendered_body = await client.broker_query(rendered, options)
+    finally:
+        await client.aclose()
+
+    assert result_failure(raw_body) is None, raw_body.get("exceptions")
+    assert result_failure(rendered_body) is None, rendered_body.get("exceptions")
+    raw_rows = raw_body["resultTable"]["rows"]
+    rendered_rows = rendered_body["resultTable"]["rows"]
+    if shape in _FLOAT_NOISE:
+        # approx refuses a nested structure, and a result row is always one.
+        assert len(rendered_rows) == len(raw_rows)
+        for rendered_row, raw_row in zip(rendered_rows, raw_rows, strict=True):
+            assert rendered_row == pytest.approx(raw_row, rel=1e-9)
+    else:
+        assert rendered_rows == raw_rows

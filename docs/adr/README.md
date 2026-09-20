@@ -14,3 +14,4 @@ Title / Status / Context / Decision / Consequences.
 | [0007](0007-parser-safety-bounds.md) | Parser safety bounds sit ahead of the parse |
 | [0008](0008-pinot-quotation-is-adapter-synthesised.md) | A Pinot quotation is synthesised by the adapter, not read from the engine |
 | [0009](0009-consuming-segments-and-proven-join-keys.md) | A consuming segment is charged at its flush threshold, and a key is proven by the catalog and the scan ordinal |
+| [0010](0010-pinot-sqlglot-dialect-preserves-spellings.md) | The Pinot dialect preserves the agent's spellings rather than transpiling them |
