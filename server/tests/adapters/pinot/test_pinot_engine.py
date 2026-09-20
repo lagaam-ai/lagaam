@@ -101,7 +101,7 @@ def test_pinot_engine_satisfies_the_port() -> None:
 def test_the_dialect_is_the_pinot_card() -> None:
     card = make_engine().dialect()
     assert card.engine == "Pinot"
-    assert card.sqlglot_dialect == ""
+    assert card.sqlglot_dialect == "pinot"
 
 
 async def test_list_catalogs_synthesises_one_catalog_over_the_databases() -> None:
