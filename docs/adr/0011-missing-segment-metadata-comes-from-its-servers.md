@@ -50,9 +50,22 @@ Two alternatives were measured and rejected:
 `GET /segments/{t}/servers` says which server holds which segments — one
 element per table type, `serverToSegmentsMap`, consuming names included — and
 a `?segments=` filter whose names all live on one server comes back whole,
-with the bulk endpoint's own fidelity. Three trials each on both tables:
-every such ask returned exactly its names, and the union covered every sealed
-name the size report listed, every time.
+with the bulk endpoint's own fidelity.
+
+It does not come back whole *every* time. The answer to any filtered ask is
+one server's response rather than a union — over 20 bulk trials on
+`u14multi` the 7-segment server answered 19 times and the 3-segment server
+once — and a filter naming one holder's names comes back whole because only
+that holder has work to do for it. When a server holding none of the names
+answers last, the body is `{}`. Measured at 40 trials per ask: `u14rep`'s
+three-name ask on 7053 came back `{}` once, the other five per-server asks
+0/40, and a **single-name** ask was empty 6/30 on `u14multi` and 4/30 on
+`u14rep` — about one in five. So a short answer is a random event, not a
+verdict about the table, and an identical retry is an independent trial
+(1/1 on the one that was caught). Pinot 1.5.1's
+`TableMetadataReader.fetchAndAggregateMetadata` reads as a per-property union
+over the server responses, which does not match what this cluster returns;
+the mechanism is not established here, only the behaviour.
 
 ## Decision
 
@@ -83,7 +96,15 @@ one URL per segment the filter names. So the backend cost of one adapter GET
 is one server request per server hosting the table — not one — and on the
 fallback path one per named segment. Source: `TableMetadataReader.java`
 (release-1.5.1) lines ~175–225.
-4. The answers are merged name-keyed into the bulk response, bulk entries
+4. An answer missing any name its ask named is **asked again for exactly the
+   names still missing**, up to `_METADATA_RETRIES` (2) more times per batch.
+   A short answer is one server's `{}`, not a fact about the table, and the
+   same request is an independent trial. Two retries take the worst measured
+   rate — 20%, a single-name ask — to under 1%. A batch still short after
+   its retries stops the fan-out and keeps the bulk response, exactly as an
+   unreadable answer does; later batches are not asked for. The merge happens
+   only when every batch came back whole.
+5. The answers are merged name-keyed into the bulk response, bulk entries
    winning, and the merged document goes to `table_facts` unchanged.
 
 The completeness guard is untouched. It runs on the merged document exactly
@@ -101,8 +122,11 @@ than guessing:
   answers `400` with an empty body, and httpx itself raises `InvalidURL`
   above 65,536 bytes per component, before any request is made. A single
   name too long to ask for alone: no fan-out at all;
-- more than `_MAX_METADATA_REQUESTS` (64) asks in total, across every group
-  and every split, counted before the first call: no fan-out at all;
+- more than `_MAX_METADATA_REQUESTS` (64) asks in the **worst case**, counted
+  before the first call: no fan-out at all. The worst case is
+  `batches x (1 + _METADATA_RETRIES)`, so 21 batches is the most that is ever
+  attempted (63 <= 64) and 22 makes no call — the retries are bounded by the
+  same number as the asks they retry, never on top of it;
 - any call returning `NotFound`, a non-dict, or raising
   `PinotTransportError` (or `InvalidURL`, which the byte cap should already
   have prevented): stop, keep what the bulk call gave;
@@ -124,6 +148,24 @@ cluster, before and after:
 | `u14rep` (replication 2) | 4 | `low`, all `None` | `scanned_bytes=6064 row_estimate=400 confidence='high'` |
 | `u12plain` (replica-group pinned) | 1 | `scanned_bytes=1582 row_estimate=400` | unchanged |
 
+The retry changes how *reliably* that holds, not what it says. Forty live
+`estimate_cost` trials per table, without the retry and with it — the quoted
+numbers are identical in every `high` answer either way:
+
+| table | `low` without the retry | `low` with it |
+|---|---|---|
+| `u14multi` | 1/40 | 0/40 |
+| `u14rep` | 2/40 | 0/40 |
+| `u12plain` | 0/40 | 0/40 |
+
+The residual is not zero. At the worst rate measured on this cluster (a 20%
+empty single-name ask) three independent asks leave under 1% of batches
+short, and a table whose fan-out is several batches multiplies that by its
+batch count. Such a quote is `low`, which is where it already was — the
+failure is a denied query, never an under-quote. And the mechanism inside
+the controller is not established (Context), so the rate is this cluster's
+behaviour, not a property anything here proves.
+
 A single-server table makes **no new request**. It is complete on the bulk
 call, `missing_sealed_segments` is empty, and `/servers` is never asked —
 which is every existing integration test and the batch quickstart.
@@ -131,7 +173,8 @@ which is every existing integration test and the batch quickstart.
 A multi-server table costs `1 + R` extra **client-to-controller** GETs per
 quotation, where `R` is the number of asks: one per group holding a segment
 the bulk call missed, plus a split wherever a group's names do not fit one
-URL. On `u14multi` that is two calls. That count is the adapter's only
+URL — up to `1 + 3R` where every ask comes back short twice. On `u14multi`
+that is two calls in the normal case. That count is the adapter's only
 measured cost; it is not a count of backend requests. Each of those GETs
 makes the controller ask every server hosting the table (Decision §3), so a
 wide cluster pays more inside Pinot than the adapter's number shows, and
@@ -141,7 +184,8 @@ which is where it already was.
 **The completeness guard is now load-bearing in a second way.** Before, a
 failed guard meant "this table spans servers". Now it means "this table spans
 servers *and* the fan-out could not close the gap" — a server that 404s, a
-name no server claims, a slow cluster. The quote is the same (`low`) either
+name no server claims, a slow cluster, or an ask that came back short three
+times running. The quote is the same (`low`) either
 way, so nothing downstream changes, but an operator diagnosing a `low` quote
 has one more place to look.
 

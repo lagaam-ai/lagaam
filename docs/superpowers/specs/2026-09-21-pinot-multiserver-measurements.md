@@ -65,3 +65,78 @@ segments, so a name-keyed merge that keeps the first entry loses nothing.
 
 Per-server asks give the bulk endpoint's own fidelity in S calls, S = servers
 holding a missing segment.
+
+## 5. Round 2 (Astra review): the answer is one server's, and small asks lose
+
+Measured 2026-09-21 evening, same tables, 40 trials per ask unless stated.
+
+`GET /segments/{t}/metadata` never returns a union. Every answer is exactly
+one server's response — the bulk call on `u14multi` over 20 trials returned
+the 7-segment server 19 times and the 3-segment server once; on `u14rep`
+15 and 5. A filter naming one holder's names comes back whole because only
+that holder has work to do for it, and the server with the most work answers
+last. When an empty responder lands last, the answer is `{}`:
+
+| ask | short answers | note |
+|---|---|---|
+| `u14multi` 7051, 3 names | 0/40 | |
+| `u14multi` 7052, 7 names | 0/40 | |
+| `u14rep` 7050/7051/7052 (3, 7, 7 names) | 0/40 each | |
+| `u14rep` 7053, 3 names | 1/40 (`{}`) | an immediate identical retry returned all 3 |
+| single-name ask, `u14multi` | 6/30 empty | |
+| single-name ask, `u14rep` | 4/30 empty | |
+
+Pinot 1.5.1's `TableMetadataReader.fetchAndAggregateMetadata` reads as a
+per-property union over `_httpResponses.values()`, which does not match
+what this cluster returns; the mechanism is not established here, only the
+behaviour. The four servers share one host with distinct admin ports
+(7500–7503) — a production cluster with one host per server is not
+measured.
+
+Consequences for the adapter: a short answer is a random event, not a
+verdict, and repeating the identical ask is an independent trial (1/1 fixed
+above). Asks are made as large as the URL cap allows, so only a server's
+last batch is small. Retrying a short answer twice takes a 20% empty rate
+(the worst measured, single names) to under 1%; what is still short after
+that stays `low`. Controller log shows 0 "falling back to legacy" lines
+across all of this, so the per-segment fallback path was never taken.
+
+## 6. Round 3: the rule implemented, and what it cost
+
+Measured 2026-09-21, same cluster, after the retry landed. Forty live
+`estimate_cost` trials per table, before and after:
+
+| table | `low` before | `low` after | the `high` answer, both ways |
+|---|---|---|---|
+| `u14multi` | 1/40 | 0/40 | `scanned_bytes=4548 row_estimate=300` |
+| `u14rep` | 2/40 | 0/40 | `scanned_bytes=6064 row_estimate=400` |
+| `u12plain` | 0/40 | 0/40 | `scanned_bytes=1582 row_estimate=400` |
+
+The quoted numbers are identical in every `high` answer either way: the rule
+changes how often a quote arrives, never what it says.
+
+**A short answer is always a whole `{}`, never a partial.** Probing
+`u14rep`'s per-server asks directly, 80 raw asks (20 trials x 4 servers):
+10 came back short, and all 10 were empty — including the 8-name ask on
+7051, twice. So §5's "an empty responder lands last" is the whole of the
+effect; no ask has ever returned some of its names.
+
+**The rate is higher than §5 measured.** §5 saw `u14rep`'s per-server asks
+short 1/40 on 7053 and 0/40 on the other three. This round saw 10/80 across
+the same four — about 12%, against §5's ~0.6%. Same cluster, same tables,
+same day. Whatever selects the answering server is not stable between
+sessions, so no rate here should be read as a constant; what is stable is
+that an identical retry is an independent trial.
+
+The 20x loop of the six u14 integration tests: 0 failures. With only the
+engine's retry loop disabled (the constant left in place, so the tests still
+import), 1 of 10 runs failed — `test_realtime_the_facts_cover_every_sealed
+_segment[u14rep]`, which is the flake round 3 exists to remove.
+
+**The integration oracle had the same bug as the adapter.** Two helpers in
+`tests/integration/test_pinot_engine.py` (`_per_server_pk_bytes`,
+`_sealed_segment_docs_per_server`) made their own un-retried per-server asks
+and then indexed the result, so a short answer failed the test for the
+adapter's correct behaviour. Both now retry on the same bound the adapter
+does. A test oracle that reads the cluster the adapter's way has to read it
+as carefully.
