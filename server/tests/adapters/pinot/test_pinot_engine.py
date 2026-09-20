@@ -2129,6 +2129,28 @@ async def test_a_per_server_ask_answering_junk_leaves_the_quote_where_it_was() -
     assert estimate.confidence == "low"
 
 
+@pytest.mark.parametrize("unreadable", [None, [], "unreadable", 123])
+async def test_a_per_server_answer_naming_a_segment_it_cannot_price_stays_low(
+    unreadable: Any,
+) -> None:
+    """The answer carries the key but no body the pricing pass can read.
+
+    Counting the key as present would make the three missing segments free:
+    10 sealed / 17,692 bytes / 1,200 rows becomes 7 / 13,144 / 900 at
+    confidence="high" — a confident under-quote.
+    """
+    estimate = await _u14_engine(
+        per_server={
+            tuple(sorted(_U14_MISSING_ON_7051)): {
+                name: unreadable for name in _U14_MISSING_ON_7051
+            }
+        }
+    ).estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+    assert estimate.row_estimate is None
+
+
 async def test_a_fan_out_that_outlasts_its_deadline_keeps_the_bulk_response(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

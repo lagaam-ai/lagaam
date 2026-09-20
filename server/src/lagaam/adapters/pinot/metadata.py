@@ -285,6 +285,11 @@ def missing_sealed_segments(seg_metadata_json: Any, size_json: Any) -> frozenset
 
     The addresses of the per-server fetch, and the reason the completeness
     guard refuses: a response missing these is one server's half of the table.
+
+    Present means a dict body — the one shape `segment_facts` prices. A
+    `{name: null}` counted present makes a sealed segment free at
+    confidence="high"; counted missing it is fetched instead, which is the
+    outcome the fan-out exists for.
     """
     named = {
         name
@@ -297,9 +302,11 @@ def missing_sealed_segments(seg_metadata_json: Any, size_json: Any) -> frozenset
         return frozenset(named)
     present: set[str] = set()
     for key, body in seg_metadata_json.items():
+        if not isinstance(body, dict):
+            continue
         if isinstance(key, str):
             present.add(key)
-        if isinstance(body, dict) and isinstance(body.get("segmentName"), str):
+        if isinstance(body.get("segmentName"), str):
             present.add(body["segmentName"])
     return frozenset(named - present)
 

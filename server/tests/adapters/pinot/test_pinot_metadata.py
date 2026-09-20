@@ -1179,6 +1179,12 @@ def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
 
 # --- U14: the segments the bulk metadata call left out, and where they live.
 
+_U14_MISSING_ON_7051 = (
+    "u14multi__0__0__20260920T1839Z",
+    "u14multi__0__1__20260920T1840Z",
+    "u14multi__0__2__20260920T1840Z",
+)
+
 
 def test_missing_sealed_segments_names_the_three_the_bulk_call_left_out() -> None:
     """The truncated bulk call is one server's half of a two-server table."""
@@ -1224,6 +1230,36 @@ def test_an_unreadable_metadata_response_is_missing_every_sealed_name() -> None:
         for name, seg in size["realtimeSegments"]["segments"].items()
         if seg["reportedSizeInBytes"] >= 0
     )
+
+
+@pytest.mark.parametrize("unreadable", [None, [], "unreadable", 123])
+def test_a_sealed_segment_whose_entry_is_not_an_object_is_missing(
+    unreadable: Any,
+) -> None:
+    """`segment_facts` prices only a dict body, so only a dict body is present.
+
+    A `{name: null}` merged in otherwise makes the guard say complete while
+    the pricing pass omits the segment — a confident under-quote.
+    """
+    size = load("size-u14multi.json")
+    bulk = load("seg-metadata-u14multi-truncated.json")
+    name = next(iter(bulk))
+    bulk[name] = unreadable
+    assert name in missing_sealed_segments(bulk, size)
+    assert not metadata_is_complete(bulk, size)
+
+
+def test_a_segment_priced_is_a_segment_counted_present() -> None:
+    """The guard's names and the pricing pass's names cannot disagree."""
+    size = load("size-u14multi.json")
+    merged = merge_segment_metadata(
+        load("seg-metadata-u14multi-truncated.json"),
+        [{name: None for name in _U14_MISSING_ON_7051}],
+    )
+    priced = {fact.name for fact in segment_facts(merged, size)}
+    assert not metadata_is_complete(merged, size)
+    assert missing_sealed_segments(merged, size) == frozenset(_U14_MISSING_ON_7051)
+    assert not (frozenset(_U14_MISSING_ON_7051) & priced)
 
 
 def test_segments_by_server_parses_the_servers_document() -> None:
