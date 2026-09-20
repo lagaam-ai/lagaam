@@ -20,6 +20,7 @@ from typing import ClassVar
 
 from sqlglot import exp, generator, parser
 from sqlglot.dialects.dialect import Dialect, inline_array_sql, rename_func
+from sqlglot.helper import seq_get
 
 from lagaam.core.models import DialectCard
 
@@ -41,7 +42,8 @@ class ArrayAgg(exp.Expression, exp.AggFunc):
 
 
 def _parse_array_agg(args: list[exp.Expr]) -> ArrayAgg:
-    return ArrayAgg(this=args[0], expressions=args[1:])
+    # A missing column is sqlglot's to refuse: it names the required argument.
+    return ArrayAgg(this=seq_get(args, 0), expressions=args[1:])
 
 
 def _array_agg_sql(self: generator.Generator, expression: ArrayAgg) -> str:

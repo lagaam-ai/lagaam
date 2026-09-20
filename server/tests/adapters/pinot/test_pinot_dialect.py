@@ -159,6 +159,19 @@ def test_a_kept_scalar_is_anonymous_with_every_argument_intact(sql: str) -> None
     assert tree.sql(dialect=_DIALECT) == sql
 
 
+@pytest.mark.parametrize(
+    "call",
+    ["ARRAY_AGG()", "arrayagg()", "ARRAYAGG( )", "ARRAY_AGG(/* nothing */)"],
+)
+def test_an_array_agg_with_no_argument_is_a_validation_error_not_a_crash(
+    call: str,
+) -> None:
+    # Astra review of PR #37: the builder indexed args[0] before sqlglot checked
+    # the required argument, so the agent was told "internal error, retry".
+    with pytest.raises(SqlValidationError, match="could not be parsed as pinot"):
+        validate_query(f"SELECT {call} FROM {_TABLE}", _DIALECT, default_limit=5)
+
+
 def test_select_star_is_still_rejected() -> None:
     with pytest.raises(SqlValidationError):
         validate_query(f"SELECT * FROM {_TABLE}", _DIALECT, default_limit=5)
