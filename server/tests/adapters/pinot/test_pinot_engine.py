@@ -2091,14 +2091,21 @@ async def test_more_servers_than_the_request_cap_makes_no_fan_out_at_all() -> No
     assert estimate.confidence == "low"
 
 
-async def test_exactly_the_cap_many_servers_is_still_asked() -> None:
-    """64 is the bound, not a step past it: the fan-out runs at the cap."""
+async def test_a_cap_many_servers_is_no_longer_asked_now_retries_are_counted() -> None:
+    """64 servers was the bound while one batch cost one call. A batch can
+    now cost three, so 64 x 3 is over the cap and the fan-out is not made —
+    the quote stays where it was, which is what every cap here does.
+
+    The boundary itself is
+    `test_the_worst_case_exactly_at_the_cap_is_still_asked`, at 21.
+    """
     asks: list[tuple[str, ...]] = []
     size, servers_json = _spread_over(64)
-    await PinotEngine(
+    estimate = await PinotEngine(
         transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
     ).estimate_cost(_U14_SQL)
-    assert len(asks) == 64
+    assert asks == []
+    assert estimate.confidence == "low"
 
 
 async def test_a_per_server_ask_that_404s_leaves_the_quote_where_it_was() -> None:
@@ -2298,3 +2305,130 @@ async def test_a_single_name_too_long_for_one_url_makes_no_call() -> None:
     ).estimate_cost(_U14_SQL)
     assert asks == []
     assert estimate.confidence == "low"
+
+
+# --- U14 round 3: the controller's answer is one server's, so a short one is
+# an independent trial that is simply asked again.
+
+
+def _u14_flaky_routes(
+    short_answers: int, asks: list[tuple[str, ...]]
+) -> Any:
+    """7051's three names, answered `{}` the first `short_answers` times.
+
+    Measured §5: a filtered ask is answered by one server, and when a server
+    holding none of the names answers last the body is `{}` — 1/40 on
+    `u14rep`'s three-name ask, ~20% on a single name. The retry is the same
+    request, so the fake answers by attempt count, not by content.
+    """
+    whole = load("seg-metadata-u14multi-7051.json")
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                if len(asks) <= short_answers:
+                    return httpx.Response(200, json={})
+                return httpx.Response(200, json=whole)
+        return _u14_routes(request)
+
+    return routes
+
+
+async def test_a_short_answer_is_asked_again_for_exactly_the_missing_names() -> None:
+    """The whole round-3 pain: `{}` once, whole on the identical retry.
+
+    One extra request, naming exactly the names still missing, and the quote
+    that was `low` about 1 run in 10 comes back `high`.
+    """
+    asks: list[tuple[str, ...]] = []
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_u14_flaky_routes(1, asks))
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 2
+    assert tuple(sorted(asks[1])) == tuple(sorted(_U14_MISSING_ON_7051))
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None
+
+
+async def test_only_the_names_still_missing_are_asked_again() -> None:
+    """A partial answer is retried for its remainder, never the whole batch."""
+    whole = load("seg-metadata-u14multi-7051.json")
+    first, *rest = sorted(_U14_MISSING_ON_7051)
+    asks: list[tuple[str, ...]] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                if len(asks) == 1:
+                    return httpx.Response(200, json={first: whole[first]})
+                return httpx.Response(
+                    200, json={name: whole[name] for name in segments}
+                )
+        return _u14_routes(request)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(routes)
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 2
+    assert tuple(sorted(asks[1])) == tuple(rest)
+    assert estimate.confidence == "high"
+
+
+async def test_a_batch_short_three_times_stops_the_fan_out_and_stays_low() -> None:
+    """Two retries and no more: what is still short stays `low`, exactly as
+    an unreadable answer does, and no later batch is asked for."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(3)
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables/u14multi/size":
+            return httpx.Response(200, json=size)
+        if path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={})
+        return _u14_routes(request, servers=servers_json)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(routes)
+    ).estimate_cost(_U14_SQL)
+    # Three asks for the first batch, then nothing: the other two servers'
+    # batches are never reached.
+    assert len(asks) == 3
+    assert len({tuple(sorted(ask)) for ask in asks}) == 1
+    assert estimate.confidence == "low"
+
+
+async def test_the_retries_are_counted_against_the_request_cap() -> None:
+    """A fan-out whose worst case is 3 asks per batch is bounded by that
+    worst case, counted before the first call — 22 batches x 3 = 66 > 64."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(22)
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+async def test_the_worst_case_exactly_at_the_cap_is_still_asked() -> None:
+    """21 batches x (1 + 2 retries) = 63 <= 64: the bound, not a step past."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(21)
+    await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 21
+
+
+async def test_the_retry_count_is_what_it_says_it_is() -> None:
+    """Pinned by value beside the caps: two retries takes the worst measured
+    20% empty rate to under 1%, and a stale mutation fails here."""
+    assert engine_module._METADATA_RETRIES == 2

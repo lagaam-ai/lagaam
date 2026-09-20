@@ -14,6 +14,7 @@ from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.engine import (
     _EXPLAIN_PRUNING,
     _EXPLAIN_TIMEOUT_MS,
+    _METADATA_RETRIES,
     _OPT_TIMEOUT_MS,
     PinotEngine,
 )
@@ -1143,12 +1144,7 @@ async def _per_server_pk_bytes(
         wanted = [name for name in names if name in sealed and name not in entries]
         if not wanted:
             continue
-        body = await engine._client.controller_get(
-            f"/segments/{table}/metadata",
-            params={"segments": wanted, "columns": ["pk"]},
-            database="default",
-        )
-        entries.update(body)
+        entries.update(await _ask_until_whole(engine, table, wanted, columns=["pk"]))
     assert set(entries) >= sealed, (set(entries), sealed)
     per_segment = {
         name: (
@@ -1249,13 +1245,39 @@ async def _sealed_segment_docs_per_server(
         wanted = [name for name in names if name in sealed and name not in entries]
         if not wanted:
             continue
+        entries.update(await _ask_until_whole(engine, table, wanted))
+    return [entries[name]["totalDocs"] for name in sealed]
+
+
+async def _ask_until_whole(
+    engine: PinotEngine,
+    table: str,
+    wanted: list[str],
+    columns: list[str] | None = None,
+) -> dict[str, Any]:
+    """One per-server ask, repeated while it comes back short.
+
+    The oracle has to be at least as reliable as the adapter it checks. A
+    filtered ask is answered by one server, so an ask whose names another
+    server answers last comes back `{}` — measured here at 10 of 80 raw asks
+    on `u14rep`. The adapter retries (ADR 0011, Decision §4); an oracle that
+    did not would fail this test for the adapter's one correct behaviour.
+    """
+    entries: dict[str, Any] = {}
+    outstanding = list(wanted)
+    for _ in range(1 + _METADATA_RETRIES):
+        params: dict[str, Any] = {"segments": outstanding}
+        if columns is not None:
+            params["columns"] = columns
         body = await engine._client.controller_get(
-            f"/segments/{table}/metadata",
-            params={"segments": wanted},
-            database="default",
+            f"/segments/{table}/metadata", params=params, database="default"
         )
         entries.update(body)
-    return [entries[name]["totalDocs"] for name in sealed]
+        outstanding = [name for name in outstanding if name not in entries]
+        if not outstanding:
+            break
+    assert not outstanding, f"{table}: {outstanding} short after every retry"
+    return entries
 
 
 async def test_realtime_a_single_server_table_quotes_exactly_as_before(

@@ -108,6 +108,9 @@ _METADATA_FANOUT_SECONDS = 10.0
 # Measured on the live controller: an 8,059-byte URL answers 200, 8,099 400.
 _MAX_METADATA_URL_BYTES = 6144
 _MAX_METADATA_REQUESTS = 64
+# Extra asks per batch for the names a short answer left out. Measured: an
+# empty answer is a random event at up to 20%, so two more takes it under 1%.
+_METADATA_RETRIES = 2
 
 
 def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
@@ -583,6 +586,16 @@ class PinotEngine:
         still decides — this widens what the guard can see, never what it
         accepts.
 
+        The controller's answer to a filtered ask is one server's response,
+        not a union, so a short answer is a random event rather than a
+        verdict: measured, `u14rep`'s three-name ask came back `{}` 1 time in
+        40 and a single-name ask about 1 in 5, and an identical retry is an
+        independent trial. A batch missing any name it asked for is asked
+        again for exactly the names still missing, up to `_METADATA_RETRIES`
+        more times, each retry counted against `_MAX_METADATA_REQUESTS` before
+        the first call. What is still short after that keeps the bulk
+        response — `low` — exactly as an unreadable answer does.
+
         One server's names go in as many URLs as the byte cap needs. Measured
         on the live controller: an 8,059-byte URL answered 200 and 8,099 got
         a 400 with an empty body, and httpx raises `InvalidURL` above 65,536
@@ -609,17 +622,42 @@ class PinotEngine:
                     return seg_json
                 answers: list[Any] = []
                 for names in batches:
-                    body = await self._client.controller_get(
-                        f"/segments/{part}/metadata",
-                        params=self._per_server_params(params, names),
-                        database=database,
-                    )
-                    if body is PinotClient.NotFound or not isinstance(body, dict):
+                    whole = await self._ask_until_whole(database, part, params, names)
+                    if whole is None:
                         return seg_json
-                    answers.append(body)
+                    answers.extend(whole)
         except (PinotTransportError, httpx.InvalidURL, TimeoutError):
             return seg_json
         return merge_segment_metadata(seg_json, answers)
+
+    async def _ask_until_whole(
+        self,
+        database: str,
+        part: str,
+        params: dict[str, str | list[str]] | None,
+        names: tuple[str, ...],
+    ) -> list[Any] | None:
+        """One batch's answers, re-asking for whatever a short one left out.
+
+        None means stop the fan-out and keep the bulk response, which is what
+        an unreadable answer has always meant: a batch still short after its
+        retries is not a verdict this adapter may quote on.
+        """
+        answers: list[Any] = []
+        outstanding = names
+        for _ in range(1 + _METADATA_RETRIES):
+            body = await self._client.controller_get(
+                f"/segments/{part}/metadata",
+                params=self._per_server_params(params, outstanding),
+                database=database,
+            )
+            if body is PinotClient.NotFound or not isinstance(body, dict):
+                return None
+            answers.append(body)
+            outstanding = tuple(name for name in outstanding if name not in body)
+            if not outstanding:
+                return answers
+        return None
 
     @classmethod
     def _metadata_batches(
@@ -633,7 +671,9 @@ class PinotEngine:
         The length is the request line httpx will send — path plus the query
         it encodes — so the cap is measured against what actually goes out
         rather than an estimate of it. None means make no call at all: a name
-        too long to ask for alone, or more asks than `_MAX_METADATA_REQUESTS`.
+        too long to ask for alone, or a worst case over
+        `_MAX_METADATA_REQUESTS`. The worst case counts every batch's retries,
+        because a short answer is asked again up to `_METADATA_RETRIES` times.
         """
         path = f"/segments/{part}/metadata"
         batches: list[tuple[str, ...]] = []
@@ -650,7 +690,9 @@ class PinotEngine:
                 batch.append(name)
             if batch:
                 batches.append(tuple(batch))
-        if not batches or len(batches) > _MAX_METADATA_REQUESTS:
+        if not batches or len(batches) * (1 + _METADATA_RETRIES) > (
+            _MAX_METADATA_REQUESTS
+        ):
             return None
         return batches
 
