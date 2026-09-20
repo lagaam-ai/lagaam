@@ -1,0 +1,134 @@
+# 0011 — Missing segment metadata is fetched from the servers that hold it
+
+**Status:** Accepted
+
+## Context
+
+ADR 0009 made metadata completeness a precondition: the segment names in
+`GET /segments/{t}/metadata` must cover every sealed segment
+`GET /tables/{t}/size` lists, or rows and bytes are both `None`. That
+precondition was right and it is still right — the shipped sum before it was
+a confident sum over a subset, an under-quote at `confidence="high"`, which
+is the one failure mode the gate exists to prevent.
+
+What it also did was deny every real deployment. A cluster is a cluster
+because it has more than one server, and measured on the realtime profile
+(Pinot 1.5.1, four servers):
+
+```
+SELECT pk FROM pinot.default.u14multi LIMIT 5 -> scanned_bytes=None row_estimate=None confidence='low'
+SELECT pk FROM pinot.default.u12plain LIMIT 5 -> scanned_bytes=1582 row_estimate=400 confidence='high'
+```
+
+Same schema, same flush threshold, same query. `u12plain`'s segments sit on
+one server; `u14multi`'s ten sealed segments split 3/7 across two. Under any
+row or byte budget every query on the second table is denied. ADR 0009's own
+consequence called that "denied rather than under-quoted" and left the fetch
+that would lift it to a later unit. This is that unit.
+
+The endpoint is not merely truncating; it is answering for one server, and no
+parameter changes that. Measured: three consecutive bulk calls on `u14multi`
+each returned the same 8 of 10 sealed segments, all from one server.
+`?columns=pk` returned 8. `?segments=` naming all twelve segments returned
+the same 8 — the filter is applied *after* a server is chosen. On `u14rep`
+(replication 2) the bulk call returns 4 of 12. A `?segments=` list whose
+names all live on one server does answer for all of them.
+
+Two alternatives were measured and rejected:
+
+- `GET /segments/{t}/zkmetadata` is one call and complete (12 of 12), and
+  carries `segment.total.docs` and `segment.size.in.bytes` — but no
+  per-column bytes, so a `SELECT pk` would be charged whole segments. That
+  is a large over-charge on a wide table, and the column projection is most
+  of what makes a Pinot quote useful.
+- `GET /segments/{t}_REALTIME/{seg}/metadata?columns=pk` is complete and
+  full-fidelity per segment (docs 100, bytes 7480, pk `indexSizeMap`
+  `{dictionary: 708, forward_index: 808}`), but costs one call per segment
+  and 500s on the untyped table name ("Ideal state does not exist for
+  table").
+
+`GET /segments/{t}/servers` says which server holds which segments — one
+element per table type, `serverToSegmentsMap`, consuming names included — and
+each server, asked for its own names, answers with the bulk endpoint's own
+fidelity. Three trials each on both tables: every per-server ask returned
+exactly its names, and the union covered every sealed name the size report
+listed, every time.
+
+## Decision
+
+When the bulk metadata response does not cover every sealed segment the size
+report names, the adapter fetches the rest from the servers that hold them:
+
+1. `GET /segments/{t}/servers` for the server-to-segments map.
+2. Each missing name is assigned to the **first** server listing it, in the
+   response's own order. Measured on `u14rep`: the two replicas' entries for
+   a segment are identical in `crc`, `totalDocs` and every column index size
+   for all ten sealed segments, so asking a second holder buys nothing and
+   costs a call. A server with nothing assigned is not called at all.
+3. Each assigned server gets `GET /segments/{t}/metadata` with
+   `segments=<its names>` and the bulk call's own `columns=` filter, so the
+   projection is priced the same way it was before.
+4. The answers are merged name-keyed into the bulk response, bulk entries
+   winning, and the merged document goes to `table_facts` unchanged.
+
+The completeness guard is untouched. It runs on the merged document exactly
+as it ran on the bulk one, and it still decides. This widens what the guard
+can see; it never widens what the guard accepts. `metadata_is_complete` is
+now defined as `not missing_sealed_segments(...)` so the guard and the fetch
+cannot disagree about which names are missing.
+
+Every bound leaves the quote exactly where ADR 0009 left it — `low` — rather
+than guessing:
+
+- more than `_MAX_METADATA_SERVERS` (32) servers assigned: no fan-out at all;
+- any per-server call returning `NotFound`, a non-dict, or raising
+  `PinotTransportError`: stop, keep what the bulk call gave;
+- the whole fan-out under `anyio.fail_after(_METADATA_FANOUT_SECONDS)`
+  (10.0s, the EXPLAIN deadline's sibling): on timeout, keep the bulk
+  response.
+
+Calls are sequential. 32 is a bound on the worst case, not a target.
+
+## Consequences
+
+A multi-server table is quoted instead of denied. Measured on the same
+cluster, before and after:
+
+| table | servers | before | after |
+|---|---|---|---|
+| `u14multi` (replication 1) | 2 | `low`, all `None` | `scanned_bytes=4548 row_estimate=300 confidence='high'` |
+| `u14rep` (replication 2) | 4 | `low`, all `None` | `scanned_bytes=6064 row_estimate=400 confidence='high'` |
+| `u12plain` (replica-group pinned) | 1 | `scanned_bytes=1582 row_estimate=400` | unchanged |
+
+A single-server table makes **no new request**. It is complete on the bulk
+call, `missing_sealed_segments` is empty, and `/servers` is never asked —
+which is every existing integration test and the batch quickstart.
+
+A multi-server table costs `1 + S` extra controller GETs per quotation, where
+`S` is the number of servers holding a segment the bulk call missed. On
+`u14multi` that is two calls; on a table whose segments are spread over every
+server in a large cluster it is one per server, sequentially, inside a 10s
+budget. A cluster wide enough to exceed 32 holders quotes `low`, which is
+where it already was.
+
+**The completeness guard is now load-bearing in a second way.** Before, a
+failed guard meant "this table spans servers". Now it means "this table spans
+servers *and* the fan-out could not close the gap" — a server that 404s, a
+name no server claims, a slow cluster. The quote is the same (`low`) either
+way, so nothing downstream changes, but an operator diagnosing a `low` quote
+has one more place to look.
+
+**The realtime profile no longer pins every table to one server.** ADR 0009
+pinned `u12plain` and `u12upsert` with a single replica group specifically to
+dodge this case. They stay pinned, as the control that proves a single-server
+table pays nothing — and `u14multi` and `u14rep` are added unpinned, with two
+partitions, precisely so the multi-server path is exercised live rather than
+only over fixtures.
+
+**Replica agreement is assumed from ten segments on one table.** All ten
+sealed segments on `u14rep` had byte-identical entries on both holders, which
+is what a Pinot segment is — an immutable file with a CRC. If two replicas of
+one segment ever disagreed, the merge would keep whichever server was asked
+first. The guard would not catch that, because both entries carry the same
+name; nothing measured suggests it can happen, and no code defends against
+it.
