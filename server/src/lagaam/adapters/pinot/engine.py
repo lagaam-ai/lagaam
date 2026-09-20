@@ -558,17 +558,21 @@ class PinotEngine:
 
         Measured: `GET /segments/{t}/metadata` answers for one server, and no
         parameter changes that — a `?segments=` filter naming all twelve of
-        `u14multi`'s segments still returned the eight on one server, because
-        the filter is applied after a server is chosen. So a cluster with more
-        than one server fails the completeness guard on every table, and every
-        query on it is denied wholesale (ADR 0009 §4).
+        `u14multi`'s segments still returned the eight on one server. So a
+        cluster with more than one server fails the completeness guard on
+        every table, and every query on it is denied wholesale (ADR 0009 §4).
 
-        `GET /segments/{t}/servers` says where the missing names live, and
-        each holder answers for its own with the bulk endpoint's own fidelity
-        — per-column index sizes included — in as many calls as there are
-        holders. Replicas are byte-identical (measured on `u14rep`: same crc,
-        totalDocs and column index sizes on both), so each name is asked of
-        exactly one server.
+        `GET /segments/{t}/servers` says where the missing names live, and a
+        filter naming one holder's names comes back whole, with the bulk
+        endpoint's own fidelity — per-column index sizes included. Nothing
+        here addresses a server: Pinot 1.5.1's
+        `TableMetadataReader.getSegmentsMetadataInternal` sends our filter to
+        every server hosting the table and aggregates, falling back to one
+        URL per named segment on a RuntimeException. Grouping by holder is
+        what makes that aggregate complete, not where the request goes, and
+        the call count below is client-to-controller only. Replicas are
+        byte-identical (measured on `u14rep`: same crc, totalDocs and column
+        index sizes on both), so each name is asked for once.
 
         Every bound leaves the quote exactly where it is today rather than
         guessing: a fan-out needing more than `_MAX_METADATA_REQUESTS` calls
