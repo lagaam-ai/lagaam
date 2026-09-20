@@ -9,6 +9,7 @@ httpx exceptions and broker messages never escape.
 
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -102,9 +103,11 @@ _EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
 
 # The whole per-server metadata fan-out, bounded like the EXPLAIN beside it:
 # the quotation is advisory and a wedged server must not hold the gate. Calls
-# are sequential, so 32 bounds the worst case rather than naming a target.
+# are sequential, so 64 bounds the worst case rather than naming a target.
 _METADATA_FANOUT_SECONDS = 10.0
-_MAX_METADATA_SERVERS = 32
+# Measured on the live controller: an 8,059-byte URL answers 200, 8,099 400.
+_MAX_METADATA_URL_BYTES = 6144
+_MAX_METADATA_REQUESTS = 64
 
 
 def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
@@ -568,11 +571,18 @@ class PinotEngine:
         exactly one server.
 
         Every bound leaves the quote exactly where it is today rather than
-        guessing: more than `_MAX_METADATA_SERVERS` holders makes no call at
-        all, one unreadable answer stops the fan-out with what the bulk call
-        gave, and the whole thing runs under one deadline. The merged document
-        goes to `table_facts` unchanged, so `metadata_is_complete` still
-        decides — this widens what the guard can see, never what it accepts.
+        guessing: a fan-out needing more than `_MAX_METADATA_REQUESTS` calls
+        makes none at all — counted before the first one — one unreadable
+        answer stops the fan-out with what the bulk call gave, and the whole
+        thing, discovery included, runs under one deadline. The merged
+        document goes to `table_facts` unchanged, so `metadata_is_complete`
+        still decides — this widens what the guard can see, never what it
+        accepts.
+
+        One server's names go in as many URLs as the byte cap needs. Measured
+        on the live controller: an 8,059-byte URL answered 200 and 8,099 got
+        a 400 with an empty body, and httpx raises `InvalidURL` above 65,536
+        bytes per component before the request is ever made.
 
         A single-server table is complete on the bulk call and makes no
         request here at all.
@@ -580,20 +590,21 @@ class PinotEngine:
         missing = missing_sealed_segments(seg_json, size_json)
         if not missing:
             return seg_json
-        servers_json = await self._client.controller_get(
-            f"/segments/{part}/servers", database=database
-        )
-        if servers_json is PinotClient.NotFound:
-            return seg_json
-        assigned = assign_missing_to_servers(
-            missing, segments_by_server(servers_json)
-        )
-        if not assigned or len(assigned) > _MAX_METADATA_SERVERS:
-            return seg_json
-        answers: list[Any] = []
         try:
             with anyio.fail_after(_METADATA_FANOUT_SECONDS):
-                for names in assigned.values():
+                servers_json = await self._client.controller_get(
+                    f"/segments/{part}/servers", database=database
+                )
+                if servers_json is PinotClient.NotFound:
+                    return seg_json
+                assigned = assign_missing_to_servers(
+                    missing, segments_by_server(servers_json)
+                )
+                batches = self._metadata_batches(part, params, assigned)
+                if batches is None:
+                    return seg_json
+                answers: list[Any] = []
+                for names in batches:
                     body = await self._client.controller_get(
                         f"/segments/{part}/metadata",
                         params=self._per_server_params(params, names),
@@ -602,15 +613,56 @@ class PinotEngine:
                     if body is PinotClient.NotFound or not isinstance(body, dict):
                         return seg_json
                     answers.append(body)
-        except (PinotTransportError, TimeoutError):
+        except (PinotTransportError, httpx.InvalidURL, TimeoutError):
             return seg_json
         return merge_segment_metadata(seg_json, answers)
+
+    @classmethod
+    def _metadata_batches(
+        cls,
+        part: str,
+        params: dict[str, str | list[str]] | None,
+        assigned: Mapping[str, tuple[str, ...]],
+    ) -> list[tuple[str, ...]] | None:
+        """Each server's names, split into asks under `_MAX_METADATA_URL_BYTES`.
+
+        The length is the request line httpx will send — path plus the query
+        it encodes — so the cap is measured against what actually goes out
+        rather than an estimate of it. None means make no call at all: a name
+        too long to ask for alone, or more asks than `_MAX_METADATA_REQUESTS`.
+        """
+        path = f"/segments/{part}/metadata"
+        batches: list[tuple[str, ...]] = []
+        for names in assigned.values():
+            batch: list[str] = []
+            for name in names:
+                if batch and cls._request_bytes(path, params, [*batch, name]) > (
+                    _MAX_METADATA_URL_BYTES
+                ):
+                    batches.append(tuple(batch))
+                    batch = []
+                if cls._request_bytes(path, params, [name]) > _MAX_METADATA_URL_BYTES:
+                    return None
+                batch.append(name)
+            if batch:
+                batches.append(tuple(batch))
+        if not batches or len(batches) > _MAX_METADATA_REQUESTS:
+            return None
+        return batches
+
+    @staticmethod
+    def _request_bytes(
+        path: str, params: dict[str, str | list[str]] | None, names: list[str]
+    ) -> int:
+        """Path plus query, encoded by the same httpx that will send it."""
+        url = httpx.URL(path, params=PinotEngine._per_server_params(params, tuple(names)))
+        return len(url.path) + len(url.query)
 
     @staticmethod
     def _per_server_params(
         params: dict[str, str | list[str]] | None, names: tuple[str, ...]
     ) -> dict[str, str | list[str]]:
-        """The bulk call's own filter, narrowed to one server's segment names.
+        """The bulk call's own filter, narrowed to one ask's segment names.
 
         `segments` is a list so httpx repeats the parameter, which is how the
         controller reads more than one name.
