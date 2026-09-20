@@ -7,7 +7,7 @@ that crashes on an unexpected key costs an agent the names it needs, and a
 missing number fails safe at the budget gate anyway.
 """
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -273,6 +273,18 @@ def metadata_is_complete(seg_metadata_json: Any, size_json: Any) -> bool:
     the one failure mode the gate exists to prevent. A segment reporting -1
     bytes is consuming and is expected to carry no useful entry, so it is
     exempt.
+
+    Defined as "nothing missing", so the guard and the fetch that goes and
+    gets the missing names can never disagree about which names those are.
+    """
+    return not missing_sealed_segments(seg_metadata_json, size_json)
+
+
+def missing_sealed_segments(seg_metadata_json: Any, size_json: Any) -> frozenset[str]:
+    """Sealed segments the size report names and the metadata response lacks.
+
+    The addresses of the per-server fetch, and the reason the completeness
+    guard refuses: a response missing these is one server's half of the table.
     """
     named = {
         name
@@ -280,16 +292,81 @@ def metadata_is_complete(seg_metadata_json: Any, size_json: Any) -> bool:
         if size is not None and size >= 0
     }
     if not named:
-        return True
+        return frozenset()
     if not isinstance(seg_metadata_json, dict):
-        return False
+        return frozenset(named)
     present: set[str] = set()
     for key, body in seg_metadata_json.items():
         if isinstance(key, str):
             present.add(key)
         if isinstance(body, dict) and isinstance(body.get("segmentName"), str):
             present.add(body["segmentName"])
-    return named <= present
+    return frozenset(named - present)
+
+
+def segments_by_server(servers_json: Any) -> dict[str, tuple[str, ...]]:
+    """Which server holds which segments, from GET /segments/{t}/servers.
+
+    The document is a list with one element per table type, so a hybrid
+    table names a server twice and the two lists are unioned. Consuming
+    names are in there too; `segment_facts` drops their entries later.
+    Insertion order is the response's, which is the order a missing name is
+    assigned to the first server holding it.
+    """
+    if not isinstance(servers_json, list):
+        return {}
+    by_server: dict[str, list[str]] = {}
+    for element in servers_json:
+        if not isinstance(element, dict):
+            continue
+        mapping = element.get("serverToSegmentsMap")
+        if not isinstance(mapping, dict):
+            continue
+        for server, names in mapping.items():
+            if not isinstance(server, str) or not server or not isinstance(names, list):
+                continue
+            held = by_server.setdefault(server, [])
+            held.extend(name for name in names if isinstance(name, str) and name)
+    return {server: tuple(names) for server, names in by_server.items() if names}
+
+
+def assign_missing_to_servers(
+    missing: frozenset[str], by_server: Mapping[str, tuple[str, ...]]
+) -> dict[str, tuple[str, ...]]:
+    """One server per missing name: the first in response order that holds it.
+
+    Measured §3: on a replicated table the two replicas' entries for a segment
+    are identical in crc, totalDocs and column index sizes, so asking a second
+    holder of the same name buys nothing and costs a call. A name no server
+    holds is simply absent — the completeness guard still catches it.
+    """
+    assigned: dict[str, list[str]] = {}
+    outstanding = set(missing)
+    for server, names in by_server.items():
+        taken = [name for name in names if name in outstanding]
+        if not taken:
+            continue
+        assigned[server] = taken
+        outstanding.difference_update(taken)
+    return {server: tuple(names) for server, names in assigned.items()}
+
+
+def merge_segment_metadata(
+    bulk: Any, per_server: Iterable[Any]
+) -> dict[str, Any]:
+    """Name-keyed union of the bulk response and the per-server answers.
+
+    The bulk entry wins where both answered: it is the response the guard was
+    measured against, and a replica's entry is identical to it anyway. A
+    response that is not a dict contributes nothing rather than raising.
+    """
+    merged: dict[str, Any] = {}
+    for response in per_server:
+        if isinstance(response, dict):
+            merged.update(response)
+    if isinstance(bulk, dict):
+        merged.update(bulk)
+    return merged
 
 
 def _is_consuming(body: dict[str, Any], reported: int | None) -> bool:

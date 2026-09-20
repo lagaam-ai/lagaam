@@ -13,10 +13,14 @@ import pytest
 
 from lagaam.adapters.pinot.metadata import (
     consuming_count,
+    assign_missing_to_servers,
     consuming_segment_names,
+    merge_segment_metadata,
     metadata_is_complete,
+    missing_sealed_segments,
     row_estimate,
     segment_facts,
+    segments_by_server,
     single_segment_unique_columns,
     stored_flush_rows,
     table_facts,
@@ -1171,3 +1175,163 @@ def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
         _size_naming("seg0"),
         schema_json=schema,
     ).unique_keys == frozenset({frozenset({"id"})})
+
+
+# --- U14: the segments the bulk metadata call left out, and where they live.
+
+
+def test_missing_sealed_segments_names_the_three_the_bulk_call_left_out() -> None:
+    """The truncated bulk call is one server's half of a two-server table."""
+    assert missing_sealed_segments(
+        load("seg-metadata-u14multi-truncated.json"), load("size-u14multi.json")
+    ) == frozenset(
+        {
+            "u14multi__0__0__20260920T1839Z",
+            "u14multi__0__1__20260920T1840Z",
+            "u14multi__0__2__20260920T1840Z",
+        }
+    )
+
+
+def test_a_complete_response_is_missing_nothing() -> None:
+    assert (
+        missing_sealed_segments(
+            load("seg-metadata-airlineStats-realtime.json"),
+            load("size-airlineStats-realtime.json"),
+        )
+        == frozenset()
+    )
+
+
+def test_completeness_is_exactly_nothing_missing() -> None:
+    """The guard and the fetch read the same names, so they cannot drift."""
+    bulk = load("seg-metadata-u14multi-truncated.json")
+    size = load("size-u14multi.json")
+    assert metadata_is_complete(bulk, size) is not bool(
+        missing_sealed_segments(bulk, size)
+    )
+
+
+@pytest.mark.parametrize("body", [None, {}, [], "junk"])
+def test_an_unreadable_size_report_names_nothing_missing(body: Any) -> None:
+    assert missing_sealed_segments(body, body) == frozenset()
+
+
+def test_an_unreadable_metadata_response_is_missing_every_sealed_name() -> None:
+    size = load("size-u14multi.json")
+    assert missing_sealed_segments("junk", size) == frozenset(
+        name
+        for name, seg in size["realtimeSegments"]["segments"].items()
+        if seg["reportedSizeInBytes"] >= 0
+    )
+
+
+def test_segments_by_server_parses_the_servers_document() -> None:
+    by_server = segments_by_server(load("servers-u14multi.json"))
+    assert [len(names) for names in by_server.values()] == [4, 8]
+    assert list(by_server) == ["Server_172.18.0.4_7051", "Server_172.18.0.4_7052"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        None,
+        {},
+        "junk",
+        [],
+        [{"tableName": "t"}],
+        [{"serverToSegmentsMap": "junk"}],
+        [{"serverToSegmentsMap": {"s": "notalist"}}],
+        ["junk"],
+    ],
+)
+def test_segments_by_server_reads_garbage_as_no_servers(body: Any) -> None:
+    assert segments_by_server(body) == {}
+
+
+def test_segments_by_server_unions_the_table_types() -> None:
+    """One element per table type, and a hybrid table has two."""
+    assert segments_by_server(
+        [
+            {"serverToSegmentsMap": {"s1": ["a"]}},
+            {"serverToSegmentsMap": {"s1": ["b"], "s2": ["c"]}},
+        ]
+    ) == {"s1": ("a", "b"), "s2": ("c",)}
+
+
+def test_assign_missing_picks_the_first_server_holding_each_name() -> None:
+    """Replicas are byte-identical (measured §3), so the first one is enough."""
+    assert assign_missing_to_servers(
+        frozenset({"a", "b", "c"}),
+        {"s1": ("a", "b"), "s2": ("b", "c"), "s3": ("a",)},
+    ) == {"s1": ("a", "b"), "s2": ("c",)}
+
+
+def test_a_server_holding_nothing_missing_is_absent() -> None:
+    assert assign_missing_to_servers(frozenset({"a"}), {"s1": ("a",), "s2": ("z",)}) == {
+        "s1": ("a",)
+    }
+
+
+def test_a_name_no_server_holds_is_simply_absent() -> None:
+    """The completeness guard still catches it, so nothing is guessed here."""
+    assert assign_missing_to_servers(frozenset({"gone"}), {"s1": ("a",)}) == {}
+
+
+def test_assigning_nothing_missing_calls_nobody() -> None:
+    assert assign_missing_to_servers(frozenset(), {"s1": ("a",)}) == {}
+
+
+def test_the_u14multi_fixtures_assign_the_three_missing_names_to_7051() -> None:
+    assignment = assign_missing_to_servers(
+        missing_sealed_segments(
+            load("seg-metadata-u14multi-truncated.json"), load("size-u14multi.json")
+        ),
+        segments_by_server(load("servers-u14multi.json")),
+    )
+    assert assignment == {
+        "Server_172.18.0.4_7051": (
+            "u14multi__0__0__20260920T1839Z",
+            "u14multi__0__1__20260920T1840Z",
+            "u14multi__0__2__20260920T1840Z",
+        )
+    }
+
+
+def test_merge_keeps_the_bulk_entry_where_both_answered() -> None:
+    bulk = {"a": {"segmentName": "a", "totalDocs": 1}}
+    per_server = [{"a": {"segmentName": "a", "totalDocs": 999}, "b": {"segmentName": "b"}}]
+    assert merge_segment_metadata(bulk, per_server) == {
+        "a": {"segmentName": "a", "totalDocs": 1},
+        "b": {"segmentName": "b"},
+    }
+
+
+@pytest.mark.parametrize("junk", [None, "junk", [], 7])
+def test_merge_ignores_a_response_it_cannot_read(junk: Any) -> None:
+    assert merge_segment_metadata({"a": {}}, [junk]) == {"a": {}}
+    assert merge_segment_metadata(junk, [{"a": {}}]) == {"a": {}}
+
+
+def test_merging_the_per_server_answer_completes_the_truncated_response() -> None:
+    """The whole point: the guard passes and every sealed segment is priced."""
+    size = load("size-u14multi.json")
+    merged = merge_segment_metadata(
+        load("seg-metadata-u14multi-truncated.json"),
+        [load("seg-metadata-u14multi-7051.json")],
+    )
+    assert metadata_is_complete(merged, size)
+    facts = segment_facts(merged, size)
+    assert len(facts) == 10
+    expected_pk = sum(
+        size
+        for body in (
+            load("seg-metadata-u14multi-7051.json")
+            | load("seg-metadata-u14multi-7052.json")
+        ).values()
+        for column in (body.get("columns") or [])
+        if column["columnName"] == "pk"
+        for size in column["indexSizeMap"].values()
+    )
+    assert sum(fact.column_bytes["pk"] for fact in facts) == expected_pk
+    assert sum(fact.docs or 0 for fact in facts) == 1000

@@ -1,0 +1,25 @@
+{
+  "schemaName" : "u14multi",
+  "enableColumnBasedNullHandling" : false,
+  "dimensionFieldSpecs" : [ {
+    "name" : "pk",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "label",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  } ],
+  "metricFieldSpecs" : [ {
+    "name" : "val",
+    "dataType" : "INT",
+    "fieldType" : "METRIC"
+  } ],
+  "dateTimeFieldSpecs" : [ {
+    "name" : "ts",
+    "dataType" : "LONG",
+    "fieldType" : "DATE_TIME",
+    "format" : "1:MILLISECONDS:EPOCH",
+    "granularity" : "1:MILLISECONDS"
+  } ]
+}

@@ -24,8 +24,12 @@ from lagaam.adapters.pinot.client import (
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
+    assign_missing_to_servers,
     consuming_segment_names,
+    merge_segment_metadata,
+    missing_sealed_segments,
     schema_columns,
+    segments_by_server,
     table_facts,
     table_names,
     table_schema,
@@ -95,6 +99,12 @@ _TIMEOUT_GRACE_SECONDS = 5.0
 # Advisory, so a wedged broker must not hold the gate for execute()'s default.
 _EXPLAIN_TIMEOUT_SECONDS = 10.0
 _EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
+
+# The whole per-server metadata fan-out, bounded like the EXPLAIN beside it:
+# the quotation is advisory and a wedged server must not hold the gate. Calls
+# are sequential, so 32 bounds the worst case rather than naming a target.
+_METADATA_FANOUT_SECONDS = 10.0
+_MAX_METADATA_SERVERS = 32
 
 
 def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
@@ -466,6 +476,13 @@ class PinotEngine:
         size_json = await self._client.controller_get(
             f"/tables/{part}/size", database=database
         )
+        seg_json = await self._complete_segment_metadata(
+            database,
+            part,
+            None if seg_json is PinotClient.NotFound else seg_json,
+            None if size_json is PinotClient.NotFound else size_json,
+            params,
+        )
         externalview_json = await self._client.controller_get(
             f"/tables/{part}/externalview", database=database
         )
@@ -500,7 +517,7 @@ class PinotEngine:
         facts = table_facts(
             table,
             config,
-            None if seg_json is PinotClient.NotFound else seg_json,
+            seg_json,
             None if size_json is PinotClient.NotFound else size_json,
             frozenset(resolved),
             externalview_json=externalview,
@@ -525,6 +542,82 @@ class PinotEngine:
                 facts,
             )
         return facts
+
+    async def _complete_segment_metadata(
+        self,
+        database: str,
+        part: str,
+        seg_json: Any,
+        size_json: Any,
+        params: dict[str, str | list[str]] | None,
+    ) -> Any:
+        """The bulk metadata response, plus the segments it left out.
+
+        Measured: `GET /segments/{t}/metadata` answers for one server, and no
+        parameter changes that — a `?segments=` filter naming all twelve of
+        `u14multi`'s segments still returned the eight on one server, because
+        the filter is applied after a server is chosen. So a cluster with more
+        than one server fails the completeness guard on every table, and every
+        query on it is denied wholesale (ADR 0009 §4).
+
+        `GET /segments/{t}/servers` says where the missing names live, and
+        each holder answers for its own with the bulk endpoint's own fidelity
+        — per-column index sizes included — in as many calls as there are
+        holders. Replicas are byte-identical (measured on `u14rep`: same crc,
+        totalDocs and column index sizes on both), so each name is asked of
+        exactly one server.
+
+        Every bound leaves the quote exactly where it is today rather than
+        guessing: more than `_MAX_METADATA_SERVERS` holders makes no call at
+        all, one unreadable answer stops the fan-out with what the bulk call
+        gave, and the whole thing runs under one deadline. The merged document
+        goes to `table_facts` unchanged, so `metadata_is_complete` still
+        decides — this widens what the guard can see, never what it accepts.
+
+        A single-server table is complete on the bulk call and makes no
+        request here at all.
+        """
+        missing = missing_sealed_segments(seg_json, size_json)
+        if not missing:
+            return seg_json
+        servers_json = await self._client.controller_get(
+            f"/segments/{part}/servers", database=database
+        )
+        if servers_json is PinotClient.NotFound:
+            return seg_json
+        assigned = assign_missing_to_servers(
+            missing, segments_by_server(servers_json)
+        )
+        if not assigned or len(assigned) > _MAX_METADATA_SERVERS:
+            return seg_json
+        answers: list[Any] = []
+        try:
+            with anyio.fail_after(_METADATA_FANOUT_SECONDS):
+                for names in assigned.values():
+                    body = await self._client.controller_get(
+                        f"/segments/{part}/metadata",
+                        params=self._per_server_params(params, names),
+                        database=database,
+                    )
+                    if body is PinotClient.NotFound or not isinstance(body, dict):
+                        return seg_json
+                    answers.append(body)
+        except (PinotTransportError, TimeoutError):
+            return seg_json
+        return merge_segment_metadata(seg_json, answers)
+
+    @staticmethod
+    def _per_server_params(
+        params: dict[str, str | list[str]] | None, names: tuple[str, ...]
+    ) -> dict[str, str | list[str]]:
+        """The bulk call's own filter, narrowed to one server's segment names.
+
+        `segments` is a list so httpx repeats the parameter, which is how the
+        controller reads more than one name.
+        """
+        narrowed: dict[str, str | list[str]] = dict(params or {})
+        narrowed["segments"] = list(names)
+        return narrowed
 
     async def _consuming_segments(
         self, database: str, part: str, externalview: Any
