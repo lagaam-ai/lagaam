@@ -100,11 +100,13 @@ _PINOT_REALTIME_BROKER = "http://localhost:8001"
 def pinot_realtime_ready() -> None:
     """Skip (don't fail) when the STREAM instance isn't up and ingesting.
 
-    Three conditions, because two of them can be true of a useless table: a
+    Several conditions, because two of them can be true of a useless table: a
     table answering a positive count may still be entirely consuming, and a
     quote against an all-consuming table exercises the None path rather than
     the charge these tests exist to prove. So a sealed segment is required
-    too, and the upsert table has to answer at all.
+    too, on the multi-server tables as well as airlineStats — their sealed
+    segments are the whole subject of the per-server metadata fetch — and
+    every table these tests quote has to answer at all.
     """
     try:
         httpx.get(
@@ -119,10 +121,12 @@ def pinot_realtime_ready() -> None:
     deadline = time.monotonic() + 300
     while True:
         try:
-            ready = (
-                _pinot_realtime_answers("airlineStats")
-                and _pinot_realtime_answers("u12upsert")
-                and _pinot_has_sealed_segment("airlineStats")
+            ready = all(
+                _pinot_realtime_answers(table)
+                for table in ("airlineStats", "u12upsert", "u14multi", "u14rep")
+            ) and all(
+                _pinot_has_sealed_segment(table)
+                for table in ("airlineStats", "u14multi", "u14rep")
             )
         except httpx.HTTPError:
             ready = False
@@ -130,9 +134,9 @@ def pinot_realtime_ready() -> None:
             return
         if time.monotonic() > deadline:
             pytest.skip(
-                "the STREAM instance never had a sealed airlineStats segment "
-                "and a queryable u12upsert within 300s — run "
-                "examples/pinot-realtime/bootstrap.sh"
+                "the STREAM instance never had sealed airlineStats, u14multi "
+                "and u14rep segments and a queryable u12upsert within 300s — "
+                "run examples/pinot-realtime/bootstrap.sh"
             )
         time.sleep(2)
 

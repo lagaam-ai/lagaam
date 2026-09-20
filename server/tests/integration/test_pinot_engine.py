@@ -4,6 +4,9 @@ Run: docker compose --profile pinot up -d   (from examples/)
 Then: uv run pytest -m integration
 """
 
+import math
+from typing import Any
+
 import pytest
 
 from lagaam.adapters.pinot.client import PinotClient
@@ -1094,3 +1097,177 @@ async def test_the_rerendered_sql_answers_exactly_as_the_raw_sql_does(
             assert rendered_row == pytest.approx(raw_row, rel=1e-9)
     else:
         assert rendered_rows == raw_rows
+
+
+# --- U14: a table whose segments live on more than one server. The bulk
+# metadata call answers for one of them, so on main both tables below quote
+# `low` and every query on them is denied. Every number is read from the
+# cluster at test time.
+
+
+async def _servers_holding(engine: PinotEngine, table: str) -> dict[str, list[str]]:
+    """Which server holds which segments, live."""
+    body = await engine._client.controller_get(
+        f"/segments/{table}/servers", database="default"
+    )
+    return dict(body[0]["serverToSegmentsMap"])
+
+
+async def _sealed_names(engine: PinotEngine, table: str) -> set[str]:
+    """The sealed segment names, from the size report that names them all."""
+    size = await engine._client.controller_get(
+        f"/tables/{table}/size", database="default"
+    )
+    return {
+        name
+        for name, body in size["realtimeSegments"]["segments"].items()
+        if body["reportedSizeInBytes"] >= 0
+    }
+
+
+async def _per_server_pk_bytes(
+    engine: PinotEngine, table: str
+) -> tuple[int, dict[str, tuple[int, int]]]:
+    """The pk index bytes over every sealed segment, asked server by server.
+
+    Returns the total and, per segment, its (pk bytes, docs) — the ratio the
+    consuming projection is taken from.
+
+    Read the way the adapter now reads it — each server for its own names —
+    because the bulk endpoint cannot answer for the whole table at all. A
+    segment is counted once even where two replicas hold it.
+    """
+    sealed = await _sealed_names(engine, table)
+    entries: dict[str, Any] = {}
+    for names in (await _servers_holding(engine, table)).values():
+        wanted = [name for name in names if name in sealed and name not in entries]
+        if not wanted:
+            continue
+        body = await engine._client.controller_get(
+            f"/segments/{table}/metadata",
+            params={"segments": wanted, "columns": ["pk"]},
+            database="default",
+        )
+        entries.update(body)
+    assert set(entries) >= sealed, (set(entries), sealed)
+    per_segment = {
+        name: (
+            sum(
+                size
+                for column in entries[name]["columns"]
+                if column["columnName"] == "pk"
+                for size in column["indexSizeMap"].values()
+            ),
+            entries[name]["totalDocs"],
+        )
+        for name in sealed
+    }
+    return sum(pk for pk, _ in per_segment.values()), per_segment
+
+
+@pytest.mark.parametrize("table", ["u14multi", "u14rep"])
+async def test_realtime_a_multi_server_table_is_quoted_not_denied(
+    pinot_realtime_ready: None, table: str
+) -> None:
+    """The pain, on the live cluster: on main these quote `low` with every
+    number None, so any budget denies every query on them. The segments the
+    bulk metadata call leaves out now come from the servers that hold them."""
+    engine = _realtime_engine()
+    holders = await _servers_holding(engine, table)
+    assert len(holders) > 1, f"{table} is meant to span servers: {holders}"
+
+    sql = f"SELECT pk FROM pinot.default.{table} LIMIT 5"
+    estimate = await engine.estimate_cost(sql)
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None
+    assert estimate.row_estimate is not None
+    # The bound that matters: it covers what the engine really scans for that
+    # same statement. The LIMIT-5 quote is compared against the LIMIT-5
+    # execution — a quote priced for a prune bounds only the query it priced.
+    assert estimate.row_estimate >= await _realtime_scanned(engine, sql)
+
+    # And with a LIMIT large enough to prune nothing, it covers the whole
+    # table — the ten sealed segments across both servers, not one server's.
+    unpruned = f"SELECT pk FROM pinot.default.{table} LIMIT 100000"
+    whole = await engine.estimate_cost(unpruned)
+    assert whole.confidence == "high"
+    assert whole.row_estimate is not None
+    assert whole.row_estimate >= await _realtime_scanned(engine, unpruned)
+    assert whole.row_estimate >= await _realtime_count(engine, table)
+
+
+@pytest.mark.parametrize("table", ["u14multi", "u14rep"])
+async def test_realtime_the_multi_server_bytes_are_every_sealed_segments_pk(
+    pinot_realtime_ready: None, table: str
+) -> None:
+    """The byte quote sums the pk index over every sealed segment the size
+    report names, not just the ones the bulk endpoint answered for — plus the
+    consuming projection, which is the one term a quotation projects."""
+    engine = _realtime_engine()
+    estimate = await engine.estimate_cost(
+        f"SELECT pk FROM pinot.default.{table} LIMIT 100000"
+    )
+    sealed_pk, per_segment = await _per_server_pk_bytes(engine, table)
+    # The consuming projection, as ruling 3.1 defines it: each consuming
+    # segment's own stored threshold times the worst pk bytes-per-doc ratio
+    # any sealed segment on this table shows.
+    worst_ratio = max(
+        pk_bytes / docs for pk_bytes, docs in per_segment.values() if docs
+    )
+    consuming = math.ceil(await _consuming_charge(engine, table) * worst_ratio)
+    assert estimate.scanned_bytes == sealed_pk + consuming
+
+    # On main this sum is unreachable: the bulk call answers for one server,
+    # so facts.complete is False and scanned_bytes is None.
+    facts = await engine._table_facts("default", table, frozenset({"pk"}), {}, {})
+    assert facts.complete
+
+
+@pytest.mark.parametrize("table", ["u14multi", "u14rep"])
+async def test_realtime_the_facts_cover_every_sealed_segment(
+    pinot_realtime_ready: None, table: str
+) -> None:
+    """The completeness guard passes because nothing is missing any more —
+    not because it was weakened. Ten sealed segments, all of them priced."""
+    engine = _realtime_engine()
+    facts = await engine._table_facts("default", table, frozenset({"pk"}), {}, {})
+    sealed = await _sealed_names(engine, table)
+    assert facts.complete
+    assert {fact.name for fact in facts.segments} == sealed
+    assert sum(fact.docs or 0 for fact in facts.segments) == sum(
+        await _sealed_segment_docs_per_server(engine, table)
+    )
+
+
+async def _sealed_segment_docs_per_server(
+    engine: PinotEngine, table: str
+) -> list[int]:
+    """Each sealed segment's docs, asked of the server that holds it."""
+    sealed = await _sealed_names(engine, table)
+    entries: dict[str, Any] = {}
+    for names in (await _servers_holding(engine, table)).values():
+        wanted = [name for name in names if name in sealed and name not in entries]
+        if not wanted:
+            continue
+        body = await engine._client.controller_get(
+            f"/segments/{table}/metadata",
+            params={"segments": wanted},
+            database="default",
+        )
+        entries.update(body)
+    return [entries[name]["totalDocs"] for name in sealed]
+
+
+async def test_realtime_a_single_server_table_quotes_exactly_as_before(
+    pinot_realtime_ready: None,
+) -> None:
+    """u12plain is on one server, so it is complete on the bulk call and the
+    fan-out changes neither its numbers nor the requests it costs."""
+    engine = _realtime_engine()
+    assert len(await _servers_holding(engine, "u12plain")) == 1
+    estimate = await engine.estimate_cost(
+        "SELECT pk FROM pinot.default.u12plain LIMIT 5"
+    )
+    assert estimate.scanned_bytes == 1582
+    assert estimate.row_estimate == 400
+    assert estimate.confidence == "high"
