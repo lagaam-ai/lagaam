@@ -2285,6 +2285,38 @@ async def test_more_batches_than_the_request_cap_makes_no_call_at_all() -> None:
     assert estimate.confidence == "low"
 
 
+def test_a_hundred_thousand_names_are_refused_before_the_loop_can_notice() -> None:
+    # Astra round 2: every name was encoded before the request cap was checked,
+    # 13.7 s of synchronous work no deadline can interrupt. The cap is known
+    # to be exceeded the moment a 22nd batch starts.
+    names = tuple(f"u14multi__{i % 2}__{i}__20260920T1839Z" for i in range(100_000))
+    started = time.perf_counter()
+    assert PinotEngine._metadata_batches("u14multi", {"columns": ["pk"]}, {"s": names}) is None
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "params", [None, {"columns": ["pk", "ts"]}], ids=["no-columns", "columns"]
+)
+def test_the_batch_size_is_the_request_line_httpx_sends(
+    params: dict[str, str | list[str]] | None,
+) -> None:
+    # The incremental count must equal the encoding of the whole ask, with
+    # nothing to escape and with everything to escape.
+    names = ("plain__0__1", "with space", "a&b=c", "ünïcode/þ", "%25already", "x" * 400)
+    part = "u14multi"
+    batches = PinotEngine._metadata_batches(part, params, {"s": names})
+    assert batches is not None
+    assert [name for batch in batches for name in batch] == list(names)
+    for batch in batches:
+        assert PinotEngine._request_bytes(f"/segments/{part}/metadata", params, list(batch)) == (
+            PinotEngine._batch_bytes(f"/segments/{part}/metadata", params, batch)
+        )
+        assert PinotEngine._request_bytes(f"/segments/{part}/metadata", params, list(batch)) <= (
+            engine_module._MAX_METADATA_URL_BYTES
+        )
+
+
 async def test_the_caps_are_what_they_say_they_are() -> None:
     """Pinned by value: a stale mutation of either fails here, loudly.
 

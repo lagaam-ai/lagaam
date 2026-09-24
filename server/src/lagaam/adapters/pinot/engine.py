@@ -674,27 +674,54 @@ class PinotEngine:
         too long to ask for alone, or a worst case over
         `_MAX_METADATA_REQUESTS`. The worst case counts every batch's retries,
         because a short answer is asked again up to `_METADATA_RETRIES` times.
+
+        This runs on the event loop and no deadline can interrupt it, so it
+        stops the moment the cap is known to be exceeded: the batch that
+        would be one too many is never built. Measured before that rule,
+        100,000 names on one holder took 13.7 s to say None.
         """
         path = f"/segments/{part}/metadata"
+        fixed = len(path) + len(cls._query(params or {}))
+        # A name joins its batch with "&", unless it is the whole query.
+        first_sep = 1 if fixed > len(path) else 0
+        most_batches = _MAX_METADATA_REQUESTS // (1 + _METADATA_RETRIES)
         batches: list[tuple[str, ...]] = []
         for names in assigned.values():
             batch: list[str] = []
+            size = fixed
             for name in names:
-                if batch and cls._request_bytes(path, params, [*batch, name]) > (
-                    _MAX_METADATA_URL_BYTES
-                ):
-                    batches.append(tuple(batch))
-                    batch = []
-                if cls._request_bytes(path, params, [name]) > _MAX_METADATA_URL_BYTES:
+                piece = len(cls._query({"segments": name}))
+                if fixed + first_sep + piece > _MAX_METADATA_URL_BYTES:
                     return None
+                joined = size + (1 if batch else first_sep) + piece
+                if batch and joined > _MAX_METADATA_URL_BYTES:
+                    batches.append(tuple(batch))
+                    if len(batches) >= most_batches:
+                        return None
+                    batch = []
+                    joined = fixed + first_sep + piece
                 batch.append(name)
+                size = joined
             if batch:
                 batches.append(tuple(batch))
-        if not batches or len(batches) * (1 + _METADATA_RETRIES) > (
-            _MAX_METADATA_REQUESTS
-        ):
-            return None
-        return batches
+                if len(batches) > most_batches:
+                    return None
+        return batches or None
+
+    @staticmethod
+    def _query(params: Mapping[str, str | list[str]]) -> str:
+        """The query string httpx encodes for these parameters."""
+        return str(httpx.QueryParams(dict(params)))
+
+    @classmethod
+    def _batch_bytes(
+        cls, path: str, params: dict[str, str | list[str]] | None, names: tuple[str, ...]
+    ) -> int:
+        """What `_metadata_batches` counts for one ask; pinned against `_request_bytes`."""
+        fixed = len(path) + len(cls._query(params or {}))
+        first_sep = 1 if fixed > len(path) else 0
+        pieces = [len(cls._query({"segments": name})) for name in names]
+        return fixed + first_sep + sum(pieces) + (len(pieces) - 1)
 
     @staticmethod
     def _request_bytes(
