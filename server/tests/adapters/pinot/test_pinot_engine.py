@@ -1431,6 +1431,29 @@ async def test_the_sealed_k_is_queried_minus_the_consuming_counter() -> None:
     assert estimate.confidence == "high"
 
 
+async def test_a_consuming_segment_the_server_pruned_is_not_subtracted_twice() -> None:
+    """u14multi after its 24 h flush: twelve sealed (two of them short), two
+    empty consuming segments the server prunes. k must be 12, not 10 — the
+    charge covers every sealed segment, then the consuming projection."""
+    explain = {
+        "numDocsScanned": 0,
+        "numSegmentsQueried": 14,
+        "numSegmentsPrunedByServer": 2,
+        "numConsumingSegmentsQueried": 2,
+    }
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if "AS JSON" in sql:
+                return httpx.Response(200, json=load("explain-mse-singletable.json"))
+            return httpx.Response(200, json=explain)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    assert await engine._surviving("airlineStats", 1, trust_limit_prune=True) == 12
+
+
 async def test_incomplete_segment_metadata_quotes_low() -> None:
     """The two-of-four u12upsert capture: a sum over half a table is no quote."""
 

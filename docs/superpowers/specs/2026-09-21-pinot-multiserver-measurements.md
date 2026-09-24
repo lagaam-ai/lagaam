@@ -140,3 +140,46 @@ and then indexed the result, so a short answer failed the test for the
 adapter's correct behaviour. Both now retry on the same bound the adapter
 does. A test oracle that reads the cluster the adapter's way has to read it
 as carefully.
+
+## 7. Round 3 (Astra re-review, 2026-09-25): the batcher's own cost, and a pruned consuming segment
+
+**Batching cost.** `_metadata_batches` re-encoded the whole batch for every
+name and checked the request cap only after the last one. Synchronous, on
+the event loop, uninterruptible by the deadline. Measured with 36-character
+names on one holder: 2,000 names 0.28 s; 100,000 names 13.69 s to say
+None, and Astra's reproducer saw a 50 ms event-loop callback wait 13.76 s.
+After: each name is encoded once, the running size is added to, and the
+batch that would be the 22nd is never built — 100,000 names refuse in
+under 0.05 s, the same reproducer's callback fires at 51 ms. The
+incremental count is pinned equal to `httpx.URL`'s own encoding, with
+nothing to escape and with everything to escape, with and without other
+parameters.
+
+**A pruned consuming segment, found by this PR's integration tests four
+days after they were written.** `u14multi`'s table config flushes on time
+at 24 h, so the two consuming segments sealed short (60 and 40 docs) and
+two new empty ones opened. `EXPLAIN PLAN FOR SELECT pk FROM u14multi LIMIT
+100000` then reports:
+
+```
+numSegmentsQueried 14  numSegmentsPrunedByServer 2  numConsumingSegmentsQueried 2
+```
+
+and the execution: `numSegmentsMatched 12, numDocsScanned 1100`. The two
+pruned segments are the empty consuming ones. The sealed k was
+`surviving − consuming = 12 − 2 = 10`: the two smallest sealed segments
+(the short ones, 100 real docs, 1,532 pk bytes) fell out of the charge,
+and the quote of 1,200 rows / 17,740 bytes covered 1,100 / 19,272 only
+because the consuming projection (200 rows, 3,080 bytes) happened to
+exceed what was dropped. `airlineStats` on the same instance shows the same
+shape: `SELECT Carrier … LIMIT 1000` — 7 queried, 1 pruned ByServer, 1
+consuming, 6 matched, 600 scanned; the old k of 5 quoted 500 + 100 = 600,
+tight only by the consuming charge's grace.
+
+Rule after: only the consuming segments the pruning provably left may come
+off the sealed k — `max(0, consuming − pruned)`, pruned being
+`queried − surviving`. Every pruned segment is assumed consuming first,
+the assumption that charges the most sealed segments. Cost: when pruning
+happens, up to `consuming` extra sealed segments are charged (airlineStats:
+700 quoted against 600 scanned, was 600). u14multi at `LIMIT 100000` now
+quotes 19,272 bytes / 1,300 rows against 1,100 scanned.

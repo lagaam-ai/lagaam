@@ -46,7 +46,7 @@ from lagaam.adapters.pinot.names import (
 from lagaam.adapters.pinot.plan import key_ordinals, max_intermediate_rows
 from lagaam.adapters.pinot.quote import quote, surviving_docs
 from lagaam.adapters.pinot.response import (
-    consuming_segments_queried,
+    consuming_segments_surviving,
     parse_query_result,
     result_failure,
     surviving_segments,
@@ -856,10 +856,10 @@ class PinotEngine:
         sealed = surviving_segments(body, trust_limit_prune=trust_limit_prune)
         if sealed is None:
             return None
-        # numSegmentsQueried includes the consuming segments, so the k that
-        # applies to sealed ones is what is left after subtracting them. The
-        # consuming charge is added by quote.py, outside this k entirely.
-        return max(0, sealed - consuming_segments_queried(body))
+        # numSegmentsQueried includes the consuming segments, and so can the
+        # pruning: only the consuming segments pruning provably left may come
+        # off the sealed k. The consuming charge is quote.py's, outside this k.
+        return max(0, sealed - consuming_segments_surviving(body, sealed))
 
     async def _explain(self, sql: str, options: str) -> Any:
         """One quotation EXPLAIN, bounded end to end rather than per operation.

@@ -21,7 +21,7 @@ from lagaam.adapters.pinot.engine import (
 from lagaam.adapters.pinot.metadata import stored_flush_rows
 from lagaam.adapters.pinot.names import two_part_sql
 from lagaam.adapters.pinot.response import (
-    consuming_segments_queried,
+    consuming_segments_surviving,
     result_failure,
     surviving_segments,
 )
@@ -743,8 +743,11 @@ async def test_realtime_rows_are_the_sealed_sum_plus_the_consuming_charge(
     table's flush threshold.
 
     k is the survivor count the pruning oracle reports, net of the consuming
-    segments it counts among them — those are charged by the threshold, not
-    by their (zero) docs.
+    segments the pruning provably left among them — those are charged by the
+    threshold, not by their (zero) docs. Measured: 7 queried, 1 pruned
+    ByServer, 1 consuming, and the pruned one is the empty consuming segment,
+    so all 6 sealed are charged; subtracting the consuming count again quoted
+    500 + 100 against 600 scanned, tight only by the consuming charge's grace.
     """
     engine = _realtime_engine()
     sql = "SELECT Carrier FROM pinot.default.airlineStats LIMIT 1000"
@@ -759,7 +762,7 @@ async def test_realtime_rows_are_the_sealed_sum_plus_the_consuming_charge(
     )
     surviving = surviving_segments(explain, trust_limit_prune=True)
     assert surviving is not None
-    sealed_k = max(1, surviving - consuming_segments_queried(explain))
+    sealed_k = max(1, surviving - consuming_segments_surviving(explain, surviving))
 
     # The k largest sealed segments, from the controller's own docs counts.
     docs = await _sealed_segment_docs(engine, "airlineStats")
