@@ -1503,9 +1503,11 @@ async def test_the_schema_is_fetched_only_for_an_upsert_table() -> None:
 
 async def test_the_schema_is_fetched_once_for_a_proven_non_upsert_key() -> None:
     """A single-sealed-segment table proves a key via notNull, not upsert
-    config, so schema_json is None through table_facts and _record_keycols
-    would re-fetch /tables/{t}/schema — but _table_facts already fetched it
-    once, for the referenced-columns filter, and must not fetch it twice."""
+    config, so schema_json stays None through _table_facts and the schema
+    reaching catalog_keys is table_schema_json — the one _table_facts already
+    fetched for the referenced-columns filter. _record_keycols would re-fetch
+    /tables/{t}/schema if that document were not reused, so it must not be
+    fetched twice."""
     seg_metadata = load("seg-metadata-baseballStats-columns.json")
     (segment,) = seg_metadata.values()
     for column in segment["columns"]:

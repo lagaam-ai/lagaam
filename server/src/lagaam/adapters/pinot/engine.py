@@ -509,15 +509,15 @@ class PinotEngine:
             externalview_json=externalview,
             consuming_segments_json=consuming_segments_json,
             unique_keys=catalog_keys(
-                config,
-                seg_json,
+                config_json=config,
+                seg_metadata_json=seg_json,
                 # The upsert branch's /schemas/{name} where there was one, else the
                 # /tables/{t}/schema this call already fetched to resolve columns.
                 # Source (b)'s nullability gate reads whichever arrives; without
                 # one it establishes nothing and yields no key.
-                schema_json or table_schema_json,
-                None if size_json is PinotClient.NotFound else size_json,
-                table_metadata_json,
+                schema_json=schema_json or table_schema_json,
+                size_json=None if size_json is PinotClient.NotFound else size_json,
+                table_metadata_json=table_metadata_json,
             ),
         )
         if facts.unique_keys:

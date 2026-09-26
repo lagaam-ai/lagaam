@@ -188,8 +188,8 @@ def test_a_cross_join_has_no_operands_to_resolve() -> None:
 def test_catalog_keys_find_no_key_in_the_realtime_airlinestats_documents() -> None:
     assert (
         catalog_keys(
-            load("tableconfig-airlineStats-realtime.json"),
-            load("seg-metadata-airlineStats-realtime.json"),
+            config_json=load("tableconfig-airlineStats-realtime.json"),
+            seg_metadata_json=load("seg-metadata-airlineStats-realtime.json"),
             schema_json=None,
             size_json=load("size-airlineStats-realtime.json"),
             table_metadata_json=None,
@@ -759,8 +759,8 @@ def test_max_multivalues_one_alone_excludes_the_column_f2() -> None:
 
 def test_catalog_keys_carry_the_upsert_key() -> None:
     assert catalog_keys(
-        load("tableconfig-u12upsert.json"),
-        load("seg-metadata-u12upsert.json"),
+        config_json=load("tableconfig-u12upsert.json"),
+        seg_metadata_json=load("seg-metadata-u12upsert.json"),
         schema_json=load("schema-u12upsert.json"),
         size_json=load("size-u12upsert.json"),
         table_metadata_json=load("metadata-u12upsert.json"),
@@ -800,8 +800,8 @@ def test_an_unread_schema_establishes_no_nullability_f1() -> None:
     config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
     assert (
         catalog_keys(
-            config,
-            _one_segment_capture(not_null=None),
+            config_json=config,
+            seg_metadata_json=_one_segment_capture(not_null=None),
             schema_json=None,
             size_json=_size_naming("seg0"),
             table_metadata_json=None,
@@ -815,8 +815,8 @@ def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
     config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
     schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
     assert catalog_keys(
-        config,
-        _one_segment_capture(not_null=True),
+        config_json=config,
+        seg_metadata_json=_one_segment_capture(not_null=True),
         schema_json=schema,
         size_json=_size_naming("seg0"),
         table_metadata_json=None,
@@ -824,9 +824,11 @@ def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
 
 
 def test_key_columns_carry_the_catalog_spelling_sorted_by_lowercase_name() -> None:
-    keys = frozenset({frozenset({"b"}), frozenset({"a"})})
-    subject = key_columns("default", "T", {"b": "B", "a": "A"}, keys)
-    assert subject == KeyColumns(database="default", table="T", columns=("A", "B"))
+    """Sorted by lowercase name (a, b), not by spelling (A, Z) — the two
+    orders disagree here, so only the lowercase-name order passes."""
+    keys = frozenset({frozenset({"a"}), frozenset({"b"})})
+    subject = key_columns("default", "T", {"a": "Z", "b": "A"}, keys)
+    assert subject == KeyColumns(database="default", table="T", columns=("Z", "A"))
 
 
 def test_a_key_column_the_schema_does_not_name_gets_no_explain() -> None:

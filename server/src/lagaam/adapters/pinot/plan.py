@@ -22,8 +22,8 @@ worth 0.0113% on these tables (954,026,194 against 954,133,829) while being
 exact-safe on the degenerate ones.
 
 The product holds for an equi-join too. The plan alone proves no join key, the
-catalog can, and `keys.py` decides when it has. There are no cardinality
-statistics anywhere in the pricing path, and an equality on a 14-distinct-value
+catalog can, and `keys.py` decides when it has. Pinot's own pricing path has no
+cardinality statistics anywhere in it, and an equality on a 14-distinct-value
 column is a near-product, not a lookup — measured, `airlineStats a JOIN
 airlineStats b ON a.Carrier = b.Carrier` builds 10,719,442 pairs over 9,746
 rows. "Has an equality" is exactly the SQL-shape proxy ADR 0004 rejected.

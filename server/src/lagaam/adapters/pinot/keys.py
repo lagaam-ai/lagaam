@@ -12,9 +12,9 @@ that key column.
 
 Two other parts of the rule live here too. The catalog's proof that a column
 set is unique (`catalog_keys`, `upsert_keys`, `single_segment_unique_columns`)
-reads either an upsert table's primary key — proven only where
-`upsertConfig` is present and no TTL reopens the key to duplicates — or a
-single sealed segment's cardinality against its doc count. And the
+reads either an upsert table's primary key — proven only where the gates on
+`upsert_keys` all hold — or a single sealed segment's cardinality against its
+doc count. And the
 key-ordinal EXPLAIN's own spelling (`key_columns`, `key_ordinal_sql`) is
 built only from bare identifiers; `_is_bare_identifier` is the guard against
 a controller-supplied database, table or column name that could otherwise
@@ -405,6 +405,7 @@ def _operand_indexes(node: dict[str, Any]) -> tuple[int, int] | None:
 
 
 def catalog_keys(
+    *,
     config_json: Any,
     seg_metadata_json: Any,
     schema_json: Any,
