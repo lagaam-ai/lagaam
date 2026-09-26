@@ -126,16 +126,26 @@ def pinot_nulls_ready(pinot_ready: None) -> None:
     is a no-op wherever they were created before; only a missing one is
     created and loaded with its measured rows.
     """
+    created: list[str] = []
     for table, (rows, _) in _PINOT_KEY_TABLES.items():
         response = httpx.get(f"http://localhost:9000/tables/{table}", timeout=10.0)
         if response.status_code == 404:
             _create_key_table(table, rows())
+            created.append(table)
     deadline = time.monotonic() + 60
-    while not all(
-        _pinot_count(table) == count for table, (_, count) in _PINOT_KEY_TABLES.items()
-    ):
+    while True:
+        short = [
+            table
+            for table, (_, count) in _PINOT_KEY_TABLES.items()
+            if _pinot_count(table) != count
+        ]
+        if not short:
+            return
         if time.monotonic() > deadline:
-            pytest.skip("the u15 tables never answered their row counts within 60s")
+            broken = [table for table in short if table in created]
+            if broken:
+                pytest.fail(f"{broken} were created here and never loaded their rows")
+            pytest.skip(f"{short} never answered their row counts within 60s")
         time.sleep(1)
 
 

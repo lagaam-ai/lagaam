@@ -1854,12 +1854,12 @@ async def test_the_honest_spelling_still_learns_ordinals() -> None:
     assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
 
 
-def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
+def _dictionary_key_selfjoin_routes(request: httpx.Request) -> httpx.Response:
     """baseballStats with no upsert config at all: one sealed segment, null
     handling off, and a playerID made dictionary-encoded (the capture's is
-    raw) with cardinality equal to the segment's docs.
-    The key-ordinal EXPLAIN is spelled from /tables/{t}/schema, which
-    _table_facts fetches for the ?columns= filter."""
+    raw) with cardinality equal to the segment's docs. The key-ordinal EXPLAIN
+    is spelled from /tables/{t}/schema, which _table_facts fetches for the
+    ?columns= filter."""
     path = request.url.path
     if path == "/query/sql":
         sql = json.loads(request.content)["sql"]
@@ -1896,13 +1896,15 @@ def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, json={})
 
 
-async def test_a_non_upsert_self_join_is_bounded_on_a_schema_proven_key_f1() -> None:
+async def test_a_non_upsert_self_join_is_bounded_on_a_cardinality_proven_key_f1() -> (
+    None
+):
     """F1: a single-sealed-segment table with no upsertConfig proves its key
-    through source (b), spelled from the /tables/{t}/schema document the
-    columns filter already fetched. playerID is at scan ordinal 17 — the
-    measured capture — which both operands compose down to: min plus the two
-    inputs, not the product."""
-    engine = PinotEngine(transport=httpx.MockTransport(_notnull_selfjoin_routes))
+    through source (b) — a dictionary column whose cardinality is its docs —
+    spelled from the /tables/{t}/schema document the columns filter already
+    fetched. playerID is at scan ordinal 17 — the measured capture — which
+    both operands compose down to: min plus the two inputs, not the product."""
+    engine = PinotEngine(transport=httpx.MockTransport(_dictionary_key_selfjoin_routes))
     estimate = await engine.estimate_cost(
         "SELECT a.playerID FROM pinot.default.baseballStats a "
         "JOIN pinot.default.baseballStats b ON a.playerID = b.playerID LIMIT 10"
@@ -1918,7 +1920,7 @@ async def test_a_schema_the_controller_will_not_serve_charges_the_product_f1() -
     def routes(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/tables/baseballStats/schema":
             return httpx.Response(404, json={"code": 404, "error": "not found"})
-        return _notnull_selfjoin_routes(request)
+        return _dictionary_key_selfjoin_routes(request)
 
     engine = PinotEngine(transport=httpx.MockTransport(routes))
     estimate = await engine.estimate_cost(

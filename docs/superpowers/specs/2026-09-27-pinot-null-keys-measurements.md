@@ -51,6 +51,13 @@ the self-join column, since null handling is off in the table.)
    for 10 rows with null handling off at query time, 9 with it on (a null
    matches nothing).
 
+Which direction each column measured: the only unique column that actually
+holds a null is `s_one_null`, a dictionary STRING column (cardinality 10 with
+one null). For INT columns (`i_two_nulls`, `i_null_and_min`) and the raw
+column `s_nodict` only the collision direction was measured — two nulls, or a
+null beside the default, read cardinality 9; no INT or raw column holding
+exactly one null was built. `id` and `s_nodict_distinct` hold no nulls.
+
 The nullability gate on source (b) (§7 rule 14; `single_segment_unique_columns`)
 therefore protects against a collision that cannot occur. It also misfires in
 both directions today, measured with main 2774925 on these tables

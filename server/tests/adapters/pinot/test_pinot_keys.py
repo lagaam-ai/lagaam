@@ -817,11 +817,8 @@ def test_catalog_keys_carry_the_upsert_key() -> None:
     ) == frozenset({frozenset({"pk"})})
 
 
-def _one_segment_capture(*, not_null: bool | None) -> dict[str, Any]:
+def _one_segment_capture() -> dict[str, Any]:
     """One sealed segment whose `id` has cardinality == totalDocs."""
-    spec: dict[str, Any] = {"name": "id", "singleValueField": True}
-    if not_null is not None:
-        spec["notNull"] = not_null
     return {
         "seg0": {
             "segmentName": "seg0",
@@ -835,7 +832,7 @@ def _one_segment_capture(*, not_null: bool | None) -> dict[str, Any]:
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
                     "hasDictionary": True,
-                    "fieldSpec": spec,
+                    "fieldSpec": {"name": "id", "singleValueField": True},
                 }
             ],
         }
@@ -848,11 +845,42 @@ def test_an_unread_schema_does_not_withhold_a_unique_column_f1() -> None:
     config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
     assert catalog_keys(
         config_json=config,
-        seg_metadata_json=_one_segment_capture(not_null=None),
+        seg_metadata_json=_one_segment_capture(),
         schema_json=None,
         size_json=_size_naming("seg0"),
         table_metadata_json=None,
     ) == frozenset({frozenset({"id"})})
+
+
+def test_one_metadata_entry_under_two_sealed_names_proves_nothing() -> None:
+    """Keyed seg0 and named seg1, the one entry covers both names the size
+    report lists, so only the exactly-one-sealed-name gate refuses it."""
+    body = _one_segment_capture()["seg0"]
+    body["segmentName"] = "seg1"
+    capture = {"seg0": body}
+    size = _size_naming("seg0", "seg1")
+    assert single_segment_unique_columns(capture, size) == frozenset()
+
+
+def test_a_sealed_name_the_metadata_never_mentions_proves_nothing() -> None:
+    """An entry under no string name, sized as the segment named "": only the
+    completeness gate sees that nothing in the metadata names it."""
+    body = _one_segment_capture()["seg0"]
+    del body["segmentName"]
+    capture = {0: body}
+    size = _size_naming("")
+    assert single_segment_unique_columns(capture, size) == frozenset()
+
+
+def test_an_entry_filed_under_the_sealed_name_but_naming_another_proves_nothing() -> (
+    None
+):
+    """Keyed seg0, which the size report names, but describing seg9."""
+    body = _one_segment_capture()["seg0"]
+    body["segmentName"] = "seg9"
+    capture = {"seg0": body}
+    size = _size_naming("seg0")
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_key_columns_carry_the_catalog_spelling_sorted_by_lowercase_name() -> None:

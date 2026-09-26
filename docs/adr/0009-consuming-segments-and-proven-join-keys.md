@@ -293,12 +293,14 @@ in `metadata.py`, `quote.py` and `engine.py`.
 
 Three one-segment Pinot 1.5.1 OFFLINE tables holding the same ten rows —
 table-level null handling on, off, and schema column-based null handling —
-were measured with two nulls, one null, a null beside the literal default,
-STRING and INT. On all three, a dictionary column's `cardinality` counts
-distinct stored values and a null is stored as the default and counted once,
-so any null collision lowers `cardinality` below `totalDocs`; equality
-therefore means every stored value differs, and a join on the column matches
-each row at most once under either query-time null mode. The nullability
+were measured with two nulls, one null, and a null beside the literal default.
+On all three, a dictionary column's `cardinality` counts distinct stored
+values and a null is stored as the default and counted once, so any null
+collision lowers `cardinality` below `totalDocs`. The collision was measured
+on dictionary STRING and INT columns and on one raw STRING column; a lone
+null only on a dictionary STRING column (`s_one_null`, which stays a key).
+Equality therefore means every stored value differs, and a join on the column
+matches each row at most once under either query-time null mode. The nullability
 gate and the schema requirement on source (b) are removed. In their place
 source (b) reads only a column whose metadata says `hasDictionary: true`: a
 raw column's `cardinality` can be an HLL estimate, and on `u15rawskew`
