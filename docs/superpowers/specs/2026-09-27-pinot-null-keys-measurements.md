@@ -66,3 +66,41 @@ On `u15nulls` even `id`, which has no nulls, is refused a key (120 = the
 product 100 + inputs 20). On `u15nullscol` the gate passes although the
 schema enables null handling, because it reads only the table flag. Both are
 outcomes of a gate built on an unmeasured risk.
+
+## A raw column's cardinality can be an estimate
+
+Everything above is exact because every column holds 10 rows. It does not
+carry over to raw (no-dictionary) columns in general. Pinot 1.5.1's
+`NoDictColumnStatisticsCollector` — used for a raw column when
+`tableIndexConfig.optimizeNoDictStatsCollection` is true, or when the cluster
+config `pinot.stats.optimize.no.dict.collection` enables it, which Lagaam
+cannot see — counts exactly only up to 2,048 unique values, then reports
+round(HLL × 1.1) capped at totalNumberOfEntries.
+
+Two more throwaway OFFLINE tables, one segment each, 3,000 rows: column `c`
+raw and `d` dictionary, both holding `u0`..`u2799` then `"hot"` 200 times
+(2,801 distinct).
+
+| table | optimizeNoDictStatsCollection | col | hasDictionary | totalDocs | cardinality | count(DISTINCT) | self-join pairs |
+|---|---|---|---|---|---|---|---|
+| u15rawskew | true | c | False | 3000 | **3000** | 2801 | 42800 |
+| u15rawskew | true | d | True | 3000 | 2801 | 2801 | 42800 |
+| u15rawexact | false | c | False | 3000 | 2801 | 2801 | 42800 |
+| u15rawexact | false | d | True | 3000 | 2801 | 2801 | 42800 |
+
+On `u15rawskew` the raw column's cardinality equals totalDocs although 200
+rows share one value. **Main 2774925 under-quotes this shape**:
+`SELECT a.c FROM pinot.default.u15rawskew a JOIN pinot.default.u15rawskew b
+ON a.c = b.c LIMIT 10` is quoted 9,000 at its widest step against 42,800
+pairs built, because source (b) takes `c` as a key. v0.2.1 differs from
+2774925 only by the move of the rule into `keys.py`, so it carries the same
+under-quote (measured on 2774925, not on the tag itself). The same query on
+`d`, and on both columns of `u15rawexact`, is charged the product, 9,006,000.
+
+So source (b) reads cardinality only where it is an exact count: a column
+whose metadata entry says `hasDictionary: true`, whose dictionary size is the
+number of distinct stored values. A raw column is never evidence, whatever
+the table config says, because the cluster config can switch the estimate on
+out of Lagaam's sight. With that rule `c` on `u15rawskew` is charged
+9,006,000, and `s_nodict_distinct` on the three null tables — raw, and
+exactly counted at 10 rows — loses its key (120 where it was 30).

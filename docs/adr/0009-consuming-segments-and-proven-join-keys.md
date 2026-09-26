@@ -291,13 +291,17 @@ in `metadata.py`, `quote.py` and `engine.py`.
 
 ## Amendment 2026-09-27 — the null caveat is closed
 
-Three one-segment tables holding the same ten rows — table-level null
-handling on, off, and schema column-based null handling — were measured
-with two nulls, one null, a null beside the literal default, dictionary and
-raw columns, STRING and INT. On all three, `cardinality` counts distinct
-stored values and a null is stored as the default and counted once, so any
-null collision lowers `cardinality` below `totalDocs`; equality therefore
-means every stored value differs, and a join on the column matches each row
-at most once under either query-time null mode. The nullability gate and
-the schema requirement on source (b) are removed; every other gate stands.
+Three one-segment Pinot 1.5.1 OFFLINE tables holding the same ten rows —
+table-level null handling on, off, and schema column-based null handling —
+were measured with two nulls, one null, a null beside the literal default,
+STRING and INT. On all three, a dictionary column's `cardinality` counts
+distinct stored values and a null is stored as the default and counted once,
+so any null collision lowers `cardinality` below `totalDocs`; equality
+therefore means every stored value differs, and a join on the column matches
+each row at most once under either query-time null mode. The nullability
+gate and the schema requirement on source (b) are removed. In their place
+source (b) reads only a column whose metadata says `hasDictionary: true`: a
+raw column's `cardinality` can be an HLL estimate, and on `u15rawskew`
+(`optimizeNoDictStatsCollection: true`, 3,000 rows, 2,801 distinct) it read
+3000, which quoted a self-join at 9,000 against 42,800 pairs built.
 Measurements: `docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md`.

@@ -1513,7 +1513,7 @@ async def test_the_schema_is_fetched_once_for_a_proven_non_upsert_key() -> None:
     for column in segment["columns"]:
         if column["columnName"] == "playerID":
             column["cardinality"] = segment["totalDocs"]
-            column["fieldSpec"]["notNull"] = True
+            column["hasDictionary"] = True
 
     def routes(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/segments/baseballStats/metadata":
@@ -1856,7 +1856,8 @@ async def test_the_honest_spelling_still_learns_ordinals() -> None:
 
 def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
     """baseballStats with no upsert config at all: one sealed segment, null
-    handling off, and a playerID whose cardinality equals the segment's docs.
+    handling off, and a playerID made dictionary-encoded (the capture's is
+    raw) with cardinality equal to the segment's docs.
     The key-ordinal EXPLAIN is spelled from /tables/{t}/schema, which
     _table_facts fetches for the ?columns= filter."""
     path = request.url.path
@@ -1888,7 +1889,7 @@ def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
         for column in segment["columns"]:
             if column["columnName"] == "playerID":
                 column["cardinality"] = segment["totalDocs"]
-                column["fieldSpec"]["notNull"] = True
+                column["hasDictionary"] = True
         return httpx.Response(200, json=seg_metadata)
     if path == "/tables/baseballStats":
         return httpx.Response(200, json=load("tableconfig-baseballStats.json"))

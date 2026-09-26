@@ -481,8 +481,8 @@ def single_segment_unique_columns(
 ) -> frozenset[frozenset[str]]:
     """Columns whose cardinality equals their docs, on a one-sealed-segment table.
 
-    cardinality is exactly count(DISTINCT col) — verified against the engine
-    on four columns — and count(DISTINCT col) <= count(col) <= totalDocs, so
+    On a dictionary column cardinality is exactly count(DISTINCT col) —
+    verified against the engine on four columns — and count(DISTINCT col) <= count(col) <= totalDocs, so
     equality forces every doc to be counted and every value to differ. That
     argument is the segment's, and it is the table's only where the two are
     the same rows: one sealed segment and nothing consuming.
@@ -502,14 +502,21 @@ def single_segment_unique_columns(
     rows the one sealed segment does not, so its presence alone voids the
     key regardless of what metadata says.
 
-    A null needs no gate of its own. cardinality counts distinct stored
-    values, and a null is stored as the column's default and counted once,
-    so two nulls, or a null beside a literal default, lower cardinality below
-    totalDocs. Equality therefore means every stored value differs, and a join
-    on the column matches each row at most once under either query-time null
-    mode — measured identically under table-level null handling on and off
-    and schema column-based null handling, for dictionary and raw, STRING and
-    INT columns (docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md).
+    Only a column whose entry says hasDictionary is exactly True is evidence:
+    a dictionary's size is an exact count of distinct stored values, while a
+    raw column's cardinality may be an estimate whatever the table config
+    says. Measured on u15rawskew (optimizeNoDictStatsCollection): a raw
+    column of 3,000 rows and 2,801 distinct values reported cardinality 3000,
+    and its self-join built 42,800 pairs against a 9,000 quote.
+
+    A null needs no gate of its own on a dictionary column. cardinality counts
+    distinct stored values, and a null is stored as the column's default and
+    counted once, so two nulls, or a null beside a literal default, lower
+    cardinality below totalDocs. Equality therefore means every stored value
+    differs, and a join on the column matches each row at most once under
+    either query-time null mode — measured on Pinot 1.5.1 OFFLINE segments
+    under table-level null handling on and off and schema column-based null
+    handling (docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md).
 
     A multi-value column's cardinality counts distinct entries, not rows —
     totalNumberOfEntries and maxNumberOfMultiValues are reported separately —
@@ -557,6 +564,8 @@ def single_segment_unique_columns(
         if not isinstance(name, str) or not name or cardinality != docs:
             continue
         if _is_multi_valued(column, docs):
+            continue
+        if column.get("hasDictionary") is not True:
             continue
         keys.add(frozenset({name.lower()}))
     return frozenset(keys)

@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 
@@ -94,29 +95,51 @@ def _pinot_answers(table: str) -> bool:
 
 
 _PINOT_NULLS = Path(__file__).parent / "fixtures" / "pinot-nulls"
-_PINOT_NULL_TABLES = ("u15nulls", "u15nullsoff", "u15nullscol")
+
+
+def _null_rows() -> bytes:
+    return (_PINOT_NULLS / "rows.json").read_bytes()
+
+
+def _skew_rows() -> bytes:
+    """2,800 unique values, then "hot" 200 times: 3,000 rows, 2,801 distinct."""
+    values = [f"u{i}" for i in range(2800)] + ["hot"] * 200
+    return "\n".join(json.dumps({"c": v, "d": v}) for v in values).encode()
+
+
+# Each table the tests quote, with the rows it holds and their count.
+_PINOT_KEY_TABLES = {
+    "u15nulls": (_null_rows, 10),
+    "u15nullsoff": (_null_rows, 10),
+    "u15nullscol": (_null_rows, 10),
+    "u15rawskew": (_skew_rows, 3000),
+    "u15rawexact": (_skew_rows, 3000),
+}
 
 
 @pytest.fixture
 def pinot_nulls_ready(pinot_ready: None) -> None:
-    """Make the three null-handling tables exist on the batch instance.
+    """Make the null-handling and raw-cardinality tables exist on the batch
+    instance.
 
     A table the controller already serves is left exactly as it is, so this
     is a no-op wherever they were created before; only a missing one is
-    created and loaded with the ten measured rows.
+    created and loaded with its measured rows.
     """
-    for table in _PINOT_NULL_TABLES:
+    for table, (rows, _) in _PINOT_KEY_TABLES.items():
         response = httpx.get(f"http://localhost:9000/tables/{table}", timeout=10.0)
         if response.status_code == 404:
-            _create_null_table(table)
+            _create_key_table(table, rows())
     deadline = time.monotonic() + 60
-    while not all(_pinot_count(table) == 10 for table in _PINOT_NULL_TABLES):
+    while not all(
+        _pinot_count(table) == count for table, (_, count) in _PINOT_KEY_TABLES.items()
+    ):
         if time.monotonic() > deadline:
-            pytest.skip("the u15 null tables never answered 10 rows within 60s")
+            pytest.skip("the u15 tables never answered their row counts within 60s")
         time.sleep(1)
 
 
-def _create_null_table(table: str) -> None:
+def _create_key_table(table: str, rows: bytes) -> None:
     """Schema, table config, then the rows, in the order the controller needs."""
     controller = "http://localhost:9000"
     httpx.post(
@@ -137,7 +160,7 @@ def _create_null_table(table: str) -> None:
             "tableNameWithType": f"{table}_OFFLINE",
             "batchConfigMapStr": '{"inputFormat":"json"}',
         },
-        files={"file": ("rows.json", (_PINOT_NULLS / "rows.json").read_bytes())},
+        files={"file": ("rows.json", rows)},
         timeout=60.0,
     ).raise_for_status()
 

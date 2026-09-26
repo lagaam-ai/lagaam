@@ -390,6 +390,7 @@ def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
                     "totalNumberOfEntries": 3,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -403,6 +404,7 @@ def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
                     "totalNumberOfEntries": 3,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "city",
                         "notNull": True,
@@ -432,6 +434,7 @@ def test_a_nullable_column_whose_cardinality_reaches_its_docs_is_a_key() -> None
                     "totalNumberOfEntries": 3,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": False,
@@ -448,15 +451,15 @@ def test_a_nullable_column_whose_cardinality_reaches_its_docs_is_a_key() -> None
 
 
 _U15_TABLES = ["u15nulls", "u15nullsoff", "u15nullscol"]
-_U15_KEYS = frozenset(
-    {frozenset({"id"}), frozenset({"s_one_null"}), frozenset({"s_nodict_distinct"})}
-)
+_U15_KEYS = frozenset({frozenset({"id"}), frozenset({"s_one_null"})})
 
 
 @pytest.mark.parametrize("table", _U15_TABLES)
 def test_a_unique_column_is_a_key_under_every_null_handling_mode(table: str) -> None:
-    """Measured on all three tables: the unique columns are keys, and no
-    column with two nulls, a null beside the default, or a repeat is."""
+    """Measured on all three tables: the unique dictionary columns are keys,
+    and no column with two nulls, a null beside the default, or a repeat is.
+    s_nodict_distinct is unique too, but raw, so its cardinality proves
+    nothing."""
     seg = load(f"seg-metadata-{table}.json")
     size = load(f"size-{table}.json")
     assert single_segment_unique_columns(seg, size) == _U15_KEYS
@@ -478,6 +481,47 @@ def test_catalog_keys_read_the_same_unique_columns_on_every_null_table(
     )
 
 
+def _raw_capture(**flag: Any) -> dict[str, Any]:
+    """One sealed segment whose `c` has cardinality == totalDocs, plus `flag`."""
+    return {
+        "seg0": {
+            "segmentName": "seg0",
+            "totalDocs": 3,
+            "columns": [
+                {
+                    "columnName": "c",
+                    "cardinality": 3,
+                    "totalDocs": 3,
+                    "totalNumberOfEntries": 3,
+                    "maxNumberOfMultiValues": 0,
+                    "fieldSpec": {"name": "c", "singleValueField": True},
+                    **flag,
+                }
+            ],
+        }
+    }
+
+
+@pytest.mark.parametrize("has_dictionary", [False, None, "true", 1])
+def test_a_column_without_a_dictionary_proves_no_key(has_dictionary: Any) -> None:
+    """Measured on u15rawskew: a raw column reported cardinality 3000 over
+    2,801 distinct values, and its self-join built 42,800 pairs."""
+    capture = _raw_capture(hasDictionary=has_dictionary)
+    assert single_segment_unique_columns(capture, _size_naming("seg0")) == frozenset()
+
+
+def test_a_column_that_does_not_say_it_has_a_dictionary_proves_no_key() -> None:
+    capture = _raw_capture()
+    assert single_segment_unique_columns(capture, _size_naming("seg0")) == frozenset()
+
+
+def test_the_same_column_with_a_dictionary_is_a_key() -> None:
+    capture = _raw_capture(hasDictionary=True)
+    assert single_segment_unique_columns(capture, _size_naming("seg0")) == frozenset(
+        {frozenset({"c"})}
+    )
+
+
 def test_more_than_one_sealed_segment_proves_nothing() -> None:
     """Per-segment cardinality is the table's only where the two are one:
     summing Carrier over 31 segments gave 432 against a true 14."""
@@ -493,6 +537,7 @@ def test_more_than_one_sealed_segment_proves_nothing() -> None:
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -521,6 +566,7 @@ def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -558,6 +604,7 @@ def test_a_size_report_naming_two_sealed_segments_proves_nothing_f1() -> None:
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -587,6 +634,7 @@ def test_a_size_report_naming_one_sealed_segment_matching_metadata_is_evidence_f
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -623,6 +671,7 @@ def test_a_consuming_segment_named_only_by_size_proves_nothing() -> None:
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -658,6 +707,7 @@ def test_an_unreadable_size_report_proves_nothing_f1(size: Any) -> None:
                     "totalNumberOfEntries": 2,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -684,6 +734,7 @@ def test_a_multi_value_column_is_never_a_key_f2() -> None:
                     "totalNumberOfEntries": 4,
                     "maxNumberOfMultiValues": 2,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "tags",
                         "notNull": True,
@@ -711,6 +762,7 @@ def test_the_same_column_single_valued_is_evidence_f2() -> None:
                     "totalNumberOfEntries": 3,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "tags",
                         "notNull": True,
@@ -741,6 +793,7 @@ def test_max_multivalues_one_alone_excludes_the_column_f2() -> None:
                     "totalNumberOfEntries": 5,
                     "maxNumberOfMultiValues": 1,
                     "indexSizeMap": {"forward_index": 8},
+                    "hasDictionary": True,
                     "fieldSpec": {
                         "name": "id",
                         "notNull": True,
@@ -781,6 +834,7 @@ def _one_segment_capture(*, not_null: bool | None) -> dict[str, Any]:
                     "totalNumberOfEntries": 3,
                     "maxNumberOfMultiValues": 0,
                     "indexSizeMap": {"forward_index": 12},
+                    "hasDictionary": True,
                     "fieldSpec": spec,
                 }
             ],
