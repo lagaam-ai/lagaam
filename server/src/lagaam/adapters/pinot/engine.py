@@ -23,7 +23,11 @@ from lagaam.adapters.pinot.client import (
     PinotTransportError,
 )
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
-from lagaam.adapters.pinot.keys import key_ordinals
+from lagaam.adapters.pinot.keys import (
+    catalog_keys,
+    key_ordinals,
+    upsert_config_present,
+)
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
     assign_missing_to_servers,
@@ -35,7 +39,6 @@ from lagaam.adapters.pinot.metadata import (
     table_facts,
     table_names,
     table_schema,
-    upsert_config_present,
 )
 from lagaam.adapters.pinot.names import (
     has_limit,
@@ -529,12 +532,17 @@ class PinotEngine:
             frozenset(resolved),
             externalview_json=externalview,
             consuming_segments_json=consuming_segments_json,
-            # The upsert branch's /schemas/{name} where there was one, else the
-            # /tables/{t}/schema this call already fetched to resolve columns.
-            # Source (b)'s nullability gate reads whichever arrives; without
-            # one it establishes nothing and yields no key.
-            schema_json=schema_json or table_schema_json,
-            table_metadata_json=table_metadata_json,
+            unique_keys=catalog_keys(
+                config,
+                seg_json,
+                # The upsert branch's /schemas/{name} where there was one, else the
+                # /tables/{t}/schema this call already fetched to resolve columns.
+                # Source (b)'s nullability gate reads whichever arrives; without
+                # one it establishes nothing and yields no key.
+                schema_json or table_schema_json,
+                None if size_json is PinotClient.NotFound else size_json,
+                table_metadata_json,
+            ),
         )
         if facts.unique_keys:
             await self._record_keycols(

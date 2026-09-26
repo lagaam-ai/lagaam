@@ -1608,6 +1608,13 @@ async def test_an_upsert_self_join_is_bounded_once_the_ordinals_are_learned() ->
     assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
 
 
+async def test_the_catalogs_key_reaches_the_table_facts() -> None:
+    """table_facts proves nothing itself; the engine hands it the catalog's key."""
+    engine = PinotEngine(transport=httpx.MockTransport(_upsert_selfjoin_routes))
+    facts = await engine._table_facts("default", "airlineStats", None, {}, {})
+    assert facts.unique_keys == frozenset({frozenset({"carrier"})})
+
+
 async def test_a_key_whose_ordinals_never_arrived_is_charged_the_product() -> None:
     """A keycols EXPLAIN that errors leaves the table with no evidence at all."""
 
