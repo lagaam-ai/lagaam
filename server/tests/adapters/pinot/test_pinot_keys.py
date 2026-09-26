@@ -856,6 +856,16 @@ def test_a_name_that_is_not_a_bare_identifier_gets_no_explain(
     assert key_columns(database, spelled, {"a": spelling}, keys) is None
 
 
+def test_an_empty_key_column_spelling_gets_no_explain() -> None:
+    keys = frozenset({frozenset({"a"})})
+    assert key_columns("default", "T", {"a": ""}, keys) is None
+
+
+def test_a_composite_key_with_one_empty_spelling_gets_no_explain() -> None:
+    keys = frozenset({frozenset({"a", "b"})})
+    assert key_columns("default", "T", {"a": "A", "b": ""}, keys) is None
+
+
 def test_a_composite_key_selects_both_its_columns() -> None:
     subject = key_columns(
         "default", "T", {"a": "A", "b": "B"}, frozenset({frozenset({"a", "b"})})

@@ -742,15 +742,11 @@ def key_columns(
     if not resolved or any(name is None for name in resolved):
         # A key column the schema does not name cannot be selected at all.
         return None
-    subject_names = [database, spelled, *(name for name in resolved if name)]
-    if not all(_is_bare_identifier(name) for name in subject_names):
+    columns = [name for name in resolved if name is not None]
+    if not all(_is_bare_identifier(name) for name in [database, spelled, *columns]):
         # Database, table and every key column reach the EXPLAIN raw.
         return None
-    return KeyColumns(
-        database=database,
-        table=spelled,
-        columns=tuple(name for name in resolved if name is not None),
-    )
+    return KeyColumns(database=database, table=spelled, columns=tuple(columns))
 
 
 def key_ordinal_sql(subject: KeyColumns) -> str:
