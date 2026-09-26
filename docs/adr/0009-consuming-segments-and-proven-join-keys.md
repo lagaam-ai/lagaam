@@ -113,11 +113,13 @@ table returned partition 0's two, then partition 1's two, then partition
 0's again. The shipped sum was therefore a confident sum over a subset: an
 under-quote at `confidence="high"`. A table whose segments span servers is
 now denied, and the `pinot-realtime` profile pins each table to one server
-with a single replica group so the demo tables are complete. Fetching each
-*sealed* segment's metadata individually is the path that would lift the
-denial, and it is U13 — the per-segment fetch the consuming charge now makes
-is over consuming segments only, and answers a different question (the
-stored threshold, which the bulk endpoint does not carry at all).
+with a single replica group so the demo tables are complete. ADR 0011 lifts
+the denial: the missing sealed segments are fetched from the servers that
+hold them, per server rather than per segment, and this precondition then
+runs unchanged on the completed document. The per-segment fetch the
+consuming charge makes is over consuming segments only, and answers a
+different question (the stored threshold, which the bulk endpoint does not
+carry at all).
 
 **A join key is charged as a key only where the catalog proves it, and only
 where the scan ordinal agrees.** Two sources of evidence:
@@ -252,8 +254,10 @@ union, plus the consuming charge — and this path is unit-tested only.
 - **A multi-server table is denied rather than under-quoted.** That is the
   completeness precondition doing its job, and it withholds quotes that
   were previously confidently wrong. On the single-server quickstart
-  nothing changes; the per-segment metadata fetch that would restore those
-  tables is U13.
+  nothing changes. **Superseded by ADR 0011**, which restores those tables
+  by fetching the missing sealed segments from the servers that hold them —
+  the precondition itself is unchanged and still decides, on a document
+  that is now complete.
 - **The hybrid path is unit-tested and not live-tested.** `-type HYBRID`
   cannot start in a container on 1.5.1 — it shells out to the `docker` CLI
   to run Kafka — so the arithmetic is proved over synthesised JSON and the
@@ -262,3 +266,17 @@ union, plus the consuming charge — and this path is unit-tested only.
   cannot be obtained at all on 1.5.1: any plan carrying a `PIPELINE_BREAKER`
   exchange fails to serialise with errorCode 450, so `max_intermediate_rows`
   gets nothing to read and returns `None`.
+
+## Amendment 2026-09-25 — a pruned segment is assumed consuming first
+
+The sealed k was `surviving − numConsumingSegmentsQueried`, on the reading
+that a consuming segment is always among the survivors. Measured on
+`u14multi` after its 24 h time flush, it is not: the server prunes an empty
+consuming segment (14 queried, 2 pruned ByServer, 2 consuming) and the
+subtraction then removed two *sealed* segments from the charge — 100 real
+docs, 1,532 bytes — covered only by the consuming projection's grace.
+`airlineStats` shows the same shape (7 queried, 1 pruned, 1 consuming).
+Only the consuming segments the pruning provably left may be subtracted:
+`max(0, consuming − pruned)`. When pruning happens this charges up to
+`consuming` more sealed segments than before, which is the fail-safe side.
+Measurements: `docs/superpowers/specs/2026-09-21-pinot-multiserver-measurements.md` §7.

@@ -181,7 +181,10 @@ is refused rather than sent.
 
 The quotation has three sources, in order of what it can prove:
 1. **Segment metadata** — sizes for OFFLINE segments and for REALTIME
-   segments already flushed to disk.
+   segments already flushed to disk. The bulk endpoint answers for one
+   server, so on a table whose segments span servers the adapter asks each
+   holder for its own and merges them before pricing anything; a quote is
+   only ever built over every sealed segment the table has (ADR 0011).
 2. **A consuming segment's flush threshold** — a REALTIME segment still
    being written reports zero size from the controller; charging that as
    written would price the newest data free, so it is charged at the
@@ -192,9 +195,10 @@ The quotation has three sources, in order of what it can prove:
    column is a primary key, the join is charged its bound rather than the
    product of its inputs (ADR 0009).
 
-Design record: [ADR 0008](adr/0008-pinot-quotation-is-adapter-synthesised.md)
-and [ADR 0009](adr/0009-consuming-segments-and-proven-join-keys.md) for the
-accepted decisions; the fuller design and the measurements behind each
+Design record: [ADR 0008](adr/0008-pinot-quotation-is-adapter-synthesised.md),
+[ADR 0009](adr/0009-consuming-segments-and-proven-join-keys.md) and
+[ADR 0011](adr/0011-missing-segment-metadata-comes-from-its-servers.md) for
+the accepted decisions; the fuller design and the measurements behind each
 number live in
 [`docs/superpowers/specs/2026-09-11-pinot-adapter-design.md`](superpowers/specs/2026-09-11-pinot-adapter-design.md)
 +

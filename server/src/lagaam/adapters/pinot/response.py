@@ -157,6 +157,31 @@ def surviving_segments(
     return max(1, queried - min(pruned, queried))
 
 
+def consuming_segments_surviving(explain_json: Any, surviving: int | None) -> int:
+    """How many consuming segments the pruning could not have removed.
+
+    The only number safe to subtract from the sealed k. numSegmentsQueried
+    counts consuming segments and the pruning counters can count them too:
+    measured on `u14multi` after its 24 h time flush, 14 queried, 2 pruned
+    ByServer, 2 consuming — and the pruned two were the empty consuming ones.
+    Subtracting the consuming count from the 12 survivors again charged 10
+    of 12 sealed segments, and the two it dropped were real rows on disk.
+
+    So every pruned segment is assumed consuming first: what remains,
+    `consuming - pruned`, floored at 0, is what pruning provably left in the
+    survivors. Assuming the other way charges fewer sealed segments, which
+    is the direction a quotation may never take.
+    """
+    consuming = consuming_segments_queried(explain_json)
+    if surviving is None or not isinstance(explain_json, dict):
+        return 0
+    queried = explain_json.get("numSegmentsQueried")
+    if isinstance(queried, bool) or not isinstance(queried, int) or queried <= 0:
+        return 0
+    pruned = max(0, queried - surviving)
+    return max(0, consuming - pruned)
+
+
 def consuming_segments_queried(explain_json: Any) -> int:
     """How many of the queried segments were CONSUMING, from the same EXPLAIN.
 

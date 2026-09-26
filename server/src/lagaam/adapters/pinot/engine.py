@@ -9,6 +9,7 @@ httpx exceptions and broker messages never escape.
 
 import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,8 +25,12 @@ from lagaam.adapters.pinot.client import (
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
+    assign_missing_to_servers,
     consuming_segment_names,
+    merge_segment_metadata,
+    missing_sealed_segments,
     schema_columns,
+    segments_by_server,
     table_facts,
     table_names,
     table_schema,
@@ -41,7 +46,7 @@ from lagaam.adapters.pinot.names import (
 from lagaam.adapters.pinot.plan import key_ordinals, max_intermediate_rows
 from lagaam.adapters.pinot.quote import quote, surviving_docs
 from lagaam.adapters.pinot.response import (
-    consuming_segments_queried,
+    consuming_segments_surviving,
     parse_query_result,
     result_failure,
     surviving_segments,
@@ -95,6 +100,17 @@ _TIMEOUT_GRACE_SECONDS = 5.0
 # Advisory, so a wedged broker must not hold the gate for execute()'s default.
 _EXPLAIN_TIMEOUT_SECONDS = 10.0
 _EXPLAIN_TIMEOUT_MS = int(_EXPLAIN_TIMEOUT_SECONDS * 1000)
+
+# The whole per-server metadata fan-out, bounded like the EXPLAIN beside it:
+# the quotation is advisory and a wedged server must not hold the gate. Calls
+# are sequential, so 64 bounds the worst case rather than naming a target.
+_METADATA_FANOUT_SECONDS = 10.0
+# Measured on the live controller: an 8,059-byte URL answers 200, 8,099 400.
+_MAX_METADATA_URL_BYTES = 6144
+_MAX_METADATA_REQUESTS = 64
+# Extra asks per batch for the names a short answer left out. Measured: an
+# empty answer is a random event at up to 20%, so two more takes it under 1%.
+_METADATA_RETRIES = 2
 
 
 def _spelled(catalog: str, schema: str, table: str, listed: list[str]) -> str:
@@ -466,6 +482,13 @@ class PinotEngine:
         size_json = await self._client.controller_get(
             f"/tables/{part}/size", database=database
         )
+        seg_json = await self._complete_segment_metadata(
+            database,
+            part,
+            None if seg_json is PinotClient.NotFound else seg_json,
+            None if size_json is PinotClient.NotFound else size_json,
+            params,
+        )
         externalview_json = await self._client.controller_get(
             f"/tables/{part}/externalview", database=database
         )
@@ -500,7 +523,7 @@ class PinotEngine:
         facts = table_facts(
             table,
             config,
-            None if seg_json is PinotClient.NotFound else seg_json,
+            seg_json,
             None if size_json is PinotClient.NotFound else size_json,
             frozenset(resolved),
             externalview_json=externalview,
@@ -525,6 +548,201 @@ class PinotEngine:
                 facts,
             )
         return facts
+
+    async def _complete_segment_metadata(
+        self,
+        database: str,
+        part: str,
+        seg_json: Any,
+        size_json: Any,
+        params: dict[str, str | list[str]] | None,
+    ) -> Any:
+        """The bulk metadata response, plus the segments it left out.
+
+        Measured: `GET /segments/{t}/metadata` answers for one server, and no
+        parameter changes that — a `?segments=` filter naming all twelve of
+        `u14multi`'s segments still returned the eight on one server. So a
+        cluster with more than one server fails the completeness guard on
+        every table, and every query on it is denied wholesale (ADR 0009 §4).
+
+        `GET /segments/{t}/servers` says where the missing names live, and a
+        filter naming one holder's names comes back whole, with the bulk
+        endpoint's own fidelity — per-column index sizes included. Nothing
+        here addresses a server: Pinot 1.5.1's
+        `TableMetadataReader.getSegmentsMetadataInternal` sends our filter to
+        every server hosting the table and aggregates, falling back to one
+        URL per named segment on a RuntimeException. Grouping by holder is
+        what makes that aggregate complete, not where the request goes, and
+        the call count below is client-to-controller only. Replicas are
+        byte-identical (measured on `u14rep`: same crc, totalDocs and column
+        index sizes on both), so each name is asked for once.
+
+        Every bound leaves the quote exactly where it is today rather than
+        guessing: a fan-out needing more than `_MAX_METADATA_REQUESTS` calls
+        makes none at all — counted before the first one — one unreadable
+        answer stops the fan-out with what the bulk call gave, and the whole
+        thing, discovery included, runs under one deadline. The merged
+        document goes to `table_facts` unchanged, so `metadata_is_complete`
+        still decides — this widens what the guard can see, never what it
+        accepts.
+
+        The controller's answer to a filtered ask is one server's response,
+        not a union, so a short answer is a random event rather than a
+        verdict: measured, `u14rep`'s three-name ask came back `{}` 1 time in
+        40 and a single-name ask about 1 in 5, and an identical retry is an
+        independent trial. A batch missing any name it asked for is asked
+        again for exactly the names still missing, up to `_METADATA_RETRIES`
+        more times, each retry counted against `_MAX_METADATA_REQUESTS` before
+        the first call. What is still short after that keeps the bulk
+        response — `low` — exactly as an unreadable answer does.
+
+        One server's names go in as many URLs as the byte cap needs. Measured
+        on the live controller: an 8,059-byte URL answered 200 and 8,099 got
+        a 400 with an empty body, and httpx raises `InvalidURL` above 65,536
+        bytes per component before the request is ever made.
+
+        A single-server table is complete on the bulk call and makes no
+        request here at all.
+        """
+        missing = missing_sealed_segments(seg_json, size_json)
+        if not missing:
+            return seg_json
+        try:
+            with anyio.fail_after(_METADATA_FANOUT_SECONDS):
+                servers_json = await self._client.controller_get(
+                    f"/segments/{part}/servers", database=database
+                )
+                if servers_json is PinotClient.NotFound:
+                    return seg_json
+                assigned = assign_missing_to_servers(
+                    missing, segments_by_server(servers_json)
+                )
+                batches = self._metadata_batches(part, params, assigned)
+                if batches is None:
+                    return seg_json
+                answers: list[Any] = []
+                for names in batches:
+                    whole = await self._ask_until_whole(database, part, params, names)
+                    if whole is None:
+                        return seg_json
+                    answers.extend(whole)
+        except (PinotTransportError, httpx.InvalidURL, TimeoutError):
+            return seg_json
+        return merge_segment_metadata(seg_json, answers)
+
+    async def _ask_until_whole(
+        self,
+        database: str,
+        part: str,
+        params: dict[str, str | list[str]] | None,
+        names: tuple[str, ...],
+    ) -> list[Any] | None:
+        """One batch's answers, re-asking for whatever a short one left out.
+
+        None means stop the fan-out and keep the bulk response, which is what
+        an unreadable answer has always meant: a batch still short after its
+        retries is not a verdict this adapter may quote on.
+        """
+        answers: list[Any] = []
+        outstanding = names
+        for _ in range(1 + _METADATA_RETRIES):
+            body = await self._client.controller_get(
+                f"/segments/{part}/metadata",
+                params=self._per_server_params(params, outstanding),
+                database=database,
+            )
+            if body is PinotClient.NotFound or not isinstance(body, dict):
+                return None
+            answers.append(body)
+            outstanding = tuple(name for name in outstanding if name not in body)
+            if not outstanding:
+                return answers
+        return None
+
+    @classmethod
+    def _metadata_batches(
+        cls,
+        part: str,
+        params: dict[str, str | list[str]] | None,
+        assigned: Mapping[str, tuple[str, ...]],
+    ) -> list[tuple[str, ...]] | None:
+        """Each server's names, split into asks under `_MAX_METADATA_URL_BYTES`.
+
+        The length is the request line httpx will send — path plus the query
+        it encodes — so the cap is measured against what actually goes out
+        rather than an estimate of it. None means make no call at all: a name
+        too long to ask for alone, or a worst case over
+        `_MAX_METADATA_REQUESTS`. The worst case counts every batch's retries,
+        because a short answer is asked again up to `_METADATA_RETRIES` times.
+
+        This runs on the event loop and no deadline can interrupt it, so it
+        stops the moment the cap is known to be exceeded: the batch that
+        would be one too many is never built. Measured before that rule,
+        100,000 names on one holder took 13.7 s to say None.
+        """
+        path = f"/segments/{part}/metadata"
+        fixed = len(path) + len(cls._query(params or {}))
+        # A name joins its batch with "&", unless it is the whole query.
+        first_sep = 1 if fixed > len(path) else 0
+        most_batches = _MAX_METADATA_REQUESTS // (1 + _METADATA_RETRIES)
+        batches: list[tuple[str, ...]] = []
+        for names in assigned.values():
+            batch: list[str] = []
+            size = fixed
+            for name in names:
+                piece = len(cls._query({"segments": name}))
+                if fixed + first_sep + piece > _MAX_METADATA_URL_BYTES:
+                    return None
+                joined = size + (1 if batch else first_sep) + piece
+                if batch and joined > _MAX_METADATA_URL_BYTES:
+                    batches.append(tuple(batch))
+                    if len(batches) >= most_batches:
+                        return None
+                    batch = []
+                    joined = fixed + first_sep + piece
+                batch.append(name)
+                size = joined
+            if batch:
+                batches.append(tuple(batch))
+                if len(batches) > most_batches:
+                    return None
+        return batches or None
+
+    @staticmethod
+    def _query(params: Mapping[str, str | list[str]]) -> str:
+        """The query string httpx encodes for these parameters."""
+        return str(httpx.QueryParams(dict(params)))
+
+    @classmethod
+    def _batch_bytes(
+        cls, path: str, params: dict[str, str | list[str]] | None, names: tuple[str, ...]
+    ) -> int:
+        """What `_metadata_batches` counts for one ask; pinned against `_request_bytes`."""
+        fixed = len(path) + len(cls._query(params or {}))
+        first_sep = 1 if fixed > len(path) else 0
+        pieces = [len(cls._query({"segments": name})) for name in names]
+        return fixed + first_sep + sum(pieces) + (len(pieces) - 1)
+
+    @staticmethod
+    def _request_bytes(
+        path: str, params: dict[str, str | list[str]] | None, names: list[str]
+    ) -> int:
+        """Path plus query, encoded by the same httpx that will send it."""
+        url = httpx.URL(path, params=PinotEngine._per_server_params(params, tuple(names)))
+        return len(url.path) + len(url.query)
+
+    @staticmethod
+    def _per_server_params(
+        params: dict[str, str | list[str]] | None, names: tuple[str, ...]
+    ) -> dict[str, str | list[str]]:
+        """The bulk call's own filter, narrowed to one ask's segment names.
+
+        `segments` is a list so httpx repeats the parameter, which is how the
+        controller reads more than one name.
+        """
+        narrowed: dict[str, str | list[str]] = dict(params or {})
+        narrowed["segments"] = list(names)
+        return narrowed
 
     async def _consuming_segments(
         self, database: str, part: str, externalview: Any
@@ -638,10 +856,10 @@ class PinotEngine:
         sealed = surviving_segments(body, trust_limit_prune=trust_limit_prune)
         if sealed is None:
             return None
-        # numSegmentsQueried includes the consuming segments, so the k that
-        # applies to sealed ones is what is left after subtracting them. The
-        # consuming charge is added by quote.py, outside this k entirely.
-        return max(0, sealed - consuming_segments_queried(body))
+        # numSegmentsQueried includes the consuming segments, and so can the
+        # pruning: only the consuming segments pruning provably left may come
+        # off the sealed k. The consuming charge is quote.py's, outside this k.
+        return max(0, sealed - consuming_segments_surviving(body, sealed))
 
     async def _explain(self, sql: str, options: str) -> Any:
         """One quotation EXPLAIN, bounded end to end rather than per operation.

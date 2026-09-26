@@ -1431,6 +1431,29 @@ async def test_the_sealed_k_is_queried_minus_the_consuming_counter() -> None:
     assert estimate.confidence == "high"
 
 
+async def test_a_consuming_segment_the_server_pruned_is_not_subtracted_twice() -> None:
+    """u14multi after its 24 h flush: twelve sealed (two of them short), two
+    empty consuming segments the server prunes. k must be 12, not 10 — the
+    charge covers every sealed segment, then the consuming projection."""
+    explain = {
+        "numDocsScanned": 0,
+        "numSegmentsQueried": 14,
+        "numSegmentsPrunedByServer": 2,
+        "numConsumingSegmentsQueried": 2,
+    }
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/query/sql":
+            sql = json.loads(request.content)["sql"]
+            if "AS JSON" in sql:
+                return httpx.Response(200, json=load("explain-mse-singletable.json"))
+            return httpx.Response(200, json=explain)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    assert await engine._surviving("airlineStats", 1, trust_limit_prune=True) == 12
+
+
 async def test_incomplete_segment_metadata_quotes_low() -> None:
     """The two-of-four u12upsert capture: a sum over half a table is no quote."""
 
@@ -1893,3 +1916,574 @@ async def test_a_schema_the_controller_will_not_serve_charges_the_product_f1() -
         "JOIN pinot.default.baseballStats b ON a.playerID = b.playerID LIMIT 10"
     )
     assert estimate.max_intermediate_rows == 97889 * 97889 + 2 * 97889
+
+
+# --- U14: the bulk metadata call is one server's view, so the segments it
+# left out are fetched from the servers that hold them.
+
+_U14_CONSUMING = (
+    "u14multi__0__3__20260920T1840Z",
+    "u14multi__1__7__20260920T1840Z",
+)
+
+
+def _u14_routes(
+    request: httpx.Request,
+    *,
+    bulk: str = "seg-metadata-u14multi-truncated.json",
+    servers: Any = None,
+    per_server: Any = None,
+) -> httpx.Response:
+    """The two-server u14multi table, from the live captures.
+
+    `servers` overrides the /servers document and `per_server` maps a sorted
+    tuple of requested segment names to the response for that ask.
+    """
+    path = request.url.path
+    if path == "/query/sql":
+        return httpx.Response(200, json=load("explain-v1-realtime-nofilter.json"))
+    if path == "/tables":
+        return httpx.Response(200, json={"tables": ["u14multi"]})
+    if path == "/tables/u14multi/externalview":
+        return httpx.Response(200, json=load("externalview-u14multi.json"))
+    if path == "/tables/u14multi/size":
+        return httpx.Response(200, json=load("size-u14multi.json"))
+    if path == "/tables/u14multi/schema":
+        return httpx.Response(200, json=load("schema-u14multi.json"))
+    if path == "/tables/u14multi":
+        return httpx.Response(200, json=load("tableconfig-u14multi.json"))
+    if path == "/segments/u14multi/servers":
+        return httpx.Response(
+            200, json=load("servers-u14multi.json") if servers is None else servers
+        )
+    if path == "/segments/u14multi/metadata":
+        asked = tuple(sorted(request.url.params.get_list("segments")))
+        if not asked:
+            return httpx.Response(200, json=load(bulk))
+        body = (per_server or {}).get(asked)
+        if body is None:
+            return httpx.Response(404, json={"code": 404, "error": "not found"})
+        return httpx.Response(200, json=body)
+    if any(path.endswith(f"/{name}/metadata") for name in _U14_CONSUMING):
+        return httpx.Response(
+            200, json=load("segment-zk-airlineStats-consuming.json")
+        )
+    return httpx.Response(404, json={})
+
+
+_U14_MISSING_ON_7051 = (
+    "u14multi__0__0__20260920T1839Z",
+    "u14multi__0__1__20260920T1840Z",
+    "u14multi__0__2__20260920T1840Z",
+)
+
+
+def _u14_engine(**kwargs: Any) -> PinotEngine:
+    def routes(request: httpx.Request) -> httpx.Response:
+        return _u14_routes(request, **kwargs)
+
+    return PinotEngine(transport=httpx.MockTransport(routes))
+
+
+_U14_SQL = "SELECT pk FROM pinot.default.u14multi LIMIT 10"
+
+
+async def test_a_complete_bulk_response_asks_no_server_where_the_segments_are() -> None:
+    """A one-server table is complete on the bulk call and pays nothing new."""
+    seen: list[str] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return _realtime_routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(routes))
+    estimate = await engine.estimate_cost(
+        "SELECT Carrier, DaysSinceEpoch FROM pinot.default.airlineStats LIMIT 10"
+    )
+    assert estimate.confidence == "high"
+    assert not any(path.endswith("/servers") for path in seen)
+
+
+async def test_the_segments_the_bulk_call_left_out_are_fetched_per_server() -> None:
+    """The whole pain: a two-server table quotes low on main. One /servers
+    call and one per-server ask restore the sum the guard refused."""
+    asks: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    bulk_columns: list[tuple[str, ...]] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            columns = tuple(request.url.params.get_list("columns"))
+            if segments:
+                asks.append((segments, columns))
+            else:
+                bulk_columns.append(columns)
+        return _u14_routes(
+            request,
+            per_server={
+                tuple(sorted(_U14_MISSING_ON_7051)): load(
+                    "seg-metadata-u14multi-7051.json"
+                )
+            },
+        )
+
+    servers_seen: list[str] = []
+
+    def counting(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/servers"):
+            servers_seen.append(request.url.path)
+        return routes(request)
+
+    engine = PinotEngine(transport=httpx.MockTransport(counting))
+    estimate = await engine.estimate_cost(_U14_SQL)
+    assert servers_seen == ["/segments/u14multi/servers"]
+    assert asks == [(_U14_MISSING_ON_7051, ("pk",))]
+    assert bulk_columns == [("pk",)]
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None
+
+
+async def test_a_server_holding_nothing_missing_is_never_asked() -> None:
+    """7052's eight names are all in the bulk response already."""
+    asks: list[tuple[str, ...]] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+        return _u14_routes(
+            request,
+            per_server={
+                tuple(sorted(_U14_MISSING_ON_7051)): load(
+                    "seg-metadata-u14multi-7051.json"
+                )
+            },
+        )
+
+    await PinotEngine(transport=httpx.MockTransport(routes)).estimate_cost(_U14_SQL)
+    assert len(asks) == 1
+    assert not any(name.startswith("u14multi__1__") for ask in asks for name in ask)
+
+
+def _spread_over(servers: int) -> tuple[Any, Any]:
+    """A size report of `servers` sealed segments, one per server, none known.
+
+    The bulk metadata response is empty, so every name is missing and every
+    server holds exactly one of them.
+    """
+    names = [f"u14multi__0__{index}__20260920T1839Z" for index in range(servers)]
+    size = {
+        "realtimeSegments": {
+            "segments": {name: {"reportedSizeInBytes": 7380} for name in names}
+        }
+    }
+    servers_json = [
+        {"serverToSegmentsMap": {f"Server_{index}": [name] for index, name in enumerate(names)}}
+    ]
+    return size, servers_json
+
+
+def _spread_routes(
+    size: Any, servers_json: Any, asks: list[tuple[str, ...]]
+) -> Any:
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables/u14multi/size":
+            return httpx.Response(200, json=size)
+        if path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                return httpx.Response(200, json={name: {"segmentName": name} for name in segments})
+            return httpx.Response(200, json={})
+        return _u14_routes(request, servers=servers_json)
+
+    return routes
+
+
+async def test_more_servers_than_the_request_cap_makes_no_fan_out_at_all() -> None:
+    """65 servers each holding one missing name: the quote stays where main
+    leaves it rather than costing 65 sequential controller calls."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(65)
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+async def test_a_cap_many_servers_is_no_longer_asked_now_retries_are_counted() -> None:
+    """64 servers was the bound while one batch cost one call. A batch can
+    now cost three, so 64 x 3 is over the cap and the fan-out is not made —
+    the quote stays where it was, which is what every cap here does.
+
+    The boundary itself is
+    `test_the_worst_case_exactly_at_the_cap_is_still_asked`, at 21.
+    """
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(64)
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+async def test_a_per_server_ask_that_404s_leaves_the_quote_where_it_was() -> None:
+    """No per_server entry, so every ask answers 404."""
+    estimate = await _u14_engine().estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+
+
+async def test_a_per_server_ask_that_cannot_be_reached_does_not_raise() -> None:
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata" and request.url.params.get(
+            "segments"
+        ):
+            raise httpx.ConnectError("server unreachable")
+        return _u14_routes(request)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(routes)
+    ).estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+
+
+async def test_a_per_server_ask_answering_junk_leaves_the_quote_where_it_was() -> None:
+    estimate = await _u14_engine(
+        per_server={tuple(sorted(_U14_MISSING_ON_7051)): ["not", "a", "dict"]}
+    ).estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+
+
+@pytest.mark.parametrize("unreadable", [None, [], "unreadable", 123])
+async def test_a_per_server_answer_naming_a_segment_it_cannot_price_stays_low(
+    unreadable: Any,
+) -> None:
+    """The answer carries the key but no body the pricing pass can read.
+
+    Counting the key as present would make the three missing segments free:
+    10 sealed / 17,692 bytes / 1,200 rows becomes 7 / 13,144 / 900 at
+    confidence="high" — a confident under-quote.
+    """
+    estimate = await _u14_engine(
+        per_server={
+            tuple(sorted(_U14_MISSING_ON_7051)): {
+                name: unreadable for name in _U14_MISSING_ON_7051
+            }
+        }
+    ).estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+    assert estimate.scanned_bytes is None
+    assert estimate.row_estimate is None
+
+
+async def test_a_fan_out_that_outlasts_its_deadline_keeps_the_bulk_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The quotation is advisory: a wedged server must not hold the gate."""
+    monkeypatch.setattr(engine_module, "_METADATA_FANOUT_SECONDS", 0.05)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata" and request.url.params.get(
+            "segments"
+        ):
+            await anyio.sleep(5)
+        return _u14_routes(
+            request,
+            per_server={
+                tuple(sorted(_U14_MISSING_ON_7051)): load(
+                    "seg-metadata-u14multi-7051.json"
+                )
+            },
+        )
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(slow)
+    ).estimate_cost(_U14_SQL)
+    assert estimate.confidence == "low"
+
+
+async def test_a_slow_servers_call_is_inside_the_same_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Discovery is part of the fan-out, so it spends the fan-out's budget.
+
+    Awaited before the deadline it delays every query on the table by
+    whatever the controller takes, up to httpx's 30-second default.
+    """
+    monkeypatch.setattr(engine_module, "_METADATA_FANOUT_SECONDS", 0.05)
+
+    async def slow(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/servers"):
+            await anyio.sleep(5)
+        return _u14_routes(
+            request,
+            per_server={
+                tuple(sorted(_U14_MISSING_ON_7051)): load(
+                    "seg-metadata-u14multi-7051.json"
+                )
+            },
+        )
+
+    started = time.monotonic()
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(slow)
+    ).estimate_cost(_U14_SQL)
+    assert time.monotonic() - started < 1.0
+    assert estimate.confidence == "low"
+
+
+def _long_names(count: int) -> list[str]:
+    """Realistic 36-char segment names, the live spelling's shape."""
+    return [f"u14multi__0__{index:06d}__20260920T1839Z" for index in range(count)]
+
+
+def _one_server_routes(
+    names: list[str], asks: list[tuple[str, ...]]
+) -> Any:
+    """Every name missing and every one of them held by a single server."""
+    size = {
+        "realtimeSegments": {
+            "segments": {name: {"reportedSizeInBytes": 7380} for name in names}
+        }
+    }
+    servers_json = [{"serverToSegmentsMap": {"Server_one": names}}]
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables/u14multi/size":
+            return httpx.Response(200, json=size)
+        if path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                return httpx.Response(
+                    200,
+                    json={
+                        name: {"segmentName": name, "totalDocs": 100}
+                        for name in segments
+                    },
+                )
+            return httpx.Response(200, json={})
+        return _u14_routes(request, servers=servers_json)
+
+    return routes
+
+
+async def test_one_servers_names_are_split_into_urls_under_the_byte_cap() -> None:
+    """2,000 names on one server: httpx refuses a query over 65,536 bytes
+    before any request, and the live controller 400s at 8,099 (200 at
+    8,059). Batched, every ask is a request the controller answers."""
+    names = _long_names(2000)
+    asks: list[tuple[str, ...]] = []
+    seen: list[int] = []
+
+    def measuring(request: httpx.Request) -> httpx.Response:
+        if request.url.params.get_list("segments"):
+            seen.append(len(request.url.path) + len(request.url.query))
+        return _one_server_routes(names, asks)(request)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(measuring)
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) > 1
+    assert len(asks) <= engine_module._MAX_METADATA_REQUESTS
+    assert max(seen) <= engine_module._MAX_METADATA_URL_BYTES
+    assert sorted(name for ask in asks for name in ask) == sorted(names)
+    assert estimate.confidence == "high"
+
+
+async def test_more_batches_than_the_request_cap_makes_no_call_at_all() -> None:
+    """Counted before the first call, so an oversized table costs nothing."""
+    asks: list[tuple[str, ...]] = []
+    names = _long_names(20000)
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_one_server_routes(names, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+def test_a_hundred_thousand_names_are_refused_before_the_loop_can_notice() -> None:
+    # Astra round 2: every name was encoded before the request cap was checked,
+    # 13.7 s of synchronous work no deadline can interrupt. The cap is known
+    # to be exceeded the moment a 22nd batch starts.
+    names = tuple(f"u14multi__{i % 2}__{i}__20260920T1839Z" for i in range(100_000))
+    started = time.perf_counter()
+    assert PinotEngine._metadata_batches("u14multi", {"columns": ["pk"]}, {"s": names}) is None
+    assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    "params", [None, {"columns": ["pk", "ts"]}], ids=["no-columns", "columns"]
+)
+def test_the_batch_size_is_the_request_line_httpx_sends(
+    params: dict[str, str | list[str]] | None,
+) -> None:
+    # The incremental count must equal the encoding of the whole ask, with
+    # nothing to escape and with everything to escape.
+    names = ("plain__0__1", "with space", "a&b=c", "ünïcode/þ", "%25already", "x" * 400)
+    part = "u14multi"
+    batches = PinotEngine._metadata_batches(part, params, {"s": names})
+    assert batches is not None
+    assert [name for batch in batches for name in batch] == list(names)
+    for batch in batches:
+        assert PinotEngine._request_bytes(f"/segments/{part}/metadata", params, list(batch)) == (
+            PinotEngine._batch_bytes(f"/segments/{part}/metadata", params, batch)
+        )
+        assert PinotEngine._request_bytes(f"/segments/{part}/metadata", params, list(batch)) <= (
+            engine_module._MAX_METADATA_URL_BYTES
+        )
+
+
+async def test_the_caps_are_what_they_say_they_are() -> None:
+    """Pinned by value: a stale mutation of either fails here, loudly.
+
+    6,144 bytes is the margin under the measured 8,059-byte URL the live
+    controller answers; 64 requests bounds the whole fan-out, servers and
+    batches together.
+    """
+    assert engine_module._MAX_METADATA_URL_BYTES == 6144
+    assert engine_module._MAX_METADATA_REQUESTS == 64
+
+
+async def test_a_single_name_too_long_for_one_url_makes_no_call() -> None:
+    """Nothing to split: the quote stays where the bulk call left it."""
+    asks: list[tuple[str, ...]] = []
+    names = ["x" * (engine_module._MAX_METADATA_URL_BYTES + 1)]
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_one_server_routes(names, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+# --- U14 round 3: the controller's answer is one server's, so a short one is
+# an independent trial that is simply asked again.
+
+
+def _u14_flaky_routes(
+    short_answers: int, asks: list[tuple[str, ...]]
+) -> Any:
+    """7051's three names, answered `{}` the first `short_answers` times.
+
+    Measured §5: a filtered ask is answered by one server, and when a server
+    holding none of the names answers last the body is `{}` — 1/40 on
+    `u14rep`'s three-name ask, ~20% on a single name. The retry is the same
+    request, so the fake answers by attempt count, not by content.
+    """
+    whole = load("seg-metadata-u14multi-7051.json")
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                if len(asks) <= short_answers:
+                    return httpx.Response(200, json={})
+                return httpx.Response(200, json=whole)
+        return _u14_routes(request)
+
+    return routes
+
+
+async def test_a_short_answer_is_asked_again_for_exactly_the_missing_names() -> None:
+    """The whole round-3 pain: `{}` once, whole on the identical retry.
+
+    One extra request, naming exactly the names still missing, and the quote
+    that was `low` about 1 run in 10 comes back `high`.
+    """
+    asks: list[tuple[str, ...]] = []
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_u14_flaky_routes(1, asks))
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 2
+    assert tuple(sorted(asks[1])) == tuple(sorted(_U14_MISSING_ON_7051))
+    assert estimate.confidence == "high"
+    assert estimate.scanned_bytes is not None
+
+
+async def test_only_the_names_still_missing_are_asked_again() -> None:
+    """A partial answer is retried for its remainder, never the whole batch."""
+    whole = load("seg-metadata-u14multi-7051.json")
+    first, *rest = sorted(_U14_MISSING_ON_7051)
+    asks: list[tuple[str, ...]] = []
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                if len(asks) == 1:
+                    return httpx.Response(200, json={first: whole[first]})
+                return httpx.Response(
+                    200, json={name: whole[name] for name in segments}
+                )
+        return _u14_routes(request)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(routes)
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 2
+    assert tuple(sorted(asks[1])) == tuple(rest)
+    assert estimate.confidence == "high"
+
+
+async def test_a_batch_short_three_times_stops_the_fan_out_and_stays_low() -> None:
+    """Two retries and no more: what is still short stays `low`, exactly as
+    an unreadable answer does, and no later batch is asked for."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(3)
+
+    def routes(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/tables/u14multi/size":
+            return httpx.Response(200, json=size)
+        if path == "/segments/u14multi/metadata":
+            segments = tuple(request.url.params.get_list("segments"))
+            if segments:
+                asks.append(segments)
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={})
+        return _u14_routes(request, servers=servers_json)
+
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(routes)
+    ).estimate_cost(_U14_SQL)
+    # Three asks for the first batch, then nothing: the other two servers'
+    # batches are never reached.
+    assert len(asks) == 3
+    assert len({tuple(sorted(ask)) for ask in asks}) == 1
+    assert estimate.confidence == "low"
+
+
+async def test_the_retries_are_counted_against_the_request_cap() -> None:
+    """A fan-out whose worst case is 3 asks per batch is bounded by that
+    worst case, counted before the first call — 22 batches x 3 = 66 > 64."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(22)
+    estimate = await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert asks == []
+    assert estimate.confidence == "low"
+
+
+async def test_the_worst_case_exactly_at_the_cap_is_still_asked() -> None:
+    """21 batches x (1 + 2 retries) = 63 <= 64: the bound, not a step past."""
+    asks: list[tuple[str, ...]] = []
+    size, servers_json = _spread_over(21)
+    await PinotEngine(
+        transport=httpx.MockTransport(_spread_routes(size, servers_json, asks))
+    ).estimate_cost(_U14_SQL)
+    assert len(asks) == 21
+
+
+async def test_the_retry_count_is_what_it_says_it_is() -> None:
+    """Pinned by value beside the caps: two retries takes the worst measured
+    20% empty rate to under 1%, and a stale mutation fails here."""
+    assert engine_module._METADATA_RETRIES == 2

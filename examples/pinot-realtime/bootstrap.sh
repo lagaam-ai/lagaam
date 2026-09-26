@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap the pinot-realtime profile: two topics, three tables, sample rows.
+# Bootstrap the pinot-realtime profile: four topics, five tables, sample rows.
 #
 #   docker compose --profile pinot-realtime up -d
 #   examples/pinot-realtime/bootstrap.sh
@@ -7,10 +7,11 @@
 # Idempotent: a topic or table that already exists is left alone, so a re-run
 # after a partial failure finishes the job rather than doubling the data.
 #
-# The topics are this profile's own (u12-flights, u12-upsert), never the STREAM
-# quickstart's: its flights-realtime is auto-created with 10 partitions and its
-# own tables consume from it, so a table pointed there gets neither the single
-# partition these tests assume nor a row count this script controls.
+# The topics are this profile's own (u12-flights, u12-upsert, u14-multi,
+# u14-rep), never the STREAM quickstart's: its flights-realtime is auto-created
+# with 10 partitions and its own tables consume from it, so a table pointed
+# there gets neither the partition count these tests assume nor a row count
+# this script controls.
 set -euo pipefail
 
 CONTROLLER="${PINOT_REALTIME_CONTROLLER:-http://localhost:9001}"
@@ -21,14 +22,18 @@ KAFKA_HOST="${LAGAAM_KAFKA_HOST:-kafka}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROWS="${U12_AIRLINE_ROWS:-600}"
 UPSERT_ROWS=600
+# 1,100 rows at a flush threshold of 100 seal 10 segments and leave one
+# consuming per partition — see the feed below for why they land unevenly.
+MULTI_ROWS=1100
 
 # A failed run must not leave the feeds — or a response body — behind on the
 # host. POST_BODY is set while post_json holds a temp file and cleared after
 # it removes one, so the trap never names a path that has been reused.
 FEED=""
 UP_FEED=""
+U14_FEED=""
 POST_BODY=""
-trap 'rm -f "${FEED-}" "${UP_FEED-}" "${POST_BODY-}"' EXIT
+trap 'rm -f "${FEED-}" "${UP_FEED-}" "${U14_FEED-}" "${POST_BODY-}"' EXIT
 
 wait_for_controller() {
   for _ in $(seq 1 60); do
@@ -162,18 +167,26 @@ wait_for_controller
 wait_for_realtime_server
 create_topic u12-flights 1
 # One partition, not two. An upsert table needs its stream partitioned by the
-# primary key, and one partition satisfies that trivially — but it also keeps
-# both u12 tables' segments on a single server. Measured on the 2-partition
-# version: the quickstart runs four servers, the sealed segments split across
-# two of them, and GET /segments/{table}/metadata returns only one server's
-# half while /tables/{table}/size names both. The completeness guard then
-# (correctly) denies every quote, and the upsert-key join bound the U12 tests
-# exist to prove becomes unobservable on the live cluster.
+# primary key, and one partition satisfies that trivially — and it keeps both
+# u12 tables on a single server, which is what makes them the control: they
+# are complete on the bulk metadata call and prove the fan-out costs a
+# single-server table nothing. The multi-server case is u14multi/u14rep below.
 create_topic u12-upsert 1
+
+# Two partitions and no replica-group pin, which is the point: the quickstart
+# runs four servers, so these two tables' sealed segments land on more than
+# one of them. GET /segments/{table}/metadata then answers for a single server
+# while /tables/{table}/size names them all, and the adapter has to go and
+# fetch the rest from the servers that hold them (ADR 0011). u14rep repeats it
+# at replication 2, where every segment sits on exactly two servers.
+create_topic u14-multi 2
+create_topic u14-rep 2
 
 post_table airlineStats airlineStats-schema.json airlineStats-table.json
 post_table u12upsert    u12upsert-schema.json    u12upsert-table.json
 post_table u12plain     u12plain-schema.json     u12plain-table.json
+post_table u14multi     u14multi-schema.json     u14multi-table.json
+post_table u14rep       u14rep-schema.json       u14rep-table.json
 
 # The flight feed: the image's own sample data, capped so the table seals a
 # predictable number of 100-row segments and still leaves one consuming.
@@ -220,5 +233,61 @@ PY
        < /tmp/u12up_feed.txt"
   echo "produced ${UPSERT_ROWS} rows (100 keys x 6 versions) to u12-upsert"
 fi
+
+# The multi-server feed, produced to both u14 topics so the two tables hold
+# byte-identical data and differ only in replication. 1,100 distinct pks, so
+# neither table has a key to prove: these tables exist to be *sized* across
+# servers, not to carry key evidence.
+#
+# The two-then-ten key shape is what makes the split uneven, and it is
+# reproducible rather than lucky: Kafka's default partitioner is murmur2 of
+# the key, k0 and k1 both hash to partition 1, and x0..x9 split 5/5. So the
+# first 500 rows land together and the last 600 spread, giving 360 rows on
+# partition 0 and 740 on partition 1 — confirmed against both the running
+# topic's offsets and murmur2 computed independently. At 100 rows a segment
+# that is 3 sealed on one server and 7 on the other, one consuming each.
+u14_feed() {
+  U14_FEED="$(mktemp -t u14_feed.XXXXXX)"
+  python3 - "${MULTI_ROWS}" > "${U14_FEED}" <<'PY'
+import json, sys, time
+total = int(sys.argv[1])
+now = int(time.time() * 1000)
+for index in range(total):
+    # Two keys for the first 500 rows, ten for the rest.
+    key = f"k{index % 2}" if index < 500 else f"x{index % 10}"
+    width = 3 if index < 500 else 4
+    row = {
+        "pk": f"key{index:0{width}d}",
+        "label": f"v{index % 6}",
+        "val": index,
+        "ts": now + index,
+    }
+    print(f"{key}\t{json.dumps(row)}")
+PY
+  chmod 644 "${U14_FEED}"
+  docker cp "${U14_FEED}" "${KAFKA}:/tmp/u14_feed.txt"
+  rm -f "${U14_FEED}"
+  U14_FEED=""
+}
+
+produce_u14() {
+  local topic="$1"
+  docker exec "${KAFKA}" bash -lc \
+    "/opt/kafka/bin/kafka-console-producer.sh --bootstrap-server ${KAFKA_HOST}:9092 \
+       --topic ${topic} --property parse.key=true --property key.separator=\$'\t' \
+       < /tmp/u14_feed.txt"
+  echo "produced ${MULTI_ROWS} rows to ${topic}"
+}
+
+# Built at most once, and only where a topic actually needs it.
+for topic in u14-multi u14-rep; do
+  if feed_needed "${topic}" "${MULTI_ROWS}"; then
+    if [ -z "${U14_FEED_BUILT-}" ]; then
+      u14_feed
+      U14_FEED_BUILT=1
+    fi
+    produce_u14 "${topic}"
+  fi
+done
 
 echo "bootstrapped — controller ${CONTROLLER}, broker http://localhost:8001"

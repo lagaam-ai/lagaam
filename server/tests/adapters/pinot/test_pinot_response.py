@@ -16,6 +16,7 @@ from lagaam.adapters.pinot.response import (
     ENGINE_FAULT,
     INCOMPLETE_RESULT,
     consuming_segments_queried,
+    consuming_segments_surviving,
     parse_query_result,
     result_failure,
     surviving_segments,
@@ -316,3 +317,38 @@ def test_an_offline_explain_reports_no_consuming_segments() -> None:
 def test_an_unreadable_consuming_counter_is_zero(body: Any) -> None:
     """Zero leaves the sealed k larger, which charges more segments."""
     assert consuming_segments_queried(body) == 0
+
+
+def test_a_pruned_segment_is_assumed_consuming_before_sealed() -> None:
+    # Measured on u14multi after a time flush: 14 queried, 2 pruned ByServer,
+    # 2 consuming — the pruned two WERE the empty consuming ones. Subtracting
+    # the consuming count from the 12 survivors again dropped two real sealed
+    # segments from the charge. The consuming segments the pruning could not
+    # have removed is the only number safe to subtract.
+    body = {
+        "numDocsScanned": 0,
+        "numSegmentsQueried": 14,
+        "numSegmentsPrunedByServer": 2,
+        "numConsumingSegmentsQueried": 2,
+    }
+    assert surviving_segments(body) == 12
+    assert consuming_segments_surviving(body, 12) == 0
+
+
+def test_an_unpruned_consuming_segment_is_still_subtracted() -> None:
+    body = {"numDocsScanned": 0, "numSegmentsQueried": 12, "numConsumingSegmentsQueried": 2}
+    assert consuming_segments_surviving(body, 12) == 2
+
+
+def test_the_measured_realtime_fixtures_keep_their_consuming_survivors() -> None:
+    # 26 queried, 25 pruned ByServer, 1 consuming: the consuming one may be
+    # among the pruned. Future-time: 1 queried, nothing pruned, 1 consuming.
+    nofilter = load("explain-v1-realtime-nofilter.json")
+    assert consuming_segments_surviving(nofilter, surviving_segments(nofilter)) == 0
+    future = load("explain-v1-realtime-futuretime.json")
+    assert consuming_segments_surviving(future, surviving_segments(future)) == 1
+
+
+def test_consuming_survivors_read_nothing_as_zero() -> None:
+    assert consuming_segments_surviving("garbage", 3) == 0
+    assert consuming_segments_surviving({"numConsumingSegmentsQueried": 2}, None) == 0
