@@ -28,10 +28,6 @@ measured, `airlineStats a JOIN airlineStats b ON a.Carrier = b.Carrier` builds
 10,719,442 pairs over 9,746 rows. "Has an equality" is exactly the SQL-shape
 proxy ADR 0004 rejected.
 
-rels[] is a flat topological list, not a tree. A node's children are its
-"inputs" ids; a node with no inputs key at all consumes the node immediately
-before it, which is how Calcite serialises a linear chain.
-
 A catalog key is the one thing that lowers a join below the product, and it
 is proven by scan ordinal rather than by name. A scan carries no column names
 at all; the names on a LogicalProject are whatever the SQL called them, and
@@ -42,13 +38,17 @@ compose down its side's chain to that same ordinal before it may be called
 that key column.
 """
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
-# A plan this deep is a machine's, not an analyst's.
-_MAX_DEPTH = 400
+from lagaam.adapters.pinot.rels import (
+    MAX_DEPTH,
+    children,
+    index_rels,
+    parse_rels,
+    suffix,
+)
 
 # The only node types a side may carry between the join and its one scan.
 # Anything else — a join, a union, an aggregate, a correlate, a second scan —
@@ -115,21 +115,13 @@ def max_intermediate_rows(
     call any column anything. A table with keys but no ordinals here yields
     no evidence.
     """
-    rels = _rels(plan_json)
+    rels = parse_rels(plan_json)
     if rels is None:
         return None
-    by_id: dict[str, dict[str, Any]] = {}
-    order: list[str] = []
-    previous: dict[str, str | None] = {}
-    last: str | None = None
-    for rel in rels:
-        rel_id = rel.get("id")
-        if not isinstance(rel_id, str) or rel_id in by_id:
-            return None
-        by_id[rel_id] = rel
-        previous[rel_id] = last
-        order.append(rel_id)
-        last = rel_id
+    indexed = index_rels(rels)
+    if indexed is None:
+        return None
+    by_id, previous, order = indexed
     evidence = _Evidence(unique_keys or {}, key_ordinals or {})
     widest: list[int] = []
     memo: dict[str, int | None] = {}
@@ -152,26 +144,20 @@ def key_ordinals(plan_json: str) -> dict[str, int] | None:
     None for any other shape: an expression, a missing or mismatched exprs
     list, no project, or anything but exactly one scan below it.
     """
-    rels = _rels(plan_json)
+    rels = parse_rels(plan_json)
     if rels is None:
         return None
-    by_id: dict[str, dict[str, Any]] = {}
-    previous: dict[str, str | None] = {}
-    last: str | None = None
-    for rel in rels:
-        rel_id = rel.get("id")
-        if not isinstance(rel_id, str) or rel_id in by_id:
-            return None
-        by_id[rel_id] = rel
-        previous[rel_id] = last
-        last = rel_id
-    if last is None:
+    indexed = index_rels(rels)
+    if indexed is None:
         return None
-    side = side_fields(last, by_id, previous)
+    by_id, previous, order = indexed
+    if not order:
+        return None
+    side = side_fields(order[-1], by_id, previous)
     if side is None or side.table is None or not side.chain:
         return None
     top = by_id.get(side.chain[0], {})
-    if _suffix(top) != _PROJECT:
+    if suffix(top) != _PROJECT:
         return None
     reads = _project_reads(top)
     names = top.get("fields")
@@ -185,21 +171,6 @@ def key_ordinals(plan_json: str) -> dict[str, int] | None:
     return ordinals or None
 
 
-def _rels(plan_json: str) -> list[dict[str, Any]] | None:
-    try:
-        body = json.loads(plan_json)
-    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
-        return None
-    if not isinstance(body, dict):
-        return None
-    rels = body.get("rels")
-    if not isinstance(rels, list) or not rels:
-        return None
-    if not all(isinstance(rel, dict) for rel in rels):
-        return None
-    return [rel for rel in rels if isinstance(rel, dict)]
-
-
 def _rows(
     rel_id: str,
     by_id: dict[str, dict[str, Any]],
@@ -211,7 +182,7 @@ def _rows(
     depth: int,
 ) -> int | None:
     """This node's rows, recording every knowable count into ``widest``."""
-    if depth > _MAX_DEPTH:
+    if depth > MAX_DEPTH:
         return None
     if rel_id in memo:
         return memo[rel_id]
@@ -220,11 +191,11 @@ def _rows(
     rel = by_id.get(rel_id)
     if rel is None:
         return None
-    children = _children(rel_id, rel, previous)
-    if children is None:
+    child_ids = children(rel_id, rel, previous)
+    if child_ids is None:
         return None
     child_rows: list[int] = []
-    for child in children:
+    for child in child_ids:
         rows = _rows(
             child, by_id, previous, leaf_docs, evidence, memo, widest, depth + 1
         )
@@ -241,29 +212,13 @@ def _rows(
         # side's equalities, in which case that side matches at most once.
         # The inputs are added on top of every branch because an outer join
         # also emits the rows that matched nothing.
-        answer = _join_rows(rel_id, by_id, previous, evidence, children, child_rows)
+        answer = _join_rows(rel_id, by_id, previous, evidence, child_ids, child_rows)
     else:
         answer = max(child_rows)
     memo[rel_id] = answer
     if answer is not None:
         widest.append(answer)
     return answer
-
-
-def _children(
-    rel_id: str, rel: dict[str, Any], previous: dict[str, str | None]
-) -> list[str] | None:
-    """This node's input ids, or [] for a leaf, or None if unreadable."""
-    inputs = rel.get("inputs")
-    if inputs is None:
-        # No inputs key: Calcite's shorthand for "the node just before me".
-        before = previous.get(rel_id)
-        return [] if before is None else [before]
-    if not isinstance(inputs, list):
-        return None
-    if not all(isinstance(value, str) for value in inputs):
-        return None
-    return [value for value in inputs if isinstance(value, str)]
 
 
 def _leaf_rows(
@@ -457,7 +412,7 @@ def _ordinal_at(
         rel = by_id.get(rel_id)
         if rel is None:
             return None
-        if _suffix(rel) != _PROJECT:
+        if suffix(rel) != _PROJECT:
             continue
         reads = _project_reads(rel)
         if reads is None or not 0 <= index < len(reads):
@@ -510,22 +465,22 @@ def side_fields(
     width: int | None = None
     chain: list[str] = []
     current: str | None = rel_id
-    for _ in range(_MAX_DEPTH):
+    for _ in range(MAX_DEPTH):
         if current is None:
             break
         rel = by_id.get(current)
         if rel is None:
             break
-        suffix = _suffix(rel)
-        if suffix == _SCAN:
+        node_suffix = suffix(rel)
+        if node_suffix == _SCAN:
             if width is None:
                 return None
             table = _scan_table(rel)
             reachable: tuple[str, ...] = tuple(chain) if table is not None else ()
             return SideFields(width, reachable, table)
-        if suffix not in _PASS_THROUGH:
+        if node_suffix not in _PASS_THROUGH:
             break
-        if suffix == _PROJECT and width is None:
+        if node_suffix == _PROJECT and width is None:
             names = rel.get("fields")
             if not isinstance(names, list) or not all(
                 isinstance(name, str) for name in names
@@ -534,10 +489,10 @@ def side_fields(
             width = len(names)
         if width is not None:
             chain.append(current)
-        children = _children(current, rel, previous)
-        if children is None or len(children) != 1:
+        node_children = children(current, rel, previous)
+        if node_children is None or len(node_children) != 1:
             break
-        current = children[0]
+        current = node_children[0]
     return None if width is None else SideFields(width, (), None)
 
 
@@ -605,11 +560,3 @@ def _operand_indexes(node: dict[str, Any]) -> tuple[int, int] | None:
             return None
         indexes.append(index)
     return (indexes[0], indexes[1])
-
-
-def _suffix(rel: dict[str, Any]) -> str:
-    """The bare class name of a node's relOp, lowercase."""
-    rel_op = rel.get("relOp")
-    if not isinstance(rel_op, str):
-        return ""
-    return rel_op.rsplit(".", 1)[-1].lower()
