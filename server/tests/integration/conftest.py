@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -90,6 +91,77 @@ def _pinot_answers(table: str) -> bool:
     if isinstance(count, bool) or not isinstance(count, int):
         return False
     return count > 0
+
+
+_PINOT_NULLS = Path(__file__).parent / "fixtures" / "pinot-nulls"
+_PINOT_NULL_TABLES = ("u15nulls", "u15nullsoff", "u15nullscol")
+
+
+@pytest.fixture
+def pinot_nulls_ready(pinot_ready: None) -> None:
+    """Make the three null-handling tables exist on the batch instance.
+
+    A table the controller already serves is left exactly as it is, so this
+    is a no-op wherever they were created before; only a missing one is
+    created and loaded with the ten measured rows.
+    """
+    for table in _PINOT_NULL_TABLES:
+        response = httpx.get(f"http://localhost:9000/tables/{table}", timeout=10.0)
+        if response.status_code == 404:
+            _create_null_table(table)
+    deadline = time.monotonic() + 60
+    while not all(_pinot_count(table) == 10 for table in _PINOT_NULL_TABLES):
+        if time.monotonic() > deadline:
+            pytest.skip("the u15 null tables never answered 10 rows within 60s")
+        time.sleep(1)
+
+
+def _create_null_table(table: str) -> None:
+    """Schema, table config, then the rows, in the order the controller needs."""
+    controller = "http://localhost:9000"
+    httpx.post(
+        f"{controller}/schemas",
+        content=(_PINOT_NULLS / f"{table}-schema.json").read_bytes(),
+        headers={"Content-Type": "application/json"},
+        timeout=30.0,
+    ).raise_for_status()
+    httpx.post(
+        f"{controller}/tables",
+        content=(_PINOT_NULLS / f"{table}-table.json").read_bytes(),
+        headers={"Content-Type": "application/json"},
+        timeout=30.0,
+    ).raise_for_status()
+    httpx.post(
+        f"{controller}/ingestFromFile",
+        params={
+            "tableNameWithType": f"{table}_OFFLINE",
+            "batchConfigMapStr": '{"inputFormat":"json"}',
+        },
+        files={"file": ("rows.json", (_PINOT_NULLS / "rows.json").read_bytes())},
+        timeout=60.0,
+    ).raise_for_status()
+
+
+def _pinot_count(table: str) -> int | None:
+    """count(*) on the batch broker, or None while the table cannot answer."""
+    try:
+        response = httpx.post(
+            "http://localhost:8000/query/sql",
+            json={
+                "sql": f"SELECT count(*) FROM {table}",
+                "queryOptions": "useMultistageEngine=true",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    body = response.json()
+    rows = (body.get("resultTable") or {}).get("rows") or []
+    if body.get("exceptions") or not rows or not rows[0]:
+        return None
+    count = rows[0][0]
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
 _PINOT_REALTIME_CONTROLLER = "http://localhost:9001"

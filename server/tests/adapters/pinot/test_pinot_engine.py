@@ -1502,7 +1502,7 @@ async def test_the_schema_is_fetched_only_for_an_upsert_table() -> None:
 
 
 async def test_the_schema_is_fetched_once_for_a_proven_non_upsert_key() -> None:
-    """A single-sealed-segment table proves a key via notNull, not upsert
+    """A single-sealed-segment table proves a key by cardinality, not upsert
     config, so schema_json stays None through _table_facts and the schema
     reaching catalog_keys is table_schema_json — the one _table_facts already
     fetched for the referenced-columns filter. _record_keycols would re-fetch
@@ -1856,9 +1856,9 @@ async def test_the_honest_spelling_still_learns_ordinals() -> None:
 
 def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
     """baseballStats with no upsert config at all: one sealed segment, null
-    handling off, and a playerID the schema route says cannot be null. The
-    only document that can establish that nullability is /tables/{t}/schema,
-    which _table_facts fetches for the ?columns= filter."""
+    handling off, and a playerID whose cardinality equals the segment's docs.
+    The key-ordinal EXPLAIN is spelled from /tables/{t}/schema, which
+    _table_facts fetches for the ?columns= filter."""
     path = request.url.path
     if path == "/query/sql":
         sql = json.loads(request.content)["sql"]
@@ -1897,10 +1897,10 @@ def _notnull_selfjoin_routes(request: httpx.Request) -> httpx.Response:
 
 async def test_a_non_upsert_self_join_is_bounded_on_a_schema_proven_key_f1() -> None:
     """F1: a single-sealed-segment table with no upsertConfig proves its key
-    through source (b), whose nullability gate reads the /tables/{t}/schema
-    document the columns filter already fetched. playerID is at scan ordinal
-    17 — the measured capture — which both operands compose down to: min plus
-    the two inputs, not the product."""
+    through source (b), spelled from the /tables/{t}/schema document the
+    columns filter already fetched. playerID is at scan ordinal 17 — the
+    measured capture — which both operands compose down to: min plus the two
+    inputs, not the product."""
     engine = PinotEngine(transport=httpx.MockTransport(_notnull_selfjoin_routes))
     estimate = await engine.estimate_cost(
         "SELECT a.playerID FROM pinot.default.baseballStats a "
@@ -1910,9 +1910,9 @@ async def test_a_non_upsert_self_join_is_bounded_on_a_schema_proven_key_f1() -> 
 
 
 async def test_a_schema_the_controller_will_not_serve_charges_the_product_f1() -> None:
-    """F1: the same table with /tables/{t}/schema answering 404. Nothing
-    establishes nullability, so source (b) yields no key and the self-join is
-    charged the product a twin always costs."""
+    """F1: the same table with /tables/{t}/schema answering 404. Source (b)
+    still proves the key, but nothing spells its key-ordinal EXPLAIN, so the
+    key never reaches the join and the self-join is charged the product."""
 
     def routes(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/tables/baseballStats/schema":

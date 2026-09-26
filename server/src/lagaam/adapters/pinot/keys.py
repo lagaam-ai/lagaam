@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from lagaam.adapters.pinot.metadata import (
-    FIELD_SPEC_KEYS,
     metadata_is_complete,
     positive_int,
     reported_sizes,
@@ -414,9 +413,7 @@ def catalog_keys(
 ) -> frozenset[frozenset[str]]:
     """Every column set the catalog proves unique on this table."""
     return upsert_keys(config_json, schema_json, table_metadata_json) or (
-        single_segment_unique_columns(
-            seg_metadata_json, config_json, schema_json, size_json
-        )
+        single_segment_unique_columns(seg_metadata_json, size_json)
     )
 
 
@@ -480,7 +477,7 @@ def upsert_config_present(config_json: Any) -> bool:
 
 
 def single_segment_unique_columns(
-    seg_metadata_json: Any, config_json: Any, schema_json: Any, size_json: Any
+    seg_metadata_json: Any, size_json: Any
 ) -> frozenset[frozenset[str]]:
     """Columns whose cardinality equals their docs, on a one-sealed-segment table.
 
@@ -505,23 +502,21 @@ def single_segment_unique_columns(
     rows the one sealed segment does not, so its presence alone voids the
     key regardless of what metadata says.
 
-    Gated on nullability because the null caveat is unclosed (log §6): if
-    cardinality counts a null or a default as a distinct value, a column with
-    one null could report cardinality == totalDocs while two rows share the
-    default. Where nullability cannot be established, nothing is yielded.
-
-    A `schema_json` of None is a schema nobody read, and it yields nothing at
-    all: the second gate clears a column that null handling is off for and the
-    schema does not mark nullable, but an unread schema marks nothing nullable
-    for want of evidence rather than for want of nullable columns. Reading
-    absence as proof would let a plainly nullable column pass as a key.
+    A null needs no gate of its own. cardinality counts distinct stored
+    values, and a null is stored as the column's default and counted once,
+    so two nulls, or a null beside a literal default, lower cardinality below
+    totalDocs. Equality therefore means every stored value differs, and a join
+    on the column matches each row at most once under either query-time null
+    mode — measured identically under table-level null handling on and off
+    and schema column-based null handling, for dictionary and raw, STRING and
+    INT columns (docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md).
 
     A multi-value column's cardinality counts distinct entries, not rows —
     totalNumberOfEntries and maxNumberOfMultiValues are reported separately —
     so equality to totalDocs proves nothing there; such a column is never
     evidence.
     """
-    if not isinstance(seg_metadata_json, dict) or schema_json is None:
+    if not isinstance(seg_metadata_json, dict):
         return frozenset()
     reported = reported_sizes(size_json)
     if any(size < 0 for size in reported.values()):
@@ -553,8 +548,6 @@ def single_segment_unique_columns(
     docs = positive_int(sole_body.get("totalDocs"))
     if docs is None:
         return frozenset()
-    nullable_off = _null_handling_disabled(config_json)
-    schema_nullable = _schema_nullable_columns(schema_json)
     keys: set[frozenset[str]] = set()
     for column in sole_body["columns"]:
         if not isinstance(column, dict):
@@ -564,12 +557,6 @@ def single_segment_unique_columns(
         if not isinstance(name, str) or not name or cardinality != docs:
             continue
         if _is_multi_valued(column, docs):
-            continue
-        spec = column.get("fieldSpec")
-        not_null = isinstance(spec, dict) and spec.get("notNull") is True
-        if not not_null and not (
-            nullable_off and name.lower() not in schema_nullable
-        ):
             continue
         keys.add(frozenset({name.lower()}))
     return frozenset(keys)
@@ -668,40 +655,6 @@ def _has_primary_key_counts(table_metadata_json: Any) -> bool:
         return False
     counts = table_metadata_json.get("upsertPartitionToServerPrimaryKeyCountMap")
     return isinstance(counts, dict) and bool(counts)
-
-
-def _null_handling_disabled(config_json: Any) -> bool:
-    """Is tableIndexConfig.nullHandlingEnabled explicitly false on a half?"""
-    if not isinstance(config_json, dict):
-        return False
-    for key in ("REALTIME", "OFFLINE"):
-        half = config_json.get(key)
-        if not isinstance(half, dict):
-            continue
-        index_config = half.get("tableIndexConfig")
-        if isinstance(index_config, dict) and index_config.get(
-            "nullHandlingEnabled"
-        ) is False:
-            return True
-    return False
-
-
-def _schema_nullable_columns(schema_json: Any) -> frozenset[str]:
-    """Lowercase names the schema marks nullable, which no gate may pass."""
-    if not isinstance(schema_json, dict):
-        return frozenset()
-    nullable: set[str] = set()
-    for key in FIELD_SPEC_KEYS:
-        specs = schema_json.get(key)
-        if not isinstance(specs, list):
-            continue
-        for spec in specs:
-            if not isinstance(spec, dict):
-                continue
-            name = spec.get("name")
-            if isinstance(name, str) and name and spec.get("nullable") is True:
-                nullable.add(name.lower())
-    return frozenset(nullable)
 
 
 @dataclass(frozen=True)

@@ -371,8 +371,6 @@ def test_no_column_on_the_single_segment_table_reaches_its_doc_count() -> None:
     assert (
         single_segment_unique_columns(
             load("seg-metadata-baseballStats-allcols.json"),
-            load("tableconfig-baseballStats.json"),
-            load("schema-baseballStats.json"),
             load("size-baseballStats.json"),
         )
         == frozenset()
@@ -380,7 +378,6 @@ def test_no_column_on_the_single_segment_table_reaches_its_doc_count() -> None:
 
 
 def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
-    """Gated on notNull, because a null could collide on the default value."""
     capture = {
         "seg0": {
             "segmentName": "seg0",
@@ -416,13 +413,13 @@ def test_a_column_whose_cardinality_equals_its_docs_is_a_key() -> None:
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
+    assert single_segment_unique_columns(capture, size) == frozenset(
         {frozenset({"id"})}
     )
 
 
-def test_a_nullable_column_yields_nothing_however_unique_it_looks() -> None:
-    """The null caveat is unclosed: cardinality may count a null as a value."""
+def test_a_nullable_column_whose_cardinality_reaches_its_docs_is_a_key() -> None:
+    """A null collision lowers cardinality below totalDocs, so none is here."""
     capture = {
         "seg0": {
             "segmentName": "seg0",
@@ -445,40 +442,40 @@ def test_a_nullable_column_yields_nothing_however_unique_it_looks() -> None:
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
-
-
-def test_null_handling_disabled_plus_a_non_nullable_schema_is_enough() -> None:
-    """The second gate the spec allows: the table cannot store a null at all."""
-    capture = {
-        "seg0": {
-            "segmentName": "seg0",
-            "totalDocs": 2,
-            "columns": [
-                {
-                    "columnName": "id",
-                    "cardinality": 2,
-                    "totalDocs": 2,
-                    "totalNumberOfEntries": 2,
-                    "maxNumberOfMultiValues": 0,
-                    "indexSizeMap": {"forward_index": 8},
-                    "fieldSpec": {
-                        "name": "id",
-                        "notNull": False,
-                        "singleValueField": True,
-                    },
-                }
-            ],
-        }
-    }
-    size = _size_naming("seg0")
-    config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
-    schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
-    assert single_segment_unique_columns(capture, config, schema, size) == frozenset(
+    assert single_segment_unique_columns(capture, size) == frozenset(
         {frozenset({"id"})}
     )
-    enabled = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": True}}}
-    assert single_segment_unique_columns(capture, enabled, schema, size) == frozenset()
+
+
+_U15_TABLES = ["u15nulls", "u15nullsoff", "u15nullscol"]
+_U15_KEYS = frozenset(
+    {frozenset({"id"}), frozenset({"s_one_null"}), frozenset({"s_nodict_distinct"})}
+)
+
+
+@pytest.mark.parametrize("table", _U15_TABLES)
+def test_a_unique_column_is_a_key_under_every_null_handling_mode(table: str) -> None:
+    """Measured on all three tables: the unique columns are keys, and no
+    column with two nulls, a null beside the default, or a repeat is."""
+    seg = load(f"seg-metadata-{table}.json")
+    size = load(f"size-{table}.json")
+    assert single_segment_unique_columns(seg, size) == _U15_KEYS
+
+
+@pytest.mark.parametrize("table", _U15_TABLES)
+def test_catalog_keys_read_the_same_unique_columns_on_every_null_table(
+    table: str,
+) -> None:
+    assert (
+        catalog_keys(
+            config_json=load(f"tableconfig-{table}.json"),
+            seg_metadata_json=load(f"seg-metadata-{table}.json"),
+            schema_json=load(f"schema-{table}.json"),
+            size_json=load(f"size-{table}.json"),
+            table_metadata_json=None,
+        )
+        == _U15_KEYS
+    )
 
 
 def test_more_than_one_sealed_segment_proves_nothing() -> None:
@@ -507,7 +504,7 @@ def test_more_than_one_sealed_segment_proves_nothing() -> None:
         for i in (0, 1)
     }
     size = _size_naming("seg0", "seg1")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
@@ -535,12 +532,12 @@ def test_a_consuming_segment_beside_the_sealed_one_proves_nothing() -> None:
         "seg1": {"segmentName": "seg1", "totalDocs": 0, "crc": -9223372036854775808},
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 @pytest.mark.parametrize("body", [None, {}, [], "junk"])
 def test_single_segment_unique_columns_never_raises(body: Any) -> None:
-    assert single_segment_unique_columns(body, body, body, body) == frozenset()
+    assert single_segment_unique_columns(body, body) == frozenset()
 
 
 def test_a_size_report_naming_two_sealed_segments_proves_nothing_f1() -> None:
@@ -571,7 +568,7 @@ def test_a_size_report_naming_two_sealed_segments_proves_nothing_f1() -> None:
         }
     }
     size = _size_naming("seg0", "seg1")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_a_size_report_naming_one_sealed_segment_matching_metadata_is_evidence_f1() -> (
@@ -600,7 +597,7 @@ def test_a_size_report_naming_one_sealed_segment_matching_metadata_is_evidence_f
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
+    assert single_segment_unique_columns(capture, size) == frozenset(
         {frozenset({"id"})}
     )
 
@@ -643,7 +640,7 @@ def test_a_consuming_segment_named_only_by_size_proves_nothing() -> None:
             }
         }
     }
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 @pytest.mark.parametrize("size", [None, {}])
@@ -670,7 +667,7 @@ def test_an_unreadable_size_report_proves_nothing_f1(size: Any) -> None:
             ],
         }
     }
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_a_multi_value_column_is_never_a_key_f2() -> None:
@@ -697,7 +694,7 @@ def test_a_multi_value_column_is_never_a_key_f2() -> None:
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_the_same_column_single_valued_is_evidence_f2() -> None:
@@ -724,7 +721,7 @@ def test_the_same_column_single_valued_is_evidence_f2() -> None:
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset(
+    assert single_segment_unique_columns(capture, size) == frozenset(
         {frozenset({"tags"})}
     )
 
@@ -754,7 +751,7 @@ def test_max_multivalues_one_alone_excludes_the_column_f2() -> None:
         }
     }
     size = _size_naming("seg0")
-    assert single_segment_unique_columns(capture, {}, {}, size) == frozenset()
+    assert single_segment_unique_columns(capture, size) == frozenset()
 
 
 def test_catalog_keys_carry_the_upsert_key() -> None:
@@ -791,33 +788,14 @@ def _one_segment_capture(*, not_null: bool | None) -> dict[str, Any]:
     }
 
 
-def test_an_unread_schema_establishes_no_nullability_f1() -> None:
-    """F1: schema_json None is a schema nobody read, not a schema that says
-    every column is non-nullable. notNull is absent and null handling is off,
-    so the only thing that could clear the column is the nullable set — and
-    with no schema that set is empty for want of evidence, not for want of
-    nullable columns. Source (b) yields nothing."""
+def test_an_unread_schema_does_not_withhold_a_unique_column_f1() -> None:
+    """F1: schema_json None is a schema nobody read. Source (b) no longer
+    reads a schema, so the unique column is still a key."""
     config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
-    assert (
-        catalog_keys(
-            config_json=config,
-            seg_metadata_json=_one_segment_capture(not_null=None),
-            schema_json=None,
-            size_json=_size_naming("seg0"),
-            table_metadata_json=None,
-        )
-        == frozenset()
-    )
-
-
-def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
-    """F1 control: the same table, with the schema read and notNull true."""
-    config = {"OFFLINE": {"tableIndexConfig": {"nullHandlingEnabled": False}}}
-    schema = {"dimensionFieldSpecs": [{"name": "id", "dataType": "STRING"}]}
     assert catalog_keys(
         config_json=config,
-        seg_metadata_json=_one_segment_capture(not_null=True),
-        schema_json=schema,
+        seg_metadata_json=_one_segment_capture(not_null=None),
+        schema_json=None,
         size_json=_size_naming("seg0"),
         table_metadata_json=None,
     ) == frozenset({frozenset({"id"})})

@@ -173,7 +173,8 @@ The column must be single-valued (a multi-value column's cardinality counts
 entries, not rows) and its nullability must be establishable, because the
 null caveat is open — and establishing it takes a schema document that was
 actually read, since an unread schema marks no column nullable for want of
-evidence rather than for want of nullable columns.
+evidence rather than for want of nullable columns. (closed 2026-09-27, see
+amendment)
 
 **A projected name proves nothing; the ordinal does.** The engine learns
 each keyed table's key-column scan ordinals with one extra EXPLAIN of the
@@ -244,7 +245,8 @@ union, plus the consuming charge — and this path is unit-tested only.
   "rows at its widest step", and the engine builds 100 true pairs. The
   freshness query runs under the *default* budget: 600 rows quoted against
   600 scanned.
-- **The null caveat on source (b) is open.** Whether `cardinality` counts a
+- **The null caveat on source (b) is open.** (closed 2026-09-27, see
+  amendment) Whether `cardinality` counts a
   null or a default as a distinct value was never exercised — every column
   measured had `count(col) == totalDocs`. Source (b) is therefore gated on
   nullability and finds nothing on either quickstart dataset: 0 of 2,604
@@ -286,3 +288,16 @@ Measurements: `docs/superpowers/specs/2026-09-21-pinot-multiserver-measurements.
 This ADR decides two rules. The proven-join-key half lives in
 `server/src/lagaam/adapters/pinot/keys.py`; the consuming-segment half lives
 in `metadata.py`, `quote.py` and `engine.py`.
+
+## Amendment 2026-09-27 — the null caveat is closed
+
+Three one-segment tables holding the same ten rows — table-level null
+handling on, off, and schema column-based null handling — were measured
+with two nulls, one null, a null beside the literal default, dictionary and
+raw columns, STRING and INT. On all three, `cardinality` counts distinct
+stored values and a null is stored as the default and counted once, so any
+null collision lowers `cardinality` below `totalDocs`; equality therefore
+means every stored value differs, and a join on the column matches each row
+at most once under either query-time null mode. The nullability gate and
+the schema requirement on source (b) are removed; every other gate stands.
+Measurements: `docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md`.
