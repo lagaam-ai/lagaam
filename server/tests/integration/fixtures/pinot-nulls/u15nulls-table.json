@@ -1,0 +1,1 @@
+{"tableName": "u15nulls", "tableType": "OFFLINE", "segmentsConfig": {"replication": "1"}, "tenants": {}, "tableIndexConfig": {"nullHandlingEnabled": true, "noDictionaryColumns": ["s_nodict", "s_nodict_distinct"]}, "metadata": {}}

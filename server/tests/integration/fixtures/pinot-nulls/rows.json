@@ -1,0 +1,10 @@
+{"id": 0, "s_two_nulls": "v0", "s_one_null": "v0", "s_null_and_default": "v0", "i_two_nulls": 100, "i_null_and_min": 100, "s_nodict": "n0", "s_nodict_distinct": "d0", "s_dup": "same"}
+{"id": 1, "s_two_nulls": "v1", "s_one_null": "v1", "s_null_and_default": "v1", "i_two_nulls": 101, "i_null_and_min": 101, "s_nodict": "n1", "s_nodict_distinct": "d1", "s_dup": "same"}
+{"id": 2, "s_two_nulls": "v2", "s_one_null": "v2", "s_null_and_default": "v2", "i_two_nulls": 102, "i_null_and_min": 102, "s_nodict": "n2", "s_nodict_distinct": "d2", "s_dup": "u2"}
+{"id": 3, "s_two_nulls": "v3", "s_one_null": "v3", "s_null_and_default": "v3", "i_two_nulls": 103, "i_null_and_min": 103, "s_nodict": "n3", "s_nodict_distinct": "d3", "s_dup": "u3"}
+{"id": 4, "s_two_nulls": "v4", "s_one_null": "v4", "s_null_and_default": "v4", "i_two_nulls": 104, "i_null_and_min": 104, "s_nodict": "n4", "s_nodict_distinct": "d4", "s_dup": "u4"}
+{"id": 5, "s_two_nulls": "v5", "s_one_null": "v5", "s_null_and_default": "v5", "i_two_nulls": 105, "i_null_and_min": 105, "s_nodict": "n5", "s_nodict_distinct": "d5", "s_dup": "u5"}
+{"id": 6, "s_two_nulls": "v6", "s_one_null": "v6", "s_null_and_default": "v6", "i_two_nulls": 106, "i_null_and_min": 106, "s_nodict": "n6", "s_nodict_distinct": "d6", "s_dup": "u6"}
+{"id": 7, "s_two_nulls": "v7", "s_one_null": "v7", "s_null_and_default": "v7", "i_two_nulls": 107, "i_null_and_min": 107, "s_nodict": "n7", "s_nodict_distinct": "d7", "s_dup": "u7"}
+{"id": 8, "s_two_nulls": null, "s_one_null": "v8", "s_null_and_default": null, "i_two_nulls": null, "i_null_and_min": null, "s_nodict": null, "s_nodict_distinct": "d8", "s_dup": "u8"}
+{"id": 9, "s_two_nulls": null, "s_one_null": null, "s_null_and_default": "null", "i_two_nulls": null, "i_null_and_min": -2147483648, "s_nodict": null, "s_nodict_distinct": "d9", "s_dup": "u9"}
