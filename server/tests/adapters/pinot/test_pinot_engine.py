@@ -1503,9 +1503,11 @@ async def test_the_schema_is_fetched_only_for_an_upsert_table() -> None:
 
 async def test_the_schema_is_fetched_once_for_a_proven_non_upsert_key() -> None:
     """A single-sealed-segment table proves a key via notNull, not upsert
-    config, so schema_json is None through table_facts and _record_keycols
-    would re-fetch /tables/{t}/schema — but _table_facts already fetched it
-    once, for the referenced-columns filter, and must not fetch it twice."""
+    config, so schema_json stays None through _table_facts and the schema
+    reaching catalog_keys is table_schema_json — the one _table_facts already
+    fetched for the referenced-columns filter. _record_keycols would re-fetch
+    /tables/{t}/schema if that document were not reused, so it must not be
+    fetched twice."""
     seg_metadata = load("seg-metadata-baseballStats-columns.json")
     (segment,) = seg_metadata.values()
     for column in segment["columns"]:
@@ -1606,6 +1608,13 @@ async def test_an_upsert_self_join_is_bounded_once_the_ordinals_are_learned() ->
         "JOIN pinot.default.airlineStats b ON a.Carrier = b.Carrier LIMIT 10"
     )
     assert estimate.max_intermediate_rows == 9746 + 9746 + 9746
+
+
+async def test_the_catalogs_key_reaches_the_table_facts() -> None:
+    """table_facts proves nothing itself; the engine hands it the catalog's key."""
+    engine = PinotEngine(transport=httpx.MockTransport(_upsert_selfjoin_routes))
+    facts = await engine._table_facts("default", "airlineStats", None, {}, {})
+    assert facts.unique_keys == frozenset({frozenset({"carrier"})})
 
 
 async def test_a_key_whose_ordinals_never_arrived_is_charged_the_product() -> None:

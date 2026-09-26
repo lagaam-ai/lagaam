@@ -10,7 +10,6 @@ httpx exceptions and broker messages never escape.
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
 from typing import Any
 
 import anyio
@@ -23,6 +22,14 @@ from lagaam.adapters.pinot.client import (
     PinotTransportError,
 )
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
+from lagaam.adapters.pinot.keys import (
+    KeyColumns,
+    catalog_keys,
+    key_columns,
+    key_ordinal_sql,
+    key_ordinals,
+    upsert_config_present,
+)
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
     assign_missing_to_servers,
@@ -34,7 +41,6 @@ from lagaam.adapters.pinot.metadata import (
     table_facts,
     table_names,
     table_schema,
-    upsert_config_present,
 )
 from lagaam.adapters.pinot.names import (
     has_limit,
@@ -43,7 +49,7 @@ from lagaam.adapters.pinot.names import (
     referenced_tables,
     two_part_sql,
 )
-from lagaam.adapters.pinot.plan import key_ordinals, max_intermediate_rows
+from lagaam.adapters.pinot.plan import max_intermediate_rows
 from lagaam.adapters.pinot.quote import quote, surviving_docs
 from lagaam.adapters.pinot.response import (
     consuming_segments_surviving,
@@ -138,32 +144,6 @@ def _plan_cell(body: object) -> str | None:
     if not isinstance(first, list) or len(first) < 2:
         return None
     return first[1] if isinstance(first[1], str) else None
-
-
-@dataclass(frozen=True)
-class _Keycols:
-    """What the key-ordinal EXPLAIN of one table has to be spelled with.
-
-    Both spellings come from the controller — the listing for the table, the
-    schema for the columns — and never from the agent's SQL, which reaches
-    the broker case-insensitively and would name a column the plan does not.
-    """
-
-    database: str
-    table: str
-    columns: tuple[str, ...]
-
-
-def _is_bare_identifier(name: str) -> bool:
-    """Is this a name the ordinals EXPLAIN can carry as it stands?
-
-    A key column's spelling comes from the schema document and is
-    interpolated into a SELECT list, so it is checked like any other name
-    this module puts in a statement: a controller is trusted for facts, not
-    for syntax, and a name carrying a comma or a comment marker would be a
-    second clause rather than a column.
-    """
-    return bool(name) and name.isascii() and name.replace("_", "").isalnum()
 
 
 def _resolved_columns(
@@ -379,7 +359,7 @@ class PinotEngine:
         listings: dict[str, list[str]] = {}
         # Lowercase database.table to the keycols EXPLAIN's own subject, filled
         # in only for a table whose keys were proven; see _key_ordinals.
-        keycols: dict[str, _Keycols] = {}
+        keycols: dict[str, KeyColumns] = {}
         try:
             facts = [
                 (
@@ -432,7 +412,7 @@ class PinotEngine:
         table: str,
         columns: frozenset[str] | None,
         listings: dict[str, list[str]],
-        keycols: dict[str, _Keycols],
+        keycols: dict[str, KeyColumns],
     ) -> TableFacts:
         """One table's config, segment metadata and size, from the controller.
 
@@ -528,12 +508,17 @@ class PinotEngine:
             frozenset(resolved),
             externalview_json=externalview,
             consuming_segments_json=consuming_segments_json,
-            # The upsert branch's /schemas/{name} where there was one, else the
-            # /tables/{t}/schema this call already fetched to resolve columns.
-            # Source (b)'s nullability gate reads whichever arrives; without
-            # one it establishes nothing and yields no key.
-            schema_json=schema_json or table_schema_json,
-            table_metadata_json=table_metadata_json,
+            unique_keys=catalog_keys(
+                config_json=config,
+                seg_metadata_json=seg_json,
+                # The upsert branch's /schemas/{name} where there was one, else the
+                # /tables/{t}/schema this call already fetched to resolve columns.
+                # Source (b)'s nullability gate reads whichever arrives; without
+                # one it establishes nothing and yields no key.
+                schema_json=schema_json or table_schema_json,
+                size_json=None if size_json is PinotClient.NotFound else size_json,
+                table_metadata_json=table_metadata_json,
+            ),
         )
         if facts.unique_keys:
             await self._record_keycols(
@@ -783,7 +768,7 @@ class PinotEngine:
 
     async def _record_keycols(
         self,
-        keycols: dict[str, _Keycols],
+        keycols: dict[str, KeyColumns],
         database: str,
         table: str,
         part: str,
@@ -816,20 +801,9 @@ class PinotEngine:
             if body is PinotClient.NotFound:
                 return
             spellings = schema_columns(body)
-        names = sorted({name for key in facts.unique_keys for name in key})
-        resolved = [spellings.get(name) for name in names]
-        if not resolved or any(name is None for name in resolved):
-            # A key column the schema does not name cannot be selected at all.
-            return
-        subject_names = [database, spelled, *(name for name in resolved if name)]
-        if not all(_is_bare_identifier(name) for name in subject_names):
-            # Database, table and every key column reach the EXPLAIN raw.
-            return
-        keycols[f"{database}.{table}".lower()] = _Keycols(
-            database=database,
-            table=spelled,
-            columns=tuple(name for name in resolved if name is not None),
-        )
+        subject = key_columns(database, spelled, spellings, facts.unique_keys)
+        if subject is not None:
+            keycols[f"{database}.{table}".lower()] = subject
 
     async def _surviving(
         self, two_part: str, table_count: int, *, trust_limit_prune: bool
@@ -879,7 +853,7 @@ class PinotEngine:
         self,
         two_part: str,
         tables: list[tuple[str, TableFacts, int | None]],
-        keycols: dict[str, _Keycols],
+        keycols: dict[str, KeyColumns],
     ) -> int | None:
         """Rows the widest plan node would build, or None if unreadable.
 
@@ -910,7 +884,7 @@ class PinotEngine:
         )
 
     async def _key_ordinals(
-        self, keycols: dict[str, _Keycols]
+        self, keycols: dict[str, KeyColumns]
     ) -> dict[str, dict[str, int]]:
         """Each keyed table's key-column scan ordinals, one EXPLAIN apiece.
 
@@ -926,11 +900,7 @@ class PinotEngine:
         """
         ordinals: dict[str, dict[str, int]] = {}
         for name, subject in keycols.items():
-            columns = ", ".join(subject.columns)
-            sql = (
-                f"{_EXPLAIN_SHAPE}SELECT {columns} "
-                f"FROM {subject.database}.{subject.table}"
-            )
+            sql = f"{_EXPLAIN_SHAPE}{key_ordinal_sql(subject)}"
             try:
                 body = await self._explain(
                     sql,
