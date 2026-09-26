@@ -26,10 +26,10 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from lagaam.adapters.pinot.metadata import (
-    _FIELD_SPEC_KEYS,
-    _positive_int,
-    _reported_sizes,
+    FIELD_SPEC_KEYS,
     metadata_is_complete,
+    positive_int,
+    reported_sizes,
 )
 from lagaam.adapters.pinot.rels import (
     MAX_DEPTH,
@@ -523,7 +523,7 @@ def single_segment_unique_columns(
     """
     if not isinstance(seg_metadata_json, dict) or schema_json is None:
         return frozenset()
-    reported = _reported_sizes(size_json)
+    reported = reported_sizes(size_json)
     if any(size < 0 for size in reported.values()):
         return frozenset()
     sealed_names = {name for name, size in reported.items() if size is not None and size >= 0}
@@ -550,7 +550,7 @@ def single_segment_unique_columns(
         name_candidate = sole_key if isinstance(sole_key, str) else ""
     if name_candidate != sole_name:
         return frozenset()
-    docs = _positive_int(sole_body.get("totalDocs"))
+    docs = positive_int(sole_body.get("totalDocs"))
     if docs is None:
         return frozenset()
     nullable_off = _null_handling_disabled(config_json)
@@ -560,7 +560,7 @@ def single_segment_unique_columns(
         if not isinstance(column, dict):
             continue
         name = column.get("columnName")
-        cardinality = _positive_int(column.get("cardinality"))
+        cardinality = positive_int(column.get("cardinality"))
         if not isinstance(name, str) or not name or cardinality != docs:
             continue
         if _is_multi_valued(column, docs):
@@ -691,7 +691,7 @@ def _schema_nullable_columns(schema_json: Any) -> frozenset[str]:
     if not isinstance(schema_json, dict):
         return frozenset()
     nullable: set[str] = set()
-    for key in _FIELD_SPEC_KEYS:
+    for key in FIELD_SPEC_KEYS:
         specs = schema_json.get(key)
         if not isinstance(specs, list):
             continue
