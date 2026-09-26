@@ -471,16 +471,16 @@ def table_facts(
     columns: frozenset[str] = frozenset(),
     *,
     externalview_json: Any = None,
-    schema_json: Any = None,
-    table_metadata_json: Any = None,
     consuming_segments_json: Mapping[str, Any] | None = None,
     unique_keys: frozenset[frozenset[str]] = frozenset(),
 ) -> TableFacts:
     """One table's type, time column, segments and realtime facts.
 
-    The four keyword documents are the U12 additions and default to None, so
-    an OFFLINE caller that fetches none of them gets exactly the pre-U12
+    The two keyword documents are the U12 additions and default to None, so
+    an OFFLINE caller that fetches neither of them gets exactly the pre-U12
     facts: no consuming segments, no threshold, complete, no key evidence.
+    No key is derived here: the caller passes `unique_keys`, as
+    `keys.catalog_keys` proves them, and the default is none.
 
     `consuming_segments_json` maps a consuming segment's name to its own ZK
     metadata, as `GET /segments/{table}/{segmentName}/metadata` serves it. A

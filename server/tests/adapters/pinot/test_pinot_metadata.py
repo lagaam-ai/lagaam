@@ -548,8 +548,6 @@ def test_table_facts_carry_the_upsert_tables_realtime_numbers() -> None:
         load("tableconfig-u12upsert.json"),
         load("seg-metadata-u12upsert.json"),
         load("size-u12upsert.json"),
-        schema_json=load("schema-u12upsert.json"),
-        table_metadata_json=load("metadata-u12upsert.json"),
     )
     assert facts.consuming == 2
     # No externalview and no segment metadata: two consuming segments whose
