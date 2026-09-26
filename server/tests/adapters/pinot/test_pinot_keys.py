@@ -12,8 +12,11 @@ from typing import Any
 import pytest
 
 from lagaam.adapters.pinot.keys import (
+    KeyColumns,
     catalog_keys,
     join_key_pairs,
+    key_columns,
+    key_ordinal_sql,
     key_ordinals,
     single_segment_unique_columns,
     upsert_keys,
@@ -817,3 +820,47 @@ def test_a_schema_that_says_the_column_cannot_be_null_is_evidence_f1() -> None:
         size_json=_size_naming("seg0"),
         table_metadata_json=None,
     ) == frozenset({frozenset({"id"})})
+
+
+def test_key_columns_carry_the_catalog_spelling_sorted_by_lowercase_name() -> None:
+    keys = frozenset({frozenset({"b"}), frozenset({"a"})})
+    subject = key_columns("default", "T", {"b": "B", "a": "A"}, keys)
+    assert subject == KeyColumns(database="default", table="T", columns=("A", "B"))
+
+
+def test_a_key_column_the_schema_does_not_name_gets_no_explain() -> None:
+    keys = frozenset({frozenset({"b"})})
+    assert key_columns("default", "T", {"a": "A"}, keys) is None
+
+
+def test_no_key_gets_no_explain() -> None:
+    assert key_columns("default", "T", {"a": "A"}, frozenset()) is None
+
+
+@pytest.mark.parametrize(
+    ("database", "spelled", "spelling"),
+    [
+        ("default", "T", "a,b"),
+        ("default", "x--", "A"),
+        ("ünï", "T", "A"),
+        ("default", "", "A"),
+    ],
+)
+def test_a_name_that_is_not_a_bare_identifier_gets_no_explain(
+    database: str, spelled: str, spelling: str
+) -> None:
+    keys = frozenset({frozenset({"a"})})
+    assert key_columns(database, spelled, {"a": spelling}, keys) is None
+
+
+def test_a_composite_key_selects_both_its_columns() -> None:
+    subject = key_columns(
+        "default", "T", {"a": "A", "b": "B"}, frozenset({frozenset({"a", "b"})})
+    )
+    assert subject is not None
+    assert subject.columns == ("A", "B")
+
+
+def test_key_ordinal_sql_selects_the_key_columns_from_the_table() -> None:
+    subject = KeyColumns(database="default", table="T", columns=("A", "B"))
+    assert key_ordinal_sql(subject) == "SELECT A, B FROM default.T"

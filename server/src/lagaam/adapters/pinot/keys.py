@@ -691,3 +691,57 @@ def _schema_nullable_columns(schema_json: Any) -> frozenset[str]:
             if isinstance(name, str) and name and spec.get("nullable") is True:
                 nullable.add(name.lower())
     return frozenset(nullable)
+
+
+@dataclass(frozen=True)
+class KeyColumns:
+    """What the key-ordinal EXPLAIN of one table has to be spelled with.
+
+    Both spellings come from the controller — the listing for the table, the
+    schema for the columns — and never from the agent's SQL, which reaches
+    the broker case-insensitively and would name a column the plan does not.
+    """
+
+    database: str
+    table: str
+    columns: tuple[str, ...]
+
+
+def _is_bare_identifier(name: str) -> bool:
+    """Is this a name the ordinals EXPLAIN can carry as it stands?
+
+    A key column's spelling comes from the schema document and is
+    interpolated into a SELECT list, so it is checked like any other name
+    this module puts in a statement: a controller is trusted for facts, not
+    for syntax, and a name carrying a comma or a comment marker would be a
+    second clause rather than a column.
+    """
+    return bool(name) and name.isascii() and name.replace("_", "").isalnum()
+
+
+def key_columns(
+    database: str,
+    spelled: str,
+    spellings: Mapping[str, str],
+    unique_keys: frozenset[frozenset[str]],
+) -> KeyColumns | None:
+    """What one table's key-ordinal EXPLAIN is spelled with, or None."""
+    names = sorted({name for key in unique_keys for name in key})
+    resolved = [spellings.get(name) for name in names]
+    if not resolved or any(name is None for name in resolved):
+        # A key column the schema does not name cannot be selected at all.
+        return None
+    subject_names = [database, spelled, *(name for name in resolved if name)]
+    if not all(_is_bare_identifier(name) for name in subject_names):
+        # Database, table and every key column reach the EXPLAIN raw.
+        return None
+    return KeyColumns(
+        database=database,
+        table=spelled,
+        columns=tuple(name for name in resolved if name is not None),
+    )
+
+
+def key_ordinal_sql(subject: KeyColumns) -> str:
+    """SELECT <key columns> FROM <database>.<table>, no LIMIT, no ORDER BY."""
+    return f"SELECT {', '.join(subject.columns)} FROM {subject.database}.{subject.table}"
