@@ -23,6 +23,7 @@ from lagaam.adapters.pinot.client import (
     PinotTransportError,
 )
 from lagaam.adapters.pinot.dialect import PINOT_DIALECT_CARD
+from lagaam.adapters.pinot.keys import key_ordinals
 from lagaam.adapters.pinot.metadata import (
     TableFacts,
     assign_missing_to_servers,
@@ -43,7 +44,7 @@ from lagaam.adapters.pinot.names import (
     referenced_tables,
     two_part_sql,
 )
-from lagaam.adapters.pinot.plan import key_ordinals, max_intermediate_rows
+from lagaam.adapters.pinot.plan import max_intermediate_rows
 from lagaam.adapters.pinot.quote import quote, surviving_docs
 from lagaam.adapters.pinot.response import (
     consuming_segments_surviving,
