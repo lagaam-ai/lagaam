@@ -482,7 +482,8 @@ def single_segment_unique_columns(
     """Columns whose cardinality equals their docs, on a one-sealed-segment table.
 
     On a dictionary column cardinality is exactly count(DISTINCT col) —
-    verified against the engine on four columns — and count(DISTINCT col) <= count(col) <= totalDocs, so
+    verified against the engine on four columns — and
+    count(DISTINCT col) <= count(col) <= totalDocs, so
     equality forces every doc to be counted and every value to differ. That
     argument is the segment's, and it is the table's only where the two are
     the same rows: one sealed segment and nothing consuming.

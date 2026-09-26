@@ -289,7 +289,7 @@ This ADR decides two rules. The proven-join-key half lives in
 `server/src/lagaam/adapters/pinot/keys.py`; the consuming-segment half lives
 in `metadata.py`, `quote.py` and `engine.py`.
 
-## Amendment 2026-09-27 — the null caveat is closed
+## Amendment 2026-09-27 — the null caveat is closed, and only a dictionary's cardinality counts
 
 Three one-segment Pinot 1.5.1 OFFLINE tables holding the same ten rows —
 table-level null handling on, off, and schema column-based null handling —

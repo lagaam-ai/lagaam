@@ -99,9 +99,9 @@ On `u15rawskew` the raw column's cardinality equals totalDocs although 200
 rows share one value. **Main 2774925 under-quotes this shape**:
 `SELECT a.c FROM pinot.default.u15rawskew a JOIN pinot.default.u15rawskew b
 ON a.c = b.c LIMIT 10` is quoted 9,000 at its widest step against 42,800
-pairs built, because source (b) takes `c` as a key. v0.2.1 differs from
-2774925 only by the move of the rule into `keys.py`, so it carries the same
-under-quote (measured on 2774925, not on the tag itself). The same query on
+pairs built, because source (b) takes `c` as a key. The v0.2.1 tag itself,
+run from `git archive v0.2.1`, quotes the same 9,000: the released version
+carries this under-quote. The same query on
 `d`, and on both columns of `u15rawexact`, is charged the product, 9,006,000.
 
 So source (b) reads cardinality only where it is an exact count: a column
