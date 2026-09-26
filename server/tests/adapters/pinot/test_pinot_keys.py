@@ -1,4 +1,5 @@
-"""The scan ordinals a join-key proof is built from.
+"""The whole join-key rule: catalog proof, key-ordinal EXPLAIN spelling,
+ordinals, and join coverage.
 
 A key column is learned as its scan ordinal from an EXPLAIN of the key columns
 themselves, and a join operand is resolved by composing its index down its own

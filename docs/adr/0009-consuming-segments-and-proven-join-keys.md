@@ -280,3 +280,5 @@ Only the consuming segments the pruning provably left may be subtracted:
 `max(0, consuming − pruned)`. When pruning happens this charges up to
 `consuming` more sealed segments than before, which is the fail-safe side.
 Measurements: `docs/superpowers/specs/2026-09-21-pinot-multiserver-measurements.md` §7.
+
+2026-09-27: the rule this ADR decides lives in `server/src/lagaam/adapters/pinot/keys.py`.

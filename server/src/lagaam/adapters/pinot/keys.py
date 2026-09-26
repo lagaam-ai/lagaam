@@ -9,6 +9,16 @@ real Carrier is 18. So the engine learns each key column's ordinal with one
 EXPLAIN of the key columns themselves (`key_ordinals`), and an operand must
 compose down its side's chain to that same ordinal before it may be called
 that key column.
+
+Two other parts of the rule live here too. The catalog's proof that a column
+set is unique (`catalog_keys`, `upsert_keys`, `single_segment_unique_columns`)
+reads either an upsert table's primary key — proven only where
+`upsertConfig` is present and no TTL reopens the key to duplicates — or a
+single sealed segment's cardinality against its doc count. And the
+key-ordinal EXPLAIN's own spelling (`key_columns`, `key_ordinal_sql`) is
+built only from bare identifiers; `_is_bare_identifier` is the guard against
+a controller-supplied database, table or column name that could otherwise
+break out of the generated SQL.
 """
 
 from collections.abc import Mapping

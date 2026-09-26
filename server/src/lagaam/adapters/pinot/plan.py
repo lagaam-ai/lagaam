@@ -59,11 +59,10 @@ def max_intermediate_rows(
     shipped behaviour: every join is the product.
 
     `key_ordinals` maps the same table name to each key column's scan
-    ordinal, learned from the engine by the module-level function of that
-    name. An operand is that key column only when it composes down to that
-    ordinal: a projected field's *name* proves nothing, since a subquery may
-    call any column anything. A table with keys but no ordinals here yields
-    no evidence.
+    ordinal, learned from the engine by `keys.key_ordinals`. An operand is
+    that key column only when it composes down to that ordinal: a projected
+    field's *name* proves nothing, since a subquery may call any column
+    anything. A table with keys but no ordinals here yields no evidence.
     """
     rels = parse_rels(plan_json)
     if rels is None:
