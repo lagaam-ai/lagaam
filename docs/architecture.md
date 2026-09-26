@@ -166,10 +166,12 @@ Trino approach:
 | Module | Does |
 |---|---|
 | `client.py` | httpx wiring; the only module with an HTTP verb, threading basic auth to both the controller and the broker |
+| `rels.py` | generic readers for Pinot's multi-stage `EXPLAIN … AS JSON` graph, shared by `plan.py` and `keys.py` |
 | `metadata.py` | controller JSON → domain values; pure, never raises — an unreadable shape is "no fact," not a crash |
+| `keys.py` | the whole join-key rule of ADR 0009: the catalog's proof that a key is unique, the key-ordinal EXPLAIN's spelling, and join coverage from proven key evidence |
 | `names.py` | three-part names for the agent (`pinot.<db>.<table>`) to two-part names for Pinot (`<db>.<table>`) |
 | `response.py` | broker JSON → a `QueryResult`, its failure, or its pruning counters; every Pinot error is an HTTP 200, so the body is the only signal |
-| `plan.py` | the widest row count anywhere in the multi-stage plan, read for shape only (which tables, joins, conditions) since the plan carries no real sizes |
+| `plan.py` | the widest row count anywhere in the multi-stage plan, read for shape only (which tables, joins, conditions) since the plan carries no real sizes, charging a join at less than the product where `keys.py` proves a key covers it |
 | `quote.py` | table facts → `CostEstimate`, synthesised from segment metadata plus the broker's own pruning oracle; a number that cannot be bounded is `None`, which the budget gate denies |
 | `engine.py` | the `QueryEngine` port itself: grounding (`list_catalogs`/`describe_table`), execution, and quotation, with a synthetic single catalog named `pinot` since Pinot has none |
 
