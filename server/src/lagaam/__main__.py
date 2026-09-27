@@ -1,6 +1,6 @@
 """Run the Lagaam MCP server over stdio, wired to one engine from env vars.
 
-Usage: uv run python -m lagaam
+Usage: uvx lagaam  (from a checkout: uv run python -m lagaam)
 
 The server refuses to start without a table grant: an agent that can reach
 every table in every catalog is the thing this exists to prevent, so that
