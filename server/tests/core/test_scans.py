@@ -11,6 +11,7 @@ from lagaam.core.scans import (
     scan_counts_saturated,
     table_scan_counts,
 )
+from tests.timing import cpu_seconds
 
 
 def unpriceable(sql: str) -> bool:
@@ -257,7 +258,7 @@ def test_a_generator_walk_of_a_doubling_chain_stays_under_a_second() -> None:
     )
     start = time.perf_counter()
     unpriceable(f"{head}{links} SELECT x FROM c23")
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_a_doubling_chain_of_fat_bodies_stays_under_a_second() -> None:
@@ -276,7 +277,7 @@ def test_a_doubling_chain_of_fat_bodies_stays_under_a_second() -> None:
     sql = "WITH " + ", ".join(parts) + " SELECT k FROM c14"
     start = time.perf_counter()
     unpriceable(sql)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_a_column_fed_unnest_does_not_inflate_the_product() -> None:
@@ -591,7 +592,7 @@ def test_a_wide_query_of_aliases_resolves_in_under_a_second() -> None:
     sql = f"WITH a AS (SELECT {binds} FROM hive.s.t) SELECT 1 FROM a z {refs}"
     start = time.perf_counter()
     unpriceable(sql)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_a_diamond_of_star_ctes_resolves_in_under_a_second() -> None:
@@ -611,7 +612,7 @@ def test_a_diamond_of_star_ctes_resolves_in_under_a_second() -> None:
     )
     start = time.perf_counter()
     unpriceable(sql)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_a_later_union_arm_inherits_the_first_arms_names() -> None:
@@ -772,7 +773,7 @@ def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n24() -> None:
     start = time.perf_counter()
     result = counts(_doubling_chain(24))
     elapsed = time.perf_counter() - start
-    assert elapsed < 1.0
+    assert elapsed < cpu_seconds(1.0)
     # 2^23 reads, counted exactly rather than truncated by the walk budget:
     # an under-count would scale the byte quote DOWN, which is the discount
     # saturation exists to refuse.
@@ -786,7 +787,7 @@ def test_a_doubling_cte_chain_resolves_in_under_a_second_at_n40() -> None:
     start = time.perf_counter()
     result = counts(_doubling_chain(40))
     elapsed = time.perf_counter() - start
-    assert elapsed < 1.0
+    assert elapsed < cpu_seconds(1.0)
     assert result["tpch.sf1.orders"] == 2**39
     assert scan_counts_saturated(_doubling_chain(40), "trino")
 
@@ -1186,7 +1187,7 @@ def test_a_wide_query_of_aliases_and_columns_stays_under_a_second() -> None:
 
     start = time.perf_counter()
     unpriceable(wide)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
     # The over-block half of the same defect: the budget was spent re-walking
     # a body once per reference, so its WIDTH — which the analyst writes —
@@ -1249,7 +1250,7 @@ def test_a_wide_statement_of_ctes_and_unnests_stays_bounded() -> None:
     start = time.perf_counter()
     unpriceable(wide)
     fanout(wide)
-    assert time.perf_counter() - start < 2.0
+    assert time.perf_counter() - start < cpu_seconds(2.0)
 
 
 def test_a_resolve_that_runs_out_of_budget_refuses() -> None:
@@ -1584,7 +1585,7 @@ def test_a_doubling_chain_of_generator_ctes_stays_under_a_second() -> None:
     start = time.perf_counter()
     unpriceable(chain)
     fanout(chain)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_deep_set_operation_nesting_refuses_rather_than_raising() -> None:
@@ -1821,7 +1822,7 @@ def test_a_statement_of_many_generators_stays_under_a_second() -> None:
     start = time.perf_counter()
     unpriceable(wide)
     fanout(wide)
-    assert time.perf_counter() - start < 1.0
+    assert time.perf_counter() - start < cpu_seconds(1.0)
 
 
 def test_a_correlated_subquery_key_is_not_one_valued() -> None:

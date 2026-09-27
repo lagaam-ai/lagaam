@@ -12,6 +12,7 @@ import sqlglot
 
 from lagaam.core.errors import SqlValidationError
 from lagaam.core.safety import _bracket_depth, _clamp_limit, _reparseable, validate_query
+from tests.timing import cpu_seconds
 
 
 def validate(sql: str) -> str:
@@ -436,7 +437,7 @@ def test_oversized_sql_is_refused_before_parsing() -> None:
     started = time.monotonic()
     with pytest.raises(SqlValidationError, match="characters"):
         validate_query(f"SELECT z.x FROM {inner} AS z", dialect="trino")
-    assert time.monotonic() - started < 2.0
+    assert time.monotonic() - started < cpu_seconds(2.0)
 
 
 def test_a_long_but_ordinary_query_is_not_refused() -> None:
@@ -553,7 +554,7 @@ def test_a_moderately_nested_array_is_refused_quickly_not_left_to_hang() -> None
     started = time.monotonic()
     with pytest.raises(SqlValidationError):
         validate_query(_nested_array(16), "trino")
-    assert time.monotonic() - started < 1.0
+    assert time.monotonic() - started < cpu_seconds(1.0)
 
 
 @pytest.mark.parametrize(
@@ -578,7 +579,7 @@ def test_an_apostrophe_in_a_comment_does_not_hide_the_nesting(
     with pytest.raises(SqlValidationError) as err:
         validate_query(sql, "trino")
     assert "nested" in str(err.value).lower()
-    assert time.monotonic() - started < 1.0
+    assert time.monotonic() - started < cpu_seconds(1.0)
 
 
 def test_an_unterminated_quote_is_refused_rather_than_read_as_zero_depth() -> None:
