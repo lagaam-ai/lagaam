@@ -1,0 +1,1 @@
+{"tableName": "u15rawexact", "tableType": "OFFLINE", "segmentsConfig": {"replication": "1"}, "tenants": {}, "metadata": {}, "tableIndexConfig": {"noDictionaryColumns": ["c"], "optimizeNoDictStatsCollection": false}}

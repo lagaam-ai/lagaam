@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -90,6 +92,109 @@ def _pinot_answers(table: str) -> bool:
     if isinstance(count, bool) or not isinstance(count, int):
         return False
     return count > 0
+
+
+_PINOT_NULLS = Path(__file__).parent / "fixtures" / "pinot-nulls"
+
+
+def _null_rows() -> bytes:
+    return (_PINOT_NULLS / "rows.json").read_bytes()
+
+
+def _skew_rows() -> bytes:
+    """2,800 unique values, then "hot" 200 times: 3,000 rows, 2,801 distinct."""
+    values = [f"u{i}" for i in range(2800)] + ["hot"] * 200
+    return "\n".join(json.dumps({"c": v, "d": v}) for v in values).encode()
+
+
+# Each table the tests quote, with the rows it holds and their count.
+_PINOT_KEY_TABLES = {
+    "u15nulls": (_null_rows, 10),
+    "u15nullsoff": (_null_rows, 10),
+    "u15nullscol": (_null_rows, 10),
+    "u15rawskew": (_skew_rows, 3000),
+    "u15rawexact": (_skew_rows, 3000),
+}
+
+
+@pytest.fixture
+def pinot_nulls_ready(pinot_ready: None) -> None:
+    """Make the null-handling and raw-cardinality tables exist on the batch
+    instance.
+
+    A table the controller already serves is left exactly as it is, so this
+    is a no-op wherever they were created before; only a missing one is
+    created and loaded with its measured rows.
+    """
+    created: list[str] = []
+    for table, (rows, _) in _PINOT_KEY_TABLES.items():
+        response = httpx.get(f"http://localhost:9000/tables/{table}", timeout=10.0)
+        if response.status_code == 404:
+            _create_key_table(table, rows())
+            created.append(table)
+    deadline = time.monotonic() + 60
+    while True:
+        short = [
+            table
+            for table, (_, count) in _PINOT_KEY_TABLES.items()
+            if _pinot_count(table) != count
+        ]
+        if not short:
+            return
+        if time.monotonic() > deadline:
+            broken = [table for table in short if table in created]
+            if broken:
+                pytest.fail(f"{broken} were created here and never loaded their rows")
+            pytest.skip(f"{short} never answered their row counts within 60s")
+        time.sleep(1)
+
+
+def _create_key_table(table: str, rows: bytes) -> None:
+    """Schema, table config, then the rows, in the order the controller needs."""
+    controller = "http://localhost:9000"
+    httpx.post(
+        f"{controller}/schemas",
+        content=(_PINOT_NULLS / f"{table}-schema.json").read_bytes(),
+        headers={"Content-Type": "application/json"},
+        timeout=30.0,
+    ).raise_for_status()
+    httpx.post(
+        f"{controller}/tables",
+        content=(_PINOT_NULLS / f"{table}-table.json").read_bytes(),
+        headers={"Content-Type": "application/json"},
+        timeout=30.0,
+    ).raise_for_status()
+    httpx.post(
+        f"{controller}/ingestFromFile",
+        params={
+            "tableNameWithType": f"{table}_OFFLINE",
+            "batchConfigMapStr": '{"inputFormat":"json"}',
+        },
+        files={"file": ("rows.json", rows)},
+        timeout=60.0,
+    ).raise_for_status()
+
+
+def _pinot_count(table: str) -> int | None:
+    """count(*) on the batch broker, or None while the table cannot answer."""
+    try:
+        response = httpx.post(
+            "http://localhost:8000/query/sql",
+            json={
+                "sql": f"SELECT count(*) FROM {table}",
+                "queryOptions": "useMultistageEngine=true",
+            },
+            timeout=10.0,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    body = response.json()
+    rows = (body.get("resultTable") or {}).get("rows") or []
+    if body.get("exceptions") or not rows or not rows[0]:
+        return None
+    count = rows[0][0]
+    return count if isinstance(count, int) and not isinstance(count, bool) else None
 
 
 _PINOT_REALTIME_CONTROLLER = "http://localhost:9001"

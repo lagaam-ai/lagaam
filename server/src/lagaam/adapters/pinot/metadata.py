@@ -14,7 +14,7 @@ from typing import Any, Final
 from lagaam.core.models import ColumnInfo, TableSchema
 
 # Pinot's three field-spec lists, in the order a card presents them.
-_FIELD_SPEC_KEYS = ("dimensionFieldSpecs", "metricFieldSpecs", "dateTimeFieldSpecs")
+FIELD_SPEC_KEYS = ("dimensionFieldSpecs", "metricFieldSpecs", "dateTimeFieldSpecs")
 
 
 def table_names(tables_json: Any) -> list[str]:
@@ -84,7 +84,7 @@ def _columns(schema_json: Any) -> list[ColumnInfo]:
     if not isinstance(schema_json, dict):
         return []
     columns: list[ColumnInfo] = []
-    for key in _FIELD_SPEC_KEYS:
+    for key in FIELD_SPEC_KEYS:
         specs = schema_json.get(key)
         if not isinstance(specs, list):
             continue
@@ -180,7 +180,7 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
     if not isinstance(seg_metadata_json, dict):
         return []
     sizes = _segment_sizes(size_json)
-    reported = _reported_sizes(size_json)
+    reported = reported_sizes(size_json)
     facts: list[SegmentFact] = []
     for key, body in seg_metadata_json.items():
         if not isinstance(body, dict):
@@ -195,10 +195,10 @@ def segment_facts(seg_metadata_json: Any, size_json: Any) -> list[SegmentFact]:
         facts.append(
             SegmentFact(
                 name=name,
-                docs=_positive_int(body.get("totalDocs"), allow_zero=True),
+                docs=positive_int(body.get("totalDocs"), allow_zero=True),
                 total_bytes=sizes.get(name),
-                start_ms=_positive_int(body.get("startTimeMillis")),
-                end_ms=_positive_int(body.get("endTimeMillis")),
+                start_ms=positive_int(body.get("startTimeMillis")),
+                end_ms=positive_int(body.get("endTimeMillis")),
                 column_bytes=_column_bytes(body.get("columns")),
             )
         )
@@ -293,7 +293,7 @@ def missing_sealed_segments(seg_metadata_json: Any, size_json: Any) -> frozenset
     """
     named = {
         name
-        for name, size in _reported_sizes(size_json).items()
+        for name, size in reported_sizes(size_json).items()
         if size is not None and size >= 0
     }
     if not named:
@@ -398,11 +398,11 @@ def _missing_segments(size_json: Any) -> int:
     half = size_json.get("realtimeSegments")
     if not isinstance(half, dict):
         return 0
-    missing = _positive_int(half.get("missingSegments"), allow_zero=True)
+    missing = positive_int(half.get("missingSegments"), allow_zero=True)
     return missing or 0
 
 
-def _reported_sizes(size_json: Any) -> dict[str, int]:
+def reported_sizes(size_json: Any) -> dict[str, int]:
     """Segment name to reportedSizeInBytes verbatim, -1 included.
 
     _segment_sizes drops the -1 as "unknown"; this keeps it, because -1 is
@@ -432,7 +432,7 @@ def _positive_int_or_digits(value: Any) -> int | None:
     """A positive int, or a string of digits meaning one. Nothing else."""
     if isinstance(value, str):
         return int(value) if value.isdigit() and int(value) > 0 else None
-    return _positive_int(value)
+    return positive_int(value)
 
 
 def time_column(config_json: Any) -> str | None:
@@ -542,7 +542,7 @@ def _segment_sizes(size_json: Any) -> dict[str, int]:
             if not isinstance(name, str) or not isinstance(body, dict):
                 continue
             # Measured: a consuming segment reports -1, which is "unknown".
-            reported = _positive_int(body.get("reportedSizeInBytes"), allow_zero=True)
+            reported = positive_int(body.get("reportedSizeInBytes"), allow_zero=True)
             if reported is not None:
                 sizes[name] = reported
     return sizes
@@ -568,14 +568,14 @@ def _column_bytes(columns_json: Any) -> Mapping[str, int]:
             continue
         total = 0
         for value in index_sizes.values():
-            size = _positive_int(value, allow_zero=True)
+            size = positive_int(value, allow_zero=True)
             if size is not None:
                 total += size
         totals[name] = total
     return totals
 
 
-def _positive_int(value: Any, allow_zero: bool = False) -> int | None:
+def positive_int(value: Any, allow_zero: bool = False) -> int | None:
     """An int the controller means as a measurement, or None."""
     if isinstance(value, bool) or not isinstance(value, int):
         return None

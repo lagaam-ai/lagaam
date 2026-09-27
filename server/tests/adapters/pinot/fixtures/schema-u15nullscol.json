@@ -1,0 +1,43 @@
+{
+  "schemaName" : "u15nullscol",
+  "enableColumnBasedNullHandling" : true,
+  "dimensionFieldSpecs" : [ {
+    "name" : "id",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION",
+    "notNull" : true
+  }, {
+    "name" : "s_two_nulls",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "s_one_null",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "s_null_and_default",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "i_two_nulls",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "i_null_and_min",
+    "dataType" : "INT",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "s_nodict",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  }, {
+    "name" : "s_nodict_distinct",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION",
+    "notNull" : true
+  }, {
+    "name" : "s_dup",
+    "dataType" : "STRING",
+    "fieldType" : "DIMENSION"
+  } ]
+}

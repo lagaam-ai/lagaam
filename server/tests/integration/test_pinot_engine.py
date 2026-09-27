@@ -552,6 +552,64 @@ async def test_a_lowercase_table_quotes_what_the_canonical_one_does(
     assert lowered.scanned_bytes == canonical.scanned_bytes
 
 
+# Measured in docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md.
+_NULL_CHARGES = {
+    "id": 30,
+    "s_one_null": 30,
+    "s_nodict_distinct": 120,
+    "s_two_nulls": 120,
+    "i_null_and_min": 120,
+}
+
+
+@pytest.mark.parametrize("column", list(_NULL_CHARGES))
+@pytest.mark.parametrize("table", ["u15nulls", "u15nullsoff", "u15nullscol"])
+async def test_a_unique_column_bounds_its_self_join_under_every_null_mode(
+    pinot_nulls_ready: None, table: str, column: str
+) -> None:
+    engine = _engine()
+    estimate = await engine.estimate_cost(
+        f"SELECT a.id FROM pinot.default.{table} a "
+        f"JOIN pinot.default.{table} b ON a.{column} = b.{column} LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == _NULL_CHARGES[column]
+    result = await engine.execute(
+        f"SELECT count(*) FROM {table} a JOIN {table} b ON a.{column} = b.{column}",
+        max_rows=1,
+        timeout_seconds=30.0,
+    )
+    (pairs,) = result.rows[0]
+    assert isinstance(pairs, int) and pairs > 0
+    # Zero under-quotes: the charge covers every pair the join really built.
+    assert estimate.max_intermediate_rows >= pairs
+
+
+@pytest.mark.parametrize("column", ["c", "d"])
+@pytest.mark.parametrize("table", ["u15rawskew", "u15rawexact"])
+async def test_a_repeated_value_charges_the_product_raw_or_dictionary(
+    pinot_nulls_ready: None, table: str, column: str
+) -> None:
+    """Measured: u15rawskew's raw `c` reports cardinality 3000 over 2,801
+    distinct values, which quoted 9,000 against 42,800 pairs built."""
+    engine = _engine()
+    described = await engine.describe_table("pinot", "default", table)
+    docs = described.row_estimate
+    assert docs == 3000
+    estimate = await engine.estimate_cost(
+        f"SELECT a.{column} FROM pinot.default.{table} a "
+        f"JOIN pinot.default.{table} b ON a.{column} = b.{column} LIMIT 10"
+    )
+    assert estimate.max_intermediate_rows == docs * docs + 2 * docs
+    result = await engine.execute(
+        f"SELECT count(*) FROM {table} a JOIN {table} b ON a.{column} = b.{column}",
+        max_rows=1,
+        timeout_seconds=30.0,
+    )
+    (pairs,) = result.rows[0]
+    assert pairs == 42800
+    assert estimate.max_intermediate_rows >= pairs
+
+
 def _realtime_engine() -> PinotEngine:
     return PinotEngine(
         controller_url="http://localhost:9001", broker_url="http://localhost:8001"

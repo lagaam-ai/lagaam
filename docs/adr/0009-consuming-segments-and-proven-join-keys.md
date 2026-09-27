@@ -173,7 +173,8 @@ The column must be single-valued (a multi-value column's cardinality counts
 entries, not rows) and its nullability must be establishable, because the
 null caveat is open — and establishing it takes a schema document that was
 actually read, since an unread schema marks no column nullable for want of
-evidence rather than for want of nullable columns.
+evidence rather than for want of nullable columns. (closed 2026-09-27, see
+amendment)
 
 **A projected name proves nothing; the ordinal does.** The engine learns
 each keyed table's key-column scan ordinals with one extra EXPLAIN of the
@@ -244,7 +245,8 @@ union, plus the consuming charge — and this path is unit-tested only.
   "rows at its widest step", and the engine builds 100 true pairs. The
   freshness query runs under the *default* budget: 600 rows quoted against
   600 scanned.
-- **The null caveat on source (b) is open.** Whether `cardinality` counts a
+- **The null caveat on source (b) is open.** (closed 2026-09-27, see
+  amendment) Whether `cardinality` counts a
   null or a default as a distinct value was never exercised — every column
   measured had `count(col) == totalDocs`. Source (b) is therefore gated on
   nullability and finds nothing on either quickstart dataset: 0 of 2,604
@@ -286,3 +288,22 @@ Measurements: `docs/superpowers/specs/2026-09-21-pinot-multiserver-measurements.
 This ADR decides two rules. The proven-join-key half lives in
 `server/src/lagaam/adapters/pinot/keys.py`; the consuming-segment half lives
 in `metadata.py`, `quote.py` and `engine.py`.
+
+## Amendment 2026-09-27 — the null caveat is closed, and only a dictionary's cardinality counts
+
+Three one-segment Pinot 1.5.1 OFFLINE tables holding the same ten rows —
+table-level null handling on, off, and schema column-based null handling —
+were measured with two nulls, one null, and a null beside the literal default.
+On all three, a dictionary column's `cardinality` counts distinct stored
+values and a null is stored as the default and counted once, so any null
+collision lowers `cardinality` below `totalDocs`. The collision was measured
+on dictionary STRING and INT columns and on one raw STRING column; a lone
+null only on a dictionary STRING column (`s_one_null`, which stays a key).
+Equality therefore means every stored value differs, and a join on the column
+matches each row at most once under either query-time null mode. The nullability
+gate and the schema requirement on source (b) are removed. In their place
+source (b) reads only a column whose metadata says `hasDictionary: true`: a
+raw column's `cardinality` can be an HLL estimate, and on `u15rawskew`
+(`optimizeNoDictStatsCollection: true`, 3,000 rows, 2,801 distinct) it read
+3000, which quoted a self-join at 9,000 against 42,800 pairs built.
+Measurements: `docs/superpowers/specs/2026-09-27-pinot-null-keys-measurements.md`.
