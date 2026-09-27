@@ -8,6 +8,7 @@ import functools
 import inspect
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from importlib.metadata import version
 from typing import Any, TypeVar
 
 from mcp.server.fastmcp import FastMCP
@@ -120,6 +121,8 @@ def create_server(
     # Returned-row cap: distinct from max_rows, which gates rows *scanned*.
     row_cap = budget.max_returned_rows or _DEFAULT_ROW_CAP
     mcp = FastMCP("lagaam", stateless_http=True, json_response=True)
+    # FastMCP 1.x takes no version, so the handshake would report the SDK's own.
+    mcp._mcp_server.version = version("lagaam")
 
     @mcp.tool()
     @_instrumented("list_catalogs", identity, audit)
