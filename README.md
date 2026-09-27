@@ -163,9 +163,9 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 ## Status
 
-`v0.2.2` — Trino adapter, schema tools, plan-based cost guard, query
+`v0.2.3` — on PyPI as `lagaam`. Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
-audit log. 1,167 unit + 212 integration tests (live Trino 476 and Pinot
+audit log. 1,170 unit + 212 integration tests (live Trino 476 and Pinot
 1.5.1, batch and realtime), mypy strict. `LAGAAM_ENGINE=pinot` starts the
 native Pinot adapter: grounding, execution and a quotation synthesised from
 segment metadata and the broker's own pruning oracle, for OFFLINE and
