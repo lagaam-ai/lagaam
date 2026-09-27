@@ -400,7 +400,7 @@ wheels = [
 ]
 
 [[package]]
-name = "lagaam-server"
+name = "lagaam"
 version = "0.2.2"
 source = { editable = "." }
 dependencies = [

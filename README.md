@@ -58,6 +58,15 @@ Reproduce: [`benchmarks/catch_rate.py`](benchmarks/catch_rate.py) →
 
 ## Quickstart
 
+Against the Trino you already have (`TRINO_PORT` / `TRINO_USER` if yours
+aren't `8080` / `lagaam`):
+
+```bash
+TRINO_HOST=trino.internal LAGAAM_ALLOWED_TABLES=hive.sales.orders uvx lagaam   # MCP server on stdio
+```
+
+Or try it on a demo warehouse:
+
 ```bash
 git clone https://github.com/lagaam-ai/lagaam && cd lagaam
 docker compose -f examples/docker-compose.yml --profile trino up -d   # demo warehouse
@@ -65,9 +74,6 @@ cd server && uv sync
 LAGAAM_ALLOWED_TABLES=tpch.tiny.orders,tpch.tiny.lineitem \
   uv run python -m lagaam                                             # MCP server on stdio
 ```
-
-Or point it at the Trino you already have with `TRINO_HOST` / `TRINO_PORT` /
-`TRINO_USER`.
 
 For Pinot, `--profile pinot` brings up the batch quickstart and
 `--profile pinot-realtime up -d` brings up a Kafka-fed streaming one —
@@ -80,8 +86,8 @@ Wire it into any MCP client (Claude Code, Claude Desktop, or your own agent):
 {
   "mcpServers": {
     "lagaam": {
-      "command": "uv",
-      "args": ["run", "--project", "/path/to/lagaam/server", "python", "-m", "lagaam"],
+      "command": "uvx",
+      "args": ["lagaam"],
       "env": {
         "TRINO_HOST": "localhost",
         "LAGAAM_MAX_SCAN_BYTES": "5368709120",

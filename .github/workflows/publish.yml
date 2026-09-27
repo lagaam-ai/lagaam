@@ -1,0 +1,62 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+      - name: Release tag matches the package version
+        working-directory: server
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          uv run --no-project python - <<'PY'
+          import os, sys, tomllib
+          version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
+          tag = os.environ["TAG"]
+          if tag != f"v{version}":
+              sys.exit(f"release tag {tag!r} does not match pyproject version v{version}")
+          PY
+      - run: uv build
+        working-directory: server
+      - name: Smoke-test the wheel in a fresh venv
+        run: |
+          uv venv /tmp/smoke && uv pip install --python /tmp/smoke server/dist/*.whl
+          set +e
+          env -u LAGAAM_ALLOWED_TABLES -u LAGAAM_ALLOW_ALL_TABLES /tmp/smoke/bin/lagaam </dev/null 2>/tmp/smoke.err
+          code=$?
+          set -e
+          cat /tmp/smoke.err
+          test "$code" -eq 2
+          grep -q LAGAAM_ALLOWED_TABLES /tmp/smoke.err
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: server/dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

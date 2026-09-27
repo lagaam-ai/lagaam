@@ -1,8 +1,21 @@
 [project]
-name = "lagaam-server"
+name = "lagaam"
 version = "0.2.2"
 description = "Lagaam — governed MCP analytics server for the open lakehouse"
+readme = "README.md"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Mudit Kapoor", email = "muditk441@gmail.com" }]
+keywords = ["mcp", "trino", "pinot", "llm", "agents", "sql", "lakehouse", "cost-guard"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Typing :: Typed",
+]
 requires-python = ">=3.12"
 dependencies = [
     # v2.0 renames FastMCP -> MCPServer and breaks the import path; migrate deliberately.
@@ -16,6 +29,15 @@ dependencies = [
     "anyio>=4",
     "trino>=0.330",
 ]
+
+[project.scripts]
+lagaam = "lagaam.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/lagaam-ai/lagaam"
+Repository = "https://github.com/lagaam-ai/lagaam"
+Issues = "https://github.com/lagaam-ai/lagaam/issues"
+Changelog = "https://github.com/lagaam-ai/lagaam/releases"
 
 [dependency-groups]
 dev = [
