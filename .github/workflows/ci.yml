@@ -22,4 +22,7 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest -q
+        env:
+          # Runners take ~3.5x a laptop's time; the scaled bounds still catch the quadratic blowups.
+          LAGAAM_TEST_SLOWDOWN: "4"
       - run: uv run mypy

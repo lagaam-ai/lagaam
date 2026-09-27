@@ -28,6 +28,7 @@ from lagaam.core.errors import (
     TableNotFoundError,
 )
 from lagaam.core.ports import QueryEngine
+from tests.timing import cpu_seconds
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -2327,7 +2328,7 @@ def test_a_hundred_thousand_names_are_refused_before_the_loop_can_notice() -> No
     names = tuple(f"u14multi__{i % 2}__{i}__20260920T1839Z" for i in range(100_000))
     started = time.perf_counter()
     assert PinotEngine._metadata_batches("u14multi", {"columns": ["pk"]}, {"s": names}) is None
-    assert time.perf_counter() - started < 0.5
+    assert time.perf_counter() - started < cpu_seconds(0.5)
 
 
 @pytest.mark.parametrize(
