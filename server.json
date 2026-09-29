@@ -3,7 +3,7 @@
   "name": "io.github.lagaam-ai/lagaam",
   "title": "Lagaam",
   "description": "Stops an agent's Trino or Pinot query before it runs if it costs too much or reads outside its grant",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "repository": {
     "url": "https://github.com/lagaam-ai/lagaam",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "pypi",
       "identifier": "lagaam",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "transport": {
         "type": "stdio"
       },
