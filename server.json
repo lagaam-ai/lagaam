@@ -1,0 +1,120 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.lagaam-ai/lagaam",
+  "title": "Lagaam",
+  "description": "Stops an agent's Trino or Pinot query before it runs if it costs too much or reads outside its grant",
+  "version": "0.2.3",
+  "repository": {
+    "url": "https://github.com/lagaam-ai/lagaam",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/lagaam-ai/lagaam",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "lagaam",
+      "version": "0.2.3",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "LAGAAM_ALLOWED_TABLES",
+          "description": "Comma list of catalog.schema.table grants; the server will not start without it",
+          "isRequired": true
+        },
+        {
+          "name": "LAGAAM_ALLOW_ALL_TABLES",
+          "description": "true to run with no grant at all: an explicit opt-out, off by default",
+          "format": "boolean"
+        },
+        {
+          "name": "LAGAAM_ENGINE",
+          "description": "Which adapter to run",
+          "choices": ["trino", "pinot"],
+          "default": "trino"
+        },
+        {
+          "name": "TRINO_HOST",
+          "description": "Trino coordinator host",
+          "default": "localhost"
+        },
+        {
+          "name": "TRINO_PORT",
+          "description": "Trino coordinator port",
+          "format": "number",
+          "default": "8080"
+        },
+        {
+          "name": "TRINO_USER",
+          "description": "Trino user",
+          "default": "lagaam"
+        },
+        {
+          "name": "PINOT_CONTROLLER_URL",
+          "description": "Pinot controller URL",
+          "default": "http://localhost:9000"
+        },
+        {
+          "name": "PINOT_BROKER_URL",
+          "description": "Pinot broker URL",
+          "default": "http://localhost:8000"
+        },
+        {
+          "name": "PINOT_USER",
+          "description": "Pinot user; unset means no auth"
+        },
+        {
+          "name": "PINOT_PASSWORD",
+          "description": "Pinot password; unset means no auth",
+          "isSecret": true
+        },
+        {
+          "name": "LAGAAM_AGENT_NAME",
+          "description": "Identity stamped on the audit trail",
+          "default": "anonymous"
+        },
+        {
+          "name": "LAGAAM_MAX_SCAN_BYTES",
+          "description": "Scan-bytes budget per query, checked before it runs (default 50 GiB)",
+          "format": "number",
+          "default": "53687091200"
+        },
+        {
+          "name": "LAGAAM_MAX_ROWS",
+          "description": "Scanned-row estimate budget per query; unset means ungated",
+          "format": "number"
+        },
+        {
+          "name": "LAGAAM_MAX_INTERMEDIATE_ROWS",
+          "description": "Rows the engine would build at its widest step, not rows returned, so a LIMIT doesn't lower it",
+          "format": "number",
+          "default": "50000000"
+        },
+        {
+          "name": "LAGAAM_MAX_RETURNED_ROWS",
+          "description": "Rows returned to the agent per query, capped at 100000; a bigger LIMIT in the query is lowered to it",
+          "format": "number",
+          "default": "1000"
+        },
+        {
+          "name": "LAGAAM_QUERY_TIMEOUT",
+          "description": "Wall-clock seconds per query",
+          "format": "number",
+          "default": "300"
+        },
+        {
+          "name": "LAGAAM_METADATA_TTL",
+          "description": "Metadata cache TTL, seconds",
+          "format": "number",
+          "default": "300"
+        },
+        {
+          "name": "LAGAAM_AUDIT_LOG",
+          "description": "Audit JSONL file path; unset means stderr",
+          "format": "filepath"
+        }
+      ]
+    }
+  ]
+}

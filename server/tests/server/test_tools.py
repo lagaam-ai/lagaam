@@ -4,6 +4,8 @@ The contract under test is what an *agent* sees: tool names, structured
 content shapes, and error text it can self-correct on.
 """
 
+from importlib.metadata import version
+
 from lagaam.core.errors import EngineError
 from lagaam.core.models import (
     CatalogMetadata,
@@ -100,3 +102,10 @@ async def test_every_tool_translates_domain_errors_not_stack_traces() -> None:
             assert "connection refused" in text
             assert "retry" in text, "EngineError must tell the agent what to do"
             assert "Traceback" not in text
+
+
+async def test_the_handshake_names_lagaam_and_its_own_version() -> None:
+    # Registries and clients read serverInfo; the SDK's own version is not ours.
+    async with lagaam_client(FakeQueryEngine()) as client:
+        info = (await client.initialize()).serverInfo
+    assert (info.name, info.version) == ("lagaam", version("lagaam"))

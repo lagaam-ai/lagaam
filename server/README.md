@@ -52,3 +52,5 @@ that has to be asked for — set `LAGAAM_ALLOW_ALL_TABLES=true` if you mean it.
 Every budget and setting: [Configuration](https://github.com/lagaam-ai/lagaam#configuration).
 
 Full docs: [github.com/lagaam-ai/lagaam](https://github.com/lagaam-ai/lagaam)
+
+<!-- mcp-name: io.github.lagaam-ai/lagaam -->

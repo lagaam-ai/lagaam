@@ -1,7 +1,7 @@
 """Shared test plumbing.
 
-The only place that touches FastMCP internals (server._mcp_server) — if the
-SDK renames it, fix it here once.
+With lagaam.server's version stamp, the only places that touch FastMCP
+internals (server._mcp_server) — if the SDK renames it, fix both.
 """
 
 from contextlib import asynccontextmanager
