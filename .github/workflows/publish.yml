@@ -23,11 +23,15 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
         run: |
           uv run --no-project python - <<'PY'
-          import os, sys, tomllib
+          import json, os, sys, tomllib
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
           tag = os.environ["TAG"]
           if tag != f"v{version}":
               sys.exit(f"release tag {tag!r} does not match pyproject version v{version}")
+          listing = json.load(open("../server.json"))
+          listed = {listing["version"], listing["packages"][0]["version"]}
+          if listed != {version}:
+              sys.exit(f"server.json lists {sorted(listed)}, pyproject says {version}")
           PY
       - run: uv build
         working-directory: server
@@ -60,3 +64,31 @@ jobs:
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
+
+  registry:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      PYPI_TRIES: "30"
+      MCP_PUBLISHER_SHA256: a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc
+    steps:
+      - uses: actions/checkout@v7
+      - name: Wait for PyPI to serve this version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("server/pyproject.toml", "rb"))["project"]["version"])')
+          for _ in $(seq "$PYPI_TRIES"); do
+            if curl -fsS -o /dev/null "https://pypi.org/pypi/lagaam/$version/json"; then exit 0; fi
+            sleep 10
+          done
+          echo "PyPI never served lagaam $version; the registry would reject the listing" >&2
+          exit 1
+      - name: Install mcp-publisher 1.8.1
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          echo "$MCP_PUBLISHER_SHA256  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+      - run: ./mcp-publisher login github-oidc
+      - run: ./mcp-publisher publish
