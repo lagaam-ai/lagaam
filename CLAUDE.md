@@ -61,7 +61,7 @@ Two halves:
 - Inline comments: one line max, only for constraints the code can't show.
 - Type hints everywhere; mypy clean on core/.
 - Every feature framed as developer pain relief in user-facing text
-  ("stop your agent from running $500 queries"), never "governance/compliance".
+  ("one agent query shouldn't stall everyone's Trino"), never "governance/compliance".
   Reason: OSS is adopted for convenience, bought for governance. README and
   docs must speak developer-pain language.
 

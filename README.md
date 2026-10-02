@@ -1,10 +1,12 @@
 ![Lagaam — every query priced before it runs](docs/banner.png)
 
-**Stop your agent from running the $500 query.** Lagaam is a governed MCP
-server that sits between your AI agents and your lakehouse (Trino and
-Apache Pinot). Every query is schema-grounded, priced *before* it runs,
-checked against a budget, and audited — and every rejection tells the agent
-exactly how to fix its SQL.
+**One agent query shouldn't stall everyone's Trino.** On a shared cluster, a
+missing partition filter or an accidental cross join doesn't cost you a bill —
+it costs everyone else their queries. Lagaam is an MCP server that sits
+between your AI agents and your lakehouse (Trino and Apache Pinot): every
+query is schema-grounded, priced from the engine's own plan *before* it runs,
+checked against a budget, and audited — and the bad one is refused before it
+runs, with a fix the agent can act on.
 
 ![Lagaam demo: SELECT * rejected, an oversized join blocked pre-execution, a scoped query running](docs/demo.gif)
 
@@ -18,11 +20,12 @@ with `uv run --project server python examples/demo_pinot.py`.*
 
 ## The problem
 
-Agents write syntactically-valid, catastrophic SQL. A missing partition
-filter turns into a full scan over a petabyte table; one retry loop burns a
-day's warehouse budget in minutes; a `SELECT *` drags 40 columns into a
-context window that needed 2. The usual fix is to not give agents database
-access at all.
+Agents write syntactically-valid, catastrophic SQL, and on a shared cluster
+the damage isn't theirs alone. A missing partition filter turns into a full
+scan that ties up every worker; an accidental cross join fills worker memory
+while everyone else's queries wait behind it; a retry loop runs it again. A
+`SELECT *` drags 40 columns into a context window that needed 2. The usual
+fix is to not give agents database access at all.
 
 Lagaam gives them access with reins on:
 
@@ -46,6 +49,29 @@ Lagaam gives them access with reins on:
   a silently misleading answer.
 - **Every call is audited.** One JSONL line per tool call: who, what,
   allowed or denied, and why.
+
+## Doesn't Trino already limit this?
+
+It limits a query once it is running. Lagaam refuses it before it starts.
+Keep both.
+
+| | Acts | What the agent sees | Catches a cross join that reads little |
+|---|---|---|---|
+| [`query.max-scan-physical-bytes`](https://trino.io/docs/current/admin/properties-query-management.html) | during execution: terminated once the bytes are scanned | a query failure | no — it counts bytes read, not rows built |
+| [`query.max-execution-time`](https://trino.io/docs/current/admin/properties-query-management.html) | during execution: terminated after the time is spent | a query failure | only after it has held the cluster that long |
+| [Resource groups](https://trino.io/docs/current/admin/resource-groups.html) (`hardPhysicalDataScanLimit`, `softMemoryLimit`, …) | on the *next* query: new queries queue once the group is over its share | its later queries wait | no — the running query continues |
+| Lagaam | before execution, from `EXPLAIN` | a refusal with the number and the fix | yes — it prices the rows the widest step would build |
+
+Measured on Trino 476: `SELECT o.orderkey, l.partkey FROM tpch.tiny.orders o
+CROSS JOIN tpch.tiny.lineitem l LIMIT 10` reads 676,575 bytes by Trino's own
+plan — any scan cap above 0.7 MB lets it run — and would build 902,625,000
+rows. Lagaam refuses it before it runs: *"This query would build 902,625,000
+rows at its widest step, over your budget of 50,000,000 … a LIMIT will not
+help — join on a column with more distinct values, or filter each side
+before the join."*
+
+Resource groups stay your backstop for everything that does reach the
+cluster; Lagaam is the gate in front of it for agent traffic.
 
 ## Catch rate
 
@@ -132,7 +158,7 @@ statistics: a table without stats cannot be priced, so its queries are refused
 rather than guessed at. Run `ANALYZE` on your tables before pointing an agent
 at them — a connector that has no statistics at all is effectively unusable
 through the gate. That is deliberate: a query nobody can size is exactly the
-kind that runs for $500.
+kind that stalls a shared cluster.
 
 ## How it works
 
