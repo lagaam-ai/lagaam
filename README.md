@@ -136,6 +136,25 @@ Wire it into any MCP client (Claude Code, Claude Desktop, or your own agent):
 }
 ```
 
+In Claude Code, install it as a plugin instead:
+
+```
+/plugin marketplace add lagaam-ai/lagaam
+/plugin install lagaam@lagaam
+```
+
+It asks for the tables to allow (`LAGAAM_ALLOWED_TABLES`) and your Trino
+host, port and user (`localhost` / `8080` / `lagaam` if you leave them).
+From a shell, pass them as flags:
+
+```bash
+claude plugin marketplace add lagaam-ai/lagaam
+claude plugin install lagaam@lagaam \
+  --config allowed_tables=hive.sales.orders --config trino_host=trino.internal
+```
+
+Other `LAGAAM_*` settings are read from the environment you start `claude` in.
+
 The agent gets three tools — `list_catalogs`, `describe_table`,
 `query_data` — and cannot reach the engine any other way.
 

@@ -1,0 +1,42 @@
+{
+  "name": "lagaam",
+  "displayName": "Lagaam",
+  "version": "0.2.4",
+  "description": "Trino MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow",
+  "author": {
+    "name": "Mudit Kapoor",
+    "url": "https://github.com/lagaam-ai"
+  },
+  "homepage": "https://github.com/lagaam-ai/lagaam",
+  "repository": "https://github.com/lagaam-ai/lagaam",
+  "license": "Apache-2.0",
+  "keywords": ["trino", "sql", "mcp", "agents", "cost-guard", "lakehouse"],
+  "userConfig": {
+    "allowed_tables": {
+      "type": "string",
+      "title": "Allowed tables",
+      "description": "Comma list of catalog.schema.table names the agent may read, for example hive.sales.orders,hive.sales.customers. The server won't start without it",
+      "required": true
+    },
+    "trino_host": {
+      "type": "string",
+      "title": "Trino host",
+      "description": "Trino coordinator host",
+      "default": "localhost"
+    },
+    "trino_port": {
+      "type": "number",
+      "title": "Trino port",
+      "description": "Trino coordinator port",
+      "default": 8080,
+      "min": 1,
+      "max": 65535
+    },
+    "trino_user": {
+      "type": "string",
+      "title": "Trino user",
+      "description": "User Lagaam connects to Trino as",
+      "default": "lagaam"
+    }
+  }
+}
