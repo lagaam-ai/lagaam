@@ -32,6 +32,14 @@ Wire it into any MCP client (Claude Code, Claude Desktop, or your own agent):
 }
 ```
 
+In Claude Code, install it as a plugin instead — it asks for the tables to
+allow and your Trino host:
+
+```
+/plugin marketplace add lagaam-ai/lagaam
+/plugin install lagaam@lagaam
+```
+
 The agent gets three tools — `list_catalogs`, `describe_table`,
 `query_data` — and cannot reach the engine any other way.
 
