@@ -56,6 +56,10 @@ Two halves:
 - Tests required for core/ logic (pytest). Adapters get integration tests
   against dockerized engines — `tests/integration/` needs docker, and the
   default pytest run deselects it.
+- A version bump edits `server/pyproject.toml`, `server/uv.lock`,
+  `server.json`, the README status line, and `plugins/lagaam/` (plugin.json
+  `version` and the `uvx lagaam@X` pin in .mcp.json). Tests catch a lagging
+  server.json or plugin; nothing checks the README.
 - Conventional commits (feat:, fix:, docs:, chore:), atomic: one logical
   change + its tests per commit. Changes land via PR, never direct to main.
 - Inline comments: one line max, only for constraints the code can't show.
