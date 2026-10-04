@@ -73,6 +73,18 @@ before the join."*
 Resource groups stay your backstop for everything that does reach the
 cluster; Lagaam is the gate in front of it for agent traffic.
 
+## What about other database MCP servers?
+
+They're good servers that do a different job: keep the agent read-only and
+bound what comes back. Lagaam does that too, and also prices the query first.
+
+| | Read-only | Row cap | Timeout | Checks the plan before running |
+|---|---|---|---|---|
+| [tuannvm/mcp-trino](https://github.com/tuannvm/mcp-trino) | on by default | results truncated while fetching (`TRINO_MAX_ROWS`) | during execution (`TRINO_QUERY_TIMEOUT`) | no — `explain_query` shows the agent a plan; it doesn't gate `execute_query` |
+| [startreedata/mcp-pinot](https://github.com/startreedata/mcp-pinot) | always on, parsed before execution | `LIMIT` rewritten before execution, paged results | during execution (`PINOT_QUERY_TIMEOUT`, 60 s) | no |
+| [bytebase/dbhub](https://github.com/bytebase/dbhub) | opt-in (`readonly`): keyword check plus the database's own read-only transaction | opt-in (`max_rows`), injected as `LIMIT`/`TOP` | opt-in (`query_timeout`), during execution | no — opt-in `explain_sql` shows a plan; it doesn't gate `execute_sql` |
+| Lagaam | always on, parsed before execution | 1,000 by default; a bigger `LIMIT` is lowered before it runs | during execution (`LAGAAM_QUERY_TIMEOUT`, 300 s) | yes — scan bytes and widest-step rows from `EXPLAIN`; over budget is refused |
+
 ## Catch rate
 
 11 queries an LLM agent plausibly writes — full scans, `SELECT *`, DDL,
