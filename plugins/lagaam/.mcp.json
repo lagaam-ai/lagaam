@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "lagaam": {
+      "command": "uvx",
+      "args": ["lagaam@0.2.4"],
+      "env": {
+        "LAGAAM_ALLOWED_TABLES": "${user_config.allowed_tables}",
+        "TRINO_HOST": "${user_config.trino_host}",
+        "TRINO_PORT": "${user_config.trino_port}",
+        "TRINO_USER": "${user_config.trino_user}"
+      }
+    }
+  }
+}
