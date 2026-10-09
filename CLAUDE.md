@@ -60,6 +60,11 @@ Two halves:
   `server.json`, the README status line, and `plugins/lagaam/` (plugin.json
   `version` and the `uvx lagaam@X` pin in .mcp.json). Tests catch a lagging
   server.json or plugin; nothing checks the README.
+- A change under `plugins/lagaam/` reaches new installs on merge, but an
+  existing install keeps its cached copy until plugin.json's `version`
+  changes, so plugin changes reach current users with the next release bump.
+- Merge a bump PR only when the release and its `pypi` approval follow at
+  once: until PyPI has the new version, the plugin's `uvx lagaam@X` pin fails.
 - Conventional commits (feat:, fix:, docs:, chore:), atomic: one logical
   change + its tests per commit. Changes land via PR, never direct to main.
 - Inline comments: one line max, only for constraints the code can't show.
