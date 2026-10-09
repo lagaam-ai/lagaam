@@ -14,6 +14,7 @@ from lagaam.core.models import (
     QueryResult,
     TableSchema,
 )
+from lagaam.server import _DEFAULT_ROW_CAP
 from tests.fakes import FakeQueryEngine
 from tests.helpers import lagaam_client
 
@@ -74,6 +75,22 @@ async def test_every_tool_parameter_is_described_in_the_input_schema() -> None:
     assert {name for _, name in params} == {"catalog", "schema", "table", "sql"}
     for (tool_name, name), spec in params.items():
         assert spec.get("description", "").strip(), f"{tool_name}.{name}"
+
+
+async def test_describe_table_discloses_it_is_read_only_and_grant_checked() -> None:
+    async with lagaam_client(FakeQueryEngine()) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    description = (tools["describe_table"].description or "").lower()
+    assert "read-only" in description
+    assert "grant" in description
+
+
+async def test_query_data_states_the_default_row_cap_and_the_grant() -> None:
+    async with lagaam_client(FakeQueryEngine()) as client:
+        tools = {t.name: t for t in (await client.list_tools()).tools}
+    description = tools["query_data"].description or ""
+    assert f"{_DEFAULT_ROW_CAP:,}" in description
+    assert "grant" in description.lower()
 
 
 async def test_list_catalogs_returns_structured_catalog_tree() -> None:

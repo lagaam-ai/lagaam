@@ -167,10 +167,17 @@ def create_server(
     async def describe_table(
         catalog: _Catalog, schema: _Schema, table: _Table
     ) -> TableSchema:
-        """Get the exact columns and types of one table.
+        """Get the exact columns and types of one table. Read-only.
 
         Always describe a table before querying it; column names you have
-        not seen here are guesses.
+        not seen here are guesses. It reads the engine's metadata and
+        statistics, never the table's rows. A table outside your grant is
+        refused before the engine is asked; a missing one errors with a
+        pointer to list_catalogs. Answers are cached, 5 minutes by default,
+        so a new column can lag. row_estimate is the engine's row-count
+        statistic, null when it has none or can't be trusted (views, tables
+        without stats, Pinot tables with a realtime part). Column comments
+        are null when unset, and always on Pinot.
         """
         _require_table_allowed(catalog, schema, table)
         return await engine.describe_table(catalog, schema, table)
@@ -183,8 +190,11 @@ def create_server(
         Write a single SELECT in the engine's dialect. The query is checked
         for safety, priced against your budget, and executed with a row cap —
         so name the columns you need (no SELECT *), and add WHERE filters to
-        keep the scan small. If it is rejected, the message says what to fix.
-        Describe the tables first so column and table names are exact.
+        keep the scan small. At most 1,000 rows come back by default (a
+        larger LIMIT is lowered to the cap), and `truncated` marks a result
+        the cap cut off. A query that touches any table outside your grant
+        is refused before it runs. If it is rejected, the message says what
+        to fix. Describe the tables first so column and table names are exact.
         """
         # validate (U3) -> allowlist (U7) -> estimate (U4) -> budget (U5) ->
         # execute. Inject cap +1 so execute can flag truncation; it returns
