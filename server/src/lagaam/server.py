@@ -9,10 +9,12 @@ import inspect
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from importlib.metadata import version
-from typing import Any, TypeVar
+from typing import Annotated, Any, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from lagaam.core.allowlist import (
     check_tables_allowed,
@@ -42,6 +44,32 @@ _RECOVERY_HINTS: dict[type[LagaamError], str] = {
         "you have access to, then retry with an exact name."
     ),
 }
+
+# No tool writes, and none can reach past the engine configured at startup.
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+
+_Catalog = Annotated[
+    str,
+    Field(
+        description="Catalog name as list_catalogs shows it. "
+        "On Pinot it is always `pinot`."
+    ),
+]
+_Schema = Annotated[
+    str,
+    Field(
+        description="Schema name as list_catalogs shows it. "
+        "On Pinot a schema is a Pinot database, such as `default`."
+    ),
+]
+_Table = Annotated[str, Field(description="Table name as list_catalogs shows it.")]
+_Sql = Annotated[
+    str,
+    Field(
+        description="One SELECT in the engine's dialect, naming each table "
+        "as catalog.schema.table and each column it needs."
+    ),
+]
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
@@ -124,7 +152,7 @@ def create_server(
     # FastMCP 1.x takes no version, so the handshake would report the SDK's own.
     mcp._mcp_server.version = version("lagaam")
 
-    @mcp.tool()
+    @mcp.tool(title="List catalogs", annotations=_READ_ONLY)
     @_instrumented("list_catalogs", identity, audit)
     async def list_catalogs() -> CatalogMetadata:
         """List every catalog, schema, and table you are allowed to query.
@@ -134,9 +162,11 @@ def create_server(
         """
         return filter_catalog_metadata(await engine.list_catalogs(), identity)
 
-    @mcp.tool()
+    @mcp.tool(title="Describe table", annotations=_READ_ONLY)
     @_instrumented("describe_table", identity, audit)
-    async def describe_table(catalog: str, schema: str, table: str) -> TableSchema:
+    async def describe_table(
+        catalog: _Catalog, schema: _Schema, table: _Table
+    ) -> TableSchema:
         """Get the exact columns and types of one table.
 
         Always describe a table before querying it; column names you have
@@ -145,9 +175,9 @@ def create_server(
         _require_table_allowed(catalog, schema, table)
         return await engine.describe_table(catalog, schema, table)
 
-    @mcp.tool()
+    @mcp.tool(title="Query data", annotations=_READ_ONLY)
     @_instrumented("query_data", identity, audit)
-    async def query_data(sql: str) -> QueryResult:
+    async def query_data(sql: _Sql) -> QueryResult:
         """Run a read-only SELECT and get the rows back.
 
         Write a single SELECT in the engine's dialect. The query is checked

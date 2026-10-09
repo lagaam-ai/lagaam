@@ -53,6 +53,29 @@ async def test_server_exposes_the_expected_tools() -> None:
             assert tool.description, f"{tool.name} needs an agent-facing description"
 
 
+async def test_every_tool_is_annotated_read_only_with_a_title() -> None:
+    # Clients read the hint to decide what needs a confirmation prompt.
+    async with lagaam_client(FakeQueryEngine()) as client:
+        tools = (await client.list_tools()).tools
+    for tool in tools:
+        assert tool.title, f"{tool.name} needs a human-readable title"
+        assert tool.annotations is not None, f"{tool.name} has no annotations"
+        assert tool.annotations.readOnlyHint is True, tool.name
+
+
+async def test_every_tool_parameter_is_described_in_the_input_schema() -> None:
+    async with lagaam_client(FakeQueryEngine()) as client:
+        tools = (await client.list_tools()).tools
+    params = {
+        (tool.name, name): spec
+        for tool in tools
+        for name, spec in tool.inputSchema["properties"].items()
+    }
+    assert {name for _, name in params} == {"catalog", "schema", "table", "sql"}
+    for (tool_name, name), spec in params.items():
+        assert spec.get("description", "").strip(), f"{tool_name}.{name}"
+
+
 async def test_list_catalogs_returns_structured_catalog_tree() -> None:
     async with lagaam_client(FakeQueryEngine()) as client:
         result = await client.call_tool("list_catalogs", {})
