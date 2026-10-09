@@ -153,7 +153,18 @@ claude plugin install lagaam@lagaam \
   --config allowed_tables=hive.sales.orders --config trino_host=trino.internal
 ```
 
-Other `LAGAAM_*` settings are read from the environment you start `claude` in.
+On Pinot, pick `engine=pinot` and set the controller and broker URLs
+(`http://localhost:9000` / `http://localhost:8000` if you leave them):
+
+```bash
+claude plugin install lagaam@lagaam --config engine=pinot \
+  --config allowed_tables=pinot.default.baseballStats \
+  --config pinot_controller_url=http://pinot.internal:9000 \
+  --config pinot_broker_url=http://pinot.internal:8099
+```
+
+Other `LAGAAM_*` settings, and `PINOT_USER` / `PINOT_PASSWORD` for a Pinot
+with auth, are read from the environment you start `claude` in.
 
 The agent gets three tools — `list_catalogs`, `describe_table`,
 `query_data` — and cannot reach the engine any other way.

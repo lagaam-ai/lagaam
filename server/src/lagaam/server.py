@@ -9,10 +9,12 @@ import inspect
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from importlib.metadata import version
-from typing import Any, TypeVar
+from typing import Annotated, Any, TypeVar
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import Field
 
 from lagaam.core.allowlist import (
     check_tables_allowed,
@@ -42,6 +44,32 @@ _RECOVERY_HINTS: dict[type[LagaamError], str] = {
         "you have access to, then retry with an exact name."
     ),
 }
+
+# No tool writes, and none can reach past the engine configured at startup.
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+
+_Catalog = Annotated[
+    str,
+    Field(
+        description="Catalog name as list_catalogs shows it. "
+        "On Pinot it is always `pinot`."
+    ),
+]
+_Schema = Annotated[
+    str,
+    Field(
+        description="Schema name as list_catalogs shows it. "
+        "On Pinot a schema is a Pinot database, such as `default`."
+    ),
+]
+_Table = Annotated[str, Field(description="Table name as list_catalogs shows it.")]
+_Sql = Annotated[
+    str,
+    Field(
+        description="One SELECT in the engine's dialect, naming each table "
+        "as catalog.schema.table and each column it needs."
+    ),
+]
 
 F = TypeVar("F", bound=Callable[..., Awaitable[Any]])
 
@@ -124,7 +152,7 @@ def create_server(
     # FastMCP 1.x takes no version, so the handshake would report the SDK's own.
     mcp._mcp_server.version = version("lagaam")
 
-    @mcp.tool()
+    @mcp.tool(title="List catalogs", annotations=_READ_ONLY)
     @_instrumented("list_catalogs", identity, audit)
     async def list_catalogs() -> CatalogMetadata:
         """List every catalog, schema, and table you are allowed to query.
@@ -134,27 +162,39 @@ def create_server(
         """
         return filter_catalog_metadata(await engine.list_catalogs(), identity)
 
-    @mcp.tool()
+    @mcp.tool(title="Describe table", annotations=_READ_ONLY)
     @_instrumented("describe_table", identity, audit)
-    async def describe_table(catalog: str, schema: str, table: str) -> TableSchema:
-        """Get the exact columns and types of one table.
+    async def describe_table(
+        catalog: _Catalog, schema: _Schema, table: _Table
+    ) -> TableSchema:
+        """Get the exact columns and types of one table. Read-only.
 
         Always describe a table before querying it; column names you have
-        not seen here are guesses.
+        not seen here are guesses. It reads the engine's metadata and
+        statistics, never the table's rows. A table outside your grant is
+        refused before the engine is asked; a missing one errors with a
+        pointer to list_catalogs. Answers are cached, 5 minutes by default,
+        so a new column can lag. row_estimate is the engine's row-count
+        statistic, null when it has none or can't be trusted (views, tables
+        without stats, Pinot tables with a realtime part). Column comments
+        are null when unset, and always on Pinot.
         """
         _require_table_allowed(catalog, schema, table)
         return await engine.describe_table(catalog, schema, table)
 
-    @mcp.tool()
+    @mcp.tool(title="Query data", annotations=_READ_ONLY)
     @_instrumented("query_data", identity, audit)
-    async def query_data(sql: str) -> QueryResult:
+    async def query_data(sql: _Sql) -> QueryResult:
         """Run a read-only SELECT and get the rows back.
 
         Write a single SELECT in the engine's dialect. The query is checked
         for safety, priced against your budget, and executed with a row cap —
         so name the columns you need (no SELECT *), and add WHERE filters to
-        keep the scan small. If it is rejected, the message says what to fix.
-        Describe the tables first so column and table names are exact.
+        keep the scan small. At most 1,000 rows come back by default (a
+        larger LIMIT is lowered to the cap), and `truncated` marks a result
+        the cap cut off. A query that touches any table outside your grant
+        is refused before it runs. If it is rejected, the message says what
+        to fix. Describe the tables first so column and table names are exact.
         """
         # validate (U3) -> allowlist (U7) -> estimate (U4) -> budget (U5) ->
         # execute. Inject cap +1 so execute can flag truncation; it returns

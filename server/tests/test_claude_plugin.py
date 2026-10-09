@@ -66,3 +66,51 @@ def test_every_user_config_reference_is_declared() -> None:
 
     assert referenced
     assert set(referenced) <= set(_manifest()["userConfig"])
+
+
+def _registry_env() -> dict[str, dict[str, Any]]:
+    listing = _json(_ROOT / "server.json")
+    return {v["name"]: v for v in listing["packages"][0]["environmentVariables"]}
+
+
+def _env_from_options() -> dict[str, str]:
+    """Env var -> the userConfig option that is its whole value."""
+    options: dict[str, str] = {}
+    for name, value in _server()["env"].items():
+        match = re.fullmatch(r"\$\{user_config\.(\w+)\}", value)
+        if match:
+            options[name] = match.group(1)
+    return options
+
+
+def test_plugin_can_run_the_pinot_adapter() -> None:
+    wired = set(_env_from_options())
+
+    assert {"LAGAAM_ENGINE", "PINOT_CONTROLLER_URL", "PINOT_BROKER_URL"} <= wired
+
+
+def test_every_user_config_default_is_the_registry_default() -> None:
+    # Accepting the plugin's defaults must start the server a registry user gets.
+    options = _manifest()["userConfig"]
+    registry = _registry_env()
+
+    for env_var, key in _env_from_options().items():
+        option = options[key]
+        default = str(option["default"]) if "default" in option else None
+        assert default == registry[env_var].get("default"), env_var
+
+
+def test_engine_field_names_every_registry_choice() -> None:
+    # Free text: `options` would stop Claude Code before 2.1.271 loading the plugin.
+    engine = _manifest()["userConfig"][_env_from_options()["LAGAAM_ENGINE"]]
+
+    assert "options" not in engine
+    for choice in _registry_env()["LAGAAM_ENGINE"]["choices"]:
+        assert choice in engine["description"].split(), choice
+
+
+def test_marketplace_entry_describes_the_plugin_as_its_manifest_does() -> None:
+    # /plugin shows the entry's description over plugin.json's.
+    [entry] = _json(_ROOT / ".claude-plugin" / "marketplace.json")["plugins"]
+
+    assert entry["description"] == _manifest()["description"]

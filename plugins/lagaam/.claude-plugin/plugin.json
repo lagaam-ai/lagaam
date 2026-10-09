@@ -2,7 +2,7 @@
   "name": "lagaam",
   "displayName": "Lagaam",
   "version": "0.2.4",
-  "description": "Trino MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow",
+  "description": "Trino and Pinot MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow",
   "author": {
     "name": "Mudit Kapoor",
     "url": "https://github.com/lagaam-ai"
@@ -10,13 +10,19 @@
   "homepage": "https://github.com/lagaam-ai/lagaam",
   "repository": "https://github.com/lagaam-ai/lagaam",
   "license": "Apache-2.0",
-  "keywords": ["trino", "sql", "mcp", "agents", "cost-guard", "lakehouse"],
+  "keywords": ["trino", "pinot", "sql", "mcp", "agents", "cost-guard", "lakehouse"],
   "userConfig": {
     "allowed_tables": {
       "type": "string",
       "title": "Allowed tables",
-      "description": "Comma list of catalog.schema.table names the agent may read, for example hive.sales.orders,hive.sales.customers. The server won't start without it",
+      "description": "Comma list of catalog.schema.table names the agent may read, for example hive.sales.orders,hive.sales.customers (on Pinot, pinot.default.events). The server won't start without it",
       "required": true
+    },
+    "engine": {
+      "type": "string",
+      "title": "Engine",
+      "description": "Which engine Lagaam connects to: trino or pinot",
+      "default": "trino"
     },
     "trino_host": {
       "type": "string",
@@ -37,6 +43,18 @@
       "title": "Trino user",
       "description": "User Lagaam connects to Trino as",
       "default": "lagaam"
+    },
+    "pinot_controller_url": {
+      "type": "string",
+      "title": "Pinot controller URL",
+      "description": "Pinot controller URL, used when engine is pinot",
+      "default": "http://localhost:9000"
+    },
+    "pinot_broker_url": {
+      "type": "string",
+      "title": "Pinot broker URL",
+      "description": "Pinot broker URL, used when engine is pinot",
+      "default": "http://localhost:8000"
     }
   }
 }

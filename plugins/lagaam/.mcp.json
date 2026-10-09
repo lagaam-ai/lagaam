@@ -5,9 +5,12 @@
       "args": ["lagaam@0.2.4"],
       "env": {
         "LAGAAM_ALLOWED_TABLES": "${user_config.allowed_tables}",
+        "LAGAAM_ENGINE": "${user_config.engine}",
         "TRINO_HOST": "${user_config.trino_host}",
         "TRINO_PORT": "${user_config.trino_port}",
-        "TRINO_USER": "${user_config.trino_user}"
+        "TRINO_USER": "${user_config.trino_user}",
+        "PINOT_CONTROLLER_URL": "${user_config.pinot_controller_url}",
+        "PINOT_BROKER_URL": "${user_config.pinot_broker_url}"
       }
     }
   }
