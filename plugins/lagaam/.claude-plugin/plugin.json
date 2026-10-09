@@ -1,7 +1,7 @@
 {
   "name": "lagaam",
   "displayName": "Lagaam",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Trino and Pinot MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow",
   "author": {
     "name": "Mudit Kapoor",

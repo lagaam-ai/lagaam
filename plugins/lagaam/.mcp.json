@@ -2,7 +2,7 @@
   "mcpServers": {
     "lagaam": {
       "command": "uvx",
-      "args": ["lagaam@0.2.4"],
+      "args": ["lagaam@0.2.5"],
       "env": {
         "LAGAAM_ALLOWED_TABLES": "${user_config.allowed_tables}",
         "LAGAAM_ENGINE": "${user_config.engine}",

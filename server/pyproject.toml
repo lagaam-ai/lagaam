@@ -1,6 +1,6 @@
 [project]
 name = "lagaam"
-version = "0.2.4"
+version = "0.2.5"
 description = "Lagaam — governed MCP analytics server for the open lakehouse"
 readme = "README.md"
 license = "Apache-2.0"
