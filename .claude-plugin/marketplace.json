@@ -1,6 +1,6 @@
 {
   "name": "lagaam",
-  "description": "Lagaam for Claude Code: refuses an agent's Trino query before it runs if it costs too much or reads outside its grant",
+  "description": "Lagaam for Claude Code: refuses an agent's Trino or Pinot query before it runs if it costs too much or reads outside its grant",
   "owner": {
     "name": "lagaam-ai",
     "url": "https://github.com/lagaam-ai"
@@ -9,7 +9,7 @@
     {
       "name": "lagaam",
       "source": "./plugins/lagaam",
-      "description": "Trino MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow"
+      "description": "Trino and Pinot MCP server that prices each query from EXPLAIN and refuses it before it runs if it's over budget or outside the tables you allow"
     }
   ]
 }

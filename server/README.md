@@ -40,6 +40,15 @@ allow and your Trino host:
 /plugin install lagaam@lagaam
 ```
 
+On Pinot, pick `engine=pinot` and set the controller and broker URLs:
+
+```bash
+claude plugin install lagaam@lagaam --config engine=pinot \
+  --config allowed_tables=pinot.default.baseballStats \
+  --config pinot_controller_url=http://pinot.internal:9000 \
+  --config pinot_broker_url=http://pinot.internal:8099
+```
+
 The agent gets three tools — `list_catalogs`, `describe_table`,
 `query_data` — and cannot reach the engine any other way.
 
