@@ -27,6 +27,8 @@ One unit at a time; each unit ends in something demoable or a failing test.
   "agent answers on data that landed 2 seconds ago") — **done** (U9-U12,
   ADR 0008/0009), and the signature demo GIF with it — **done** (U13,
   `examples/demo_pinot.py` → `docs/demo-pinot.gif`)
+- Post-execution actuals on the audit line: the quote next to what the
+  engine read (ADR 0012) — **done**
 - Operator v0: Agent CRD + reconcile → pod + identity + limits ConfigMap
 - LiteLLM proxy wiring: token/dollar meter per agent
 - `kubectl get agents` demo GIF

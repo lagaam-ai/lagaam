@@ -73,6 +73,15 @@ class QueryEngine(Protocol):
 5. Verify → sanity checks on result shape; optional self-correction loop
 6. Audit log → agent identity, SQL, cost estimate vs actual, timestamp
 
+A `query_data` audit line carries `estimate` (the quote) next to `actuals`,
+what the engine reported after the run: `rows_scanned` (Trino
+`processedRows`, Pinot `numDocsScanned`), `bytes_scanned` (Trino
+`processedBytes`; always null on Pinot, which reports no bytes),
+`elapsed_ms`, `partial` (Trino was still running after a capped fetch, so
+the counts are a floor) and `engine_counters` under the engine's own names.
+`actuals` is null when the engine reported nothing and absent when the
+query never ran. It never reaches the agent or the budget gate (ADR 0012).
+
 Engine errors at step 4 come back with a hint naming what to change:
 `NOT_SUPPORTED` and `FUNCTION_NOT_FOUND` tell the agent which construct or
 function to rewrite, instead of inviting it to retry the identical query.
