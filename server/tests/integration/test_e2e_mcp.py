@@ -1,9 +1,13 @@
 """End to end: MCP protocol -> Lagaam server -> an adapter -> a real engine."""
 
+import json
+from typing import Any
+
 import pytest
 
 from lagaam.adapters.pinot.engine import PinotEngine
 from lagaam.adapters.trino.engine import TrinoEngine
+from lagaam.core.audit import AuditLog
 from lagaam.core.budget import (
     DEFAULT_MAX_INTERMEDIATE_ROWS,
     DEFAULT_MAX_SCAN_BYTES,
@@ -128,6 +132,54 @@ async def test_a_filtered_pinot_query_clears_the_default_budget_and_runs(
         assert answer.structuredContent is not None
         assert answer.structuredContent["row_count"] > 0
         assert "Carrier" in answer.structuredContent["columns"]
+
+
+async def _audited_query(
+    engine: TrinoEngine | PinotEngine, sql: str, identity: AgentIdentity | None
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """One query_data call; its structured answer and its audit detail."""
+    lines: list[str] = []
+    async with lagaam_client(
+        engine,
+        budget=_default_budget(),
+        identity=identity,
+        audit=AuditLog(sink=lines.append),
+    ) as client:
+        answer = await client.call_tool("query_data", {"sql": sql})
+    assert not answer.isError
+    assert answer.structuredContent is not None
+    record = json.loads(lines[-1])
+    assert record["outcome"] == "allowed"
+    return answer.structuredContent, record["detail"]
+
+
+async def test_the_trino_audit_line_puts_actuals_beside_the_quote(
+    trino_ready: None,
+) -> None:
+    answer, detail = await _audited_query(
+        TrinoEngine(host="localhost", port=8080, user="lagaam-e2e"),
+        "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey = 1",
+        None,
+    )
+    assert "actuals" not in answer
+    assert detail["estimate"]["row_estimate"] is not None
+    assert detail["actuals"]["rows_scanned"] == 15000
+    assert detail["actuals"]["partial"] is False
+
+
+async def test_the_pinot_audit_line_puts_actuals_beside_the_quote(
+    pinot_ready: None,
+) -> None:
+    answer, detail = await _audited_query(
+        _pinot_engine(),
+        "SELECT Carrier, count(*) AS flights FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 5",
+        _PINOT_GRANT,
+    )
+    assert "actuals" not in answer
+    assert detail["actuals"]["rows_scanned"] == 1101
+    assert detail["actuals"]["bytes_scanned"] is None
+    assert detail["actuals"]["rows_scanned"] <= detail["estimate"]["row_estimate"]
 
 
 async def test_an_unbounded_pinot_cross_join_is_denied_on_row_work(
