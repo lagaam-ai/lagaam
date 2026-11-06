@@ -16,3 +16,4 @@ Title / Status / Context / Decision / Consequences.
 | [0009](0009-consuming-segments-and-proven-join-keys.md) | A consuming segment is charged at its flush threshold, and a key is proven by the catalog and the scan ordinal |
 | [0010](0010-pinot-sqlglot-dialect-preserves-spellings.md) | The Pinot dialect preserves the agent's spellings rather than transpiling them |
 | [0011](0011-missing-segment-metadata-comes-from-its-servers.md) | Segment metadata the bulk call leaves out is fetched from the servers that hold it |
+| [0012](0012-actuals-are-an-operator-receipt-not-a-gate.md) | Post-execution actuals are an operator's receipt, never a gate or an agent input |

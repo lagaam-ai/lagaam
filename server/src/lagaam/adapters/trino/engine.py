@@ -19,6 +19,7 @@ from lagaam.adapters.trino.dialect import TRINO_DIALECT_CARD
 from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 from lagaam.adapters.trino.numbers import finite_number
 from lagaam.adapters.trino.plan import max_intermediate_rows
+from lagaam.adapters.trino.stats import actuals_from_stats
 from lagaam.core.errors import (
     ConfigurationError,
     EngineError,
@@ -369,6 +370,7 @@ class TrinoEngine:
             # Fetch one extra to detect truncation without a second query.
             rows = cur.fetchmany(max_rows + 1)
             columns = [d[0] for d in cur.description or []]
+            actuals = actuals_from_stats(getattr(cur, "stats", None))
         truncated = len(rows) > max_rows
         capped = [list(r) for r in rows[:max_rows]]
         return QueryResult(
@@ -376,6 +378,7 @@ class TrinoEngine:
             rows=capped,
             row_count=len(capped),
             truncated=truncated,
+            actuals=actuals,
         )
 
     def _estimate_cost(self, sql: str) -> CostEstimate:

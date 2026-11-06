@@ -7,6 +7,7 @@ translate engine-specific metadata into them. Core never imports engine SDKs.
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 
 class ColumnInfo(BaseModel):
@@ -81,6 +82,29 @@ class CostEstimate(BaseModel):
         return self
 
 
+class QueryActuals(BaseModel):
+    """What the engine says a query actually cost, read after it ran.
+
+    The receipt to CostEstimate's quotation, for the audit line: an operator
+    can only tune a budget by seeing how far the quote was off. Observation
+    only — nothing is ever gated on these numbers.
+
+    Every field is optional because engines report different things: Pinot
+    reports no bytes at all, so ``bytes_scanned`` is None there rather than 0.
+    ``rows_scanned`` is rows the scan read (Trino ``processedRows``, Pinot
+    ``numDocsScanned``), the same sense as ``CostEstimate.row_estimate``.
+    """
+
+    rows_scanned: int | None = None
+    bytes_scanned: int | None = None
+    elapsed_ms: int | None = None
+    # The engine was still running when read (a capped fetch), so every
+    # count is a floor rather than the total.
+    partial: bool = False
+    # Engine-native counters under their engine's own names, for forensics.
+    engine_counters: dict[str, int] = Field(default_factory=dict)
+
+
 class QueryResult(BaseModel):
     """Rows returned to the agent, capped to a row budget.
 
@@ -94,6 +118,8 @@ class QueryResult(BaseModel):
     truncated: bool = False
     # Non-blocking notes the agent should weigh before trusting the result.
     warnings: list[str] = Field(default_factory=list)
+    # For the audit line only: kept out of the agent's answer and tool schema.
+    actuals: SkipJsonSchema[QueryActuals | None] = Field(default=None, exclude=True)
 
 
 class DialectCard(BaseModel):

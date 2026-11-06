@@ -48,7 +48,9 @@ Lagaam gives them access with reins on:
   pages, all-NULL columns — the agent gets a warning with a next action, not
   a silently misleading answer.
 - **Every call is audited.** One JSONL line per tool call: who, what,
-  allowed or denied, and why.
+  allowed or denied, and why. A query's line puts the quote next to what
+  the engine says it actually read, so you can see how far off the
+  estimate was before you loosen or tighten a budget.
 
 ## Doesn't Trino already limit this?
 
@@ -255,8 +257,7 @@ segment metadata and the broker's own pruning oracle, for OFFLINE and
 REALTIME tables alike — a consuming segment is charged at the stream's
 flush threshold, and a join is charged its bound rather than the product
 wherever the catalog proves the key. On deck
-([roadmap](docs/roadmap.md)): post-execution actuals on the audit line,
-then a Kubernetes control plane — agents as CRDs with token/dollar budgets
+([roadmap](docs/roadmap.md)): a Kubernetes control plane — agents as CRDs with token/dollar budgets
 and kill switches.
 
 Apache 2.0.

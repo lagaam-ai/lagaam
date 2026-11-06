@@ -12,7 +12,7 @@ is the same broker answer parsed the same way, so it lives here too.
 from typing import Any
 
 from lagaam.adapters.pinot.errors import classify
-from lagaam.core.models import QueryResult
+from lagaam.core.models import QueryActuals, QueryResult
 
 INCOMPLETE_RESULT = "INCOMPLETE_RESULT"
 
@@ -67,10 +67,13 @@ def parse_query_result(body: Any, max_rows: int) -> QueryResult:
     warnings: list[str] = []
     if isinstance(body, dict) and body.get("numGroupsWarningLimitReached") is True:
         warnings.append(_GROUP_WARNING)
+    actuals = actuals_from_response(body)
 
     table = body.get("resultTable") if isinstance(body, dict) else None
     if not isinstance(table, dict):
-        return QueryResult(columns=[], rows=[], row_count=0, warnings=warnings)
+        return QueryResult(
+            columns=[], rows=[], row_count=0, warnings=warnings, actuals=actuals
+        )
 
     schema = table.get("dataSchema")
     names = schema.get("columnNames") if isinstance(schema, dict) else None
@@ -89,6 +92,49 @@ def parse_query_result(body: Any, max_rows: int) -> QueryResult:
         row_count=len(capped),
         truncated=truncated,
         warnings=warnings,
+        actuals=actuals,
+    )
+
+
+# The filter and freshness counters the spec names for the actual cost, plus
+# the segment fan-out, under Pinot's own names. There is no bytes counter.
+_EXTRA_COUNTERS = (
+    "totalDocs",
+    "numEntriesScannedInFilter",
+    "numEntriesScannedPostFilter",
+    "numSegmentsQueried",
+    "numSegmentsProcessed",
+    "numSegmentsMatched",
+    "numConsumingSegmentsQueried",
+    "minConsumingFreshnessTimeMs",
+)
+
+
+def _count(body: dict[str, Any], key: str) -> int | None:
+    value = body.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def actuals_from_response(body: Any) -> QueryActuals | None:
+    """What the broker says the query did; observation for the audit line.
+
+    The broker answers once, after the query finished, so these are never
+    partial. bytes_scanned stays None: Pinot reports no bytes read, and a 0
+    would claim a scan that cost nothing.
+    """
+    if not isinstance(body, dict):
+        return None
+    counters = {
+        key: value
+        for key in _EXTRA_COUNTERS
+        if (value := _count(body, key)) is not None
+    }
+    return QueryActuals(
+        rows_scanned=_count(body, "numDocsScanned"),
+        elapsed_ms=_count(body, "timeUsedMs"),
+        engine_counters=counters,
     )
 
 

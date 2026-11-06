@@ -134,6 +134,22 @@ async def test_execute_not_truncated_when_rows_fit(engine: TrinoEngine) -> None:
     assert not result.truncated
 
 
+async def test_execute_reports_what_the_query_actually_read(
+    engine: TrinoEngine,
+) -> None:
+    # The scan reads the whole tpch.tiny.orders split set even under a filter.
+    result = await engine.execute(
+        "SELECT orderkey FROM tpch.tiny.orders WHERE orderkey = 1", max_rows=100
+    )
+    actuals = result.actuals
+    assert actuals is not None
+    assert actuals.partial is False
+    assert actuals.rows_scanned == 15000
+    assert actuals.bytes_scanned is not None
+    assert actuals.elapsed_ms is not None and actuals.elapsed_ms > 0
+    assert "cpuTimeMillis" in actuals.engine_counters
+
+
 async def test_execute_truncation_needs_a_limit_above_the_cap(
     engine: TrinoEngine,
 ) -> None:

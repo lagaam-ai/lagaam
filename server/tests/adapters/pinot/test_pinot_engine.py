@@ -439,6 +439,16 @@ async def test_execute_sends_two_part_sql_to_the_broker() -> None:
     )
 
 
+async def test_execute_returns_the_brokers_actuals_with_the_rows() -> None:
+    result = await broker_engine(replying(load("agg-groupby.json"))).execute(
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "GROUP BY Carrier LIMIT 5",
+        max_rows=10,
+    )
+    assert result.actuals is not None
+    assert result.actuals.rows_scanned == 9746
+
+
 async def test_execute_pins_the_multistage_engine_and_the_response_cap() -> None:
     handler = replying(load("agg-groupby.json"))
     await broker_engine(handler).execute(

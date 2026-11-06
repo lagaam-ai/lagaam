@@ -209,6 +209,9 @@ def create_server(
         detail["estimate"] = estimate.model_dump()
         enforce_budget(estimate, budget)
         result = await engine.execute(safe_sql, row_cap, budget.timeout_seconds)
+        # The receipt beside the quote; recorded, never enforced.
+        actuals = result.actuals
+        detail["actuals"] = None if actuals is None else actuals.model_dump()
         detail["row_count"] = result.row_count
         detail["truncated"] = result.truncated
         # Extend: an engine may have attached warnings of its own.

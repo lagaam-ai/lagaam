@@ -11,7 +11,8 @@ import anyio
 
 from lagaam.core.audit import AuditLog
 from lagaam.core.identity import AgentIdentity
-from lagaam.core.models import QueryResult
+from lagaam.core.budget import QueryBudget
+from lagaam.core.models import CostEstimate, QueryActuals, QueryResult
 from tests.fakes import FakeQueryEngine
 from tests.helpers import lagaam_client
 
@@ -154,6 +155,71 @@ async def test_audit_records_the_sql_that_actually_ran() -> None:
     assert detail["executed_sql"] == "SELECT a FROM tpch.tiny.orders LIMIT 1001"
     assert detail["estimate"]["scanned_bytes"] == 1_000_000
     assert detail["row_count"] == 1
+
+
+async def test_audit_puts_the_actuals_beside_the_quote() -> None:
+    # The operator tunes a budget by how far the quote was off: both halves
+    # of that comparison have to land on the same line.
+    actuals = QueryActuals(
+        rows_scanned=15_000,
+        bytes_scanned=0,
+        elapsed_ms=182,
+        engine_counters={"cpuTimeMillis": 23},
+    )
+    engine = FakeQueryEngine(
+        result=QueryResult(columns=["a"], rows=[[1]], row_count=1, actuals=actuals)
+    )
+    lines: list[str] = []
+    async with lagaam_client(engine, audit=AuditLog(sink=lines.append)) as client:
+        answer = await client.call_tool(
+            "query_data", {"sql": "SELECT a FROM tpch.tiny.orders"}
+        )
+    detail = json.loads(lines[0])["detail"]
+    assert detail["estimate"]["row_estimate"] == 1000
+    assert detail["actuals"] == {
+        "rows_scanned": 15_000,
+        "bytes_scanned": 0,
+        "elapsed_ms": 182,
+        "partial": False,
+        "engine_counters": {"cpuTimeMillis": 23},
+    }
+    # The agent's answer is unchanged by it.
+    assert answer.structuredContent is not None
+    assert "actuals" not in answer.structuredContent
+
+
+async def test_an_engine_that_reports_no_actuals_logs_null() -> None:
+    lines: list[str] = []
+    async with lagaam_client(
+        FakeQueryEngine(), audit=AuditLog(sink=lines.append)
+    ) as client:
+        await client.call_tool("query_data", {"sql": "SELECT a FROM tpch.tiny.orders"})
+    assert json.loads(lines[0])["detail"]["actuals"] is None
+
+
+async def test_a_denied_query_has_a_quote_and_no_actuals() -> None:
+    # Nothing ran, so there is no receipt to claim.
+    engine = FakeQueryEngine(
+        estimate=CostEstimate(scanned_bytes=48 * 1024**3, row_estimate=10),
+        result=QueryResult(
+            columns=["a"], rows=[], row_count=0, actuals=QueryActuals(rows_scanned=1)
+        ),
+    )
+    lines: list[str] = []
+    async with lagaam_client(
+        engine,
+        budget=QueryBudget(max_scan_bytes=1024),
+        audit=AuditLog(sink=lines.append),
+    ) as client:
+        answer = await client.call_tool(
+            "query_data", {"sql": "SELECT a FROM tpch.tiny.orders"}
+        )
+    assert answer.isError
+    record = json.loads(lines[0])
+    assert record["outcome"] == "denied"
+    assert record["detail"]["estimate"]["scanned_bytes"] == 48 * 1024**3
+    assert "actuals" not in record["detail"]
+    assert engine.executed == []
 
 
 class SlowEngine(FakeQueryEngine):
