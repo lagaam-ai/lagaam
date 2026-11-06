@@ -8,6 +8,8 @@ from lagaam.core.models import (
     CatalogMetadata,
     ColumnInfo,
     CostEstimate,
+    QueryActuals,
+    QueryResult,
     SchemaInfo,
     TableSchema,
 )
@@ -86,3 +88,31 @@ def test_max_intermediate_rows_does_not_decide_confidence() -> None:
     assert (
         CostEstimate(scanned_bytes=10, max_intermediate_rows=5).confidence == "high"
     )
+
+
+def test_actuals_default_to_unknown_rather_than_zero() -> None:
+    # An engine that reports no bytes must not read as a scan that cost none.
+    actuals = QueryActuals()
+    assert actuals.rows_scanned is None
+    assert actuals.bytes_scanned is None
+    assert actuals.elapsed_ms is None
+    assert actuals.partial is False
+    assert actuals.engine_counters == {}
+
+
+def test_actuals_never_reach_the_agents_answer() -> None:
+    result = QueryResult(
+        columns=["a"],
+        rows=[[1]],
+        row_count=1,
+        actuals=QueryActuals(rows_scanned=15_000),
+    )
+    assert "actuals" not in result.model_dump()
+    assert "actuals" not in result.model_dump_json()
+    assert result.actuals is not None and result.actuals.rows_scanned == 15_000
+
+
+def test_actuals_are_not_in_the_tool_schema_the_agent_reads() -> None:
+    schema = QueryResult.model_json_schema()
+    assert "actuals" not in schema["properties"]
+    assert "QueryActuals" not in str(schema)

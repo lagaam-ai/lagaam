@@ -43,7 +43,14 @@ _MAX_RECORD_CHARS = 64 * 1024
 
 # What a tool contributes about what it actually did — emitted ahead of the
 # agent's own arguments so no argument list can crowd it out.
-_RESERVED_KEYS = ("executed_sql", "estimate", "row_count", "truncated", "reason")
+_RESERVED_KEYS = (
+    "executed_sql",
+    "estimate",
+    "actuals",
+    "row_count",
+    "truncated",
+    "reason",
+)
 
 # The marker _truncated() writes to say what it cut. Reserved so a supplied
 # field cannot forge an elision on SQL that was in fact logged in full.

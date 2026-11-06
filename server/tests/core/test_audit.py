@@ -230,6 +230,16 @@ def test_what_the_tool_did_survives_a_crowded_argument_list() -> None:
     assert logged["executed_sql"] == "SELECT a FROM c.s.t LIMIT 10"
 
 
+def test_the_actuals_survive_a_crowded_argument_list() -> None:
+    # The receipt is appended after the arguments, like executed_sql.
+    detail: dict[str, object] = {f"arg{i}": i for i in range(150)}
+    detail["actuals"] = {"rows_scanned": 15_000, "bytes_scanned": None}
+    lines: list[str] = []
+    AuditLog(sink=lines.append).record("a", "query_data", "allowed", detail)
+    logged = json.loads(lines[0])["detail"]
+    assert logged["actuals"] == {"rows_scanned": 15_000, "bytes_scanned": None}
+
+
 def test_many_large_sibling_values_cannot_grow_the_line_without_bound() -> None:
     # Each value is individually under the per-value cap; only a total budget
     # stops 100 of them from becoming a 400 KB line.
