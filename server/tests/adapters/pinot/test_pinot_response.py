@@ -15,6 +15,7 @@ import pytest
 from lagaam.adapters.pinot.response import (
     ENGINE_FAULT,
     INCOMPLETE_RESULT,
+    actuals_from_response,
     consuming_segments_queried,
     consuming_segments_surviving,
     parse_query_result,
@@ -123,6 +124,43 @@ def test_a_malformed_row_does_not_crash_the_parse() -> None:
     }
     result = parse_query_result(body, max_rows=10)
     assert result.rows == [["ok"], ["fine"]]
+
+
+def test_a_result_carries_the_brokers_actuals() -> None:
+    actuals = parse_query_result(load("agg-groupby.json"), max_rows=10).actuals
+    assert actuals is not None
+    assert actuals.rows_scanned == 9746
+    assert actuals.elapsed_ms == 14
+    assert actuals.partial is False
+    assert actuals.engine_counters["totalDocs"] == 9746
+    assert actuals.engine_counters["numEntriesScannedInFilter"] == 0
+    assert actuals.engine_counters["numEntriesScannedPostFilter"] == 9746
+    assert actuals.engine_counters["numSegmentsProcessed"] == 31
+    assert actuals.engine_counters["minConsumingFreshnessTimeMs"] == 0
+
+
+def test_pinot_reports_no_bytes_so_the_actuals_claim_none() -> None:
+    # A 0 would read as a scan that cost nothing.
+    actuals = actuals_from_response(load("agg-groupby.json"))
+    assert actuals is not None and actuals.bytes_scanned is None
+
+
+def test_a_body_without_rows_still_carries_its_actuals() -> None:
+    result = parse_query_result({"resultTable": None, "numDocsScanned": 7}, 10)
+    assert result.actuals is not None and result.actuals.rows_scanned == 7
+
+
+@pytest.mark.parametrize("bad", [None, -1, "9746", 1.5, True])
+def test_an_unreadable_broker_counter_is_unknown_not_zero(bad: Any) -> None:
+    actuals = actuals_from_response({"numDocsScanned": bad, "totalDocs": bad})
+    assert actuals is not None
+    assert actuals.rows_scanned is None
+    assert "totalDocs" not in actuals.engine_counters
+
+
+@pytest.mark.parametrize("body", [None, [], "ok"])
+def test_a_body_that_is_not_an_object_has_no_actuals(body: Any) -> None:
+    assert actuals_from_response(body) is None
 
 
 def test_a_time_filter_survives_three_of_thirty_one_segments() -> None:

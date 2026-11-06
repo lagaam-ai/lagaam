@@ -165,6 +165,29 @@ async def test_validated_sql_executes_on_the_multistage_engine(
     assert result.rows[0][0] == "WN"
 
 
+async def test_execute_reports_the_docs_the_broker_actually_scanned(
+    engine: PinotEngine,
+) -> None:
+    # Measured on the quickstart: 1101 docs over 3 of 31 segments.
+    sql = (
+        "SELECT Carrier, count(*) AS n FROM pinot.default.airlineStats "
+        "WHERE DaysSinceEpoch BETWEEN 16071 AND 16073 GROUP BY Carrier LIMIT 5"
+    )
+    estimate = await engine.estimate_cost(sql)
+    result = await engine.execute(sql, max_rows=5, timeout_seconds=30.0)
+    actuals = result.actuals
+    assert actuals is not None
+    assert actuals.rows_scanned == 1101
+    assert actuals.bytes_scanned is None
+    assert actuals.partial is False
+    assert actuals.engine_counters["totalDocs"] == 9746
+    assert actuals.engine_counters["numSegmentsProcessed"] == 3
+    assert "numEntriesScannedInFilter" in actuals.engine_counters
+    # The quote is an upper bound on what the scan then read.
+    assert estimate.row_estimate is not None
+    assert actuals.rows_scanned <= estimate.row_estimate
+
+
 async def test_a_join_runs_because_every_query_is_multistage(
     engine: PinotEngine,
 ) -> None:
