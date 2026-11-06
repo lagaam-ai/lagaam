@@ -9,6 +9,10 @@ has to be asked for rather than inherited from an empty environment.
 Env:
   LAGAAM_ENGINE          which adapter to run: trino (default) or pinot
   TRINO_HOST (localhost), TRINO_PORT (8080), TRINO_USER (lagaam)
+  TRINO_PASSWORD or TRINO_JWT  log in to a shared cluster (unset = no login;
+                         both set = startup error)
+  TRINO_HTTP_SCHEME      http or https (https once a login is set, else http)
+  TRINO_VERIFY           TLS cert check: true (default), false, or a CA bundle path
   PINOT_CONTROLLER_URL (http://localhost:9000), PINOT_BROKER_URL
     (http://localhost:8000), PINOT_USER, PINOT_PASSWORD (unset = no auth)
   LAGAAM_ALLOWED_TABLES  comma list of catalog.schema.table — REQUIRED
