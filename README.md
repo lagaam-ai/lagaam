@@ -266,7 +266,7 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 ## Status
 
-`v0.2.5` — on PyPI as `lagaam`, listed in the MCP Registry as `io.github.lagaam-ai/lagaam`, installable as a Claude Code plugin (`lagaam@lagaam`). Trino adapter, schema tools, plan-based cost guard, query
+`v1.0.0` — on PyPI as `lagaam`, listed in the MCP Registry as `io.github.lagaam-ai/lagaam`, installable as a Claude Code plugin (`lagaam@lagaam`). Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
 audit log with post-execution actuals, https + password/JWT login for a shared
 Trino. 1,243 unit + 219 integration tests (live Trino 476 and Pinot
