@@ -1,9 +1,13 @@
+import functools
 import json
+import ssl
 import time
 from pathlib import Path
 
 import httpx
 import pytest
+import requests
+import trino.auth
 import trino.dbapi
 import trino.exceptions
 
@@ -283,3 +287,45 @@ def _pinot_has_sealed_segment(table: str) -> bool:
         for states in half.values()
         if isinstance(states, dict)
     )
+
+
+TRINO_AUTH_CA = Path(__file__).resolve().parents[3] / "examples" / "trino-auth" / "tls" / "cert.pem"
+TRINO_AUTH_LOGIN = ("lagaam", "lagaam-test-password")
+
+
+@pytest.fixture
+def trino_auth_ready() -> None:
+    """Skip unless the https + password Trino (compose profile trino-auth) answers."""
+    if not TRINO_AUTH_CA.is_file():
+        pytest.skip("no cert — run examples/trino-auth/setup.sh, then --profile trino-auth up -d")
+    tls = ssl.create_default_context(cafile=str(TRINO_AUTH_CA))
+    try:
+        info = httpx.get("https://localhost:8443/v1/info", verify=tls, timeout=2.0).json()
+    except httpx.HTTPError:
+        pytest.skip("https Trino not reachable — docker compose --profile trino-auth up -d")
+    if info.get("starting", True):
+        pytest.skip("https Trino is still starting — retry in a few seconds")
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            with trino.dbapi.connect(
+                host="localhost",
+                port=8443,
+                user=TRINO_AUTH_LOGIN[0],
+                http_scheme="https",
+                auth=trino.auth.BasicAuthentication(*TRINO_AUTH_LOGIN),
+                http_session=_trusting_session(),
+            ) as conn:
+                conn.cursor().execute("SELECT orderkey FROM tpch.tiny.orders LIMIT 1").fetchall()
+            return
+        except (trino.exceptions.Error, trino.exceptions.HttpError, OSError):
+            if time.monotonic() > deadline:
+                pytest.skip("https Trino never became queryable within 30s")
+            time.sleep(1)
+
+
+def _trusting_session() -> requests.Session:
+    # Per request: REQUESTS_CA_BUNDLE would override a Session-level verify.
+    session = requests.Session()
+    session.request = functools.partial(session.request, verify=str(TRINO_AUTH_CA))  # type: ignore[method-assign]
+    return session

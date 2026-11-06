@@ -51,6 +51,26 @@
           "default": "lagaam"
         },
         {
+          "name": "TRINO_PASSWORD",
+          "description": "Password for TRINO_USER; unset means no login. Not with TRINO_JWT",
+          "isSecret": true
+        },
+        {
+          "name": "TRINO_JWT",
+          "description": "JWT to log in with instead of a password; unset means no login",
+          "isSecret": true
+        },
+        {
+          "name": "TRINO_HTTP_SCHEME",
+          "description": "http or https; unset means https once a password or JWT is set, else http",
+          "choices": ["http", "https"]
+        },
+        {
+          "name": "TRINO_VERIFY",
+          "description": "TLS cert check: true, false, or the path of a CA bundle (PEM)",
+          "default": "true"
+        },
+        {
           "name": "PINOT_CONTROLLER_URL",
           "description": "Pinot controller URL",
           "default": "http://localhost:9000"

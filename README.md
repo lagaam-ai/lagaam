@@ -163,8 +163,10 @@ claude plugin install lagaam@lagaam --config engine=pinot \
   --config pinot_broker_url=http://pinot.internal:8099
 ```
 
-Other `LAGAAM_*` settings, and `PINOT_USER` / `PINOT_PASSWORD` for a Pinot
-with auth, are read from the environment you start `claude` in.
+Other `LAGAAM_*` settings, the Trino login (`TRINO_PASSWORD` or `TRINO_JWT`,
+plus `TRINO_VERIFY` for a private CA), and `PINOT_USER` / `PINOT_PASSWORD` for
+a Pinot with auth, are read from the environment you start `claude` in, so a
+password never sits in the plugin's config.
 
 The agent gets three tools — `list_catalogs`, `describe_table`,
 `query_data` — and cannot reach the engine any other way.
@@ -184,6 +186,19 @@ The agent gets three tools — `list_catalogs`, `describe_table`,
 | `LAGAAM_METADATA_TTL` | Metadata cache TTL, seconds | `300` |
 | `LAGAAM_AUDIT_LOG` | Audit JSONL file path | stderr |
 | `TRINO_HOST` / `TRINO_PORT` / `TRINO_USER` | Trino coordinator | `localhost` / `8080` / `lagaam` |
+| `TRINO_PASSWORD` | Password for `TRINO_USER`, for a cluster that wants a login | unset (no login) |
+| `TRINO_JWT` | JWT to log in with instead of a password — set one or the other, not both | unset |
+| `TRINO_HTTP_SCHEME` | `http` or `https` | `https` once a password or JWT is set, else `http` |
+| `TRINO_VERIFY` | Check the cluster's TLS cert: `true`, `false`, or the path of your CA bundle (PEM) for a private CA | `true` |
+
+**A shared Trino with a login works the same way.** Set `TRINO_PASSWORD` (or
+`TRINO_JWT`) and lagaam talks https, since Trino won't take a password over
+plain http; set `TRINO_PORT` to the cluster's https port too (often `443` or
+`8443`). A login the cluster refuses tells the agent so, without the password,
+and a password and a JWT both set stop the server at startup rather than
+guessing which one you meant. Try it locally against a Trino that wants both:
+`examples/trino-auth/setup.sh`, then
+`docker compose -f examples/docker-compose.yml --profile trino-auth up -d`.
 
 **The server will not start without `LAGAAM_ALLOWED_TABLES`.** An agent that
 can reach every table in every catalog is the thing this exists to prevent, so

@@ -12,6 +12,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
+  # A Trino that wants https and a password, like a shared cluster does. Make
+  # its cert first: examples/trino-auth/setup.sh (login and CA path printed there).
+  trino-auth:
+    image: trinodb/trino:476
+    container_name: lagaam-trino-auth
+    profiles: ["trino-auth"]
+    mem_limit: 2g
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./trino-auth/config.properties:/etc/trino/config.properties:ro
+      - ./trino-auth/password-authenticator.properties:/etc/trino/password-authenticator.properties:ro
+      - ./trino-auth/password.db:/etc/trino/password.db:ro
+      - ./trino-auth/tls:/etc/trino/tls:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
   pinot:
     image: apachepinot/pinot:release-1.5.1
     container_name: lagaam-pinot

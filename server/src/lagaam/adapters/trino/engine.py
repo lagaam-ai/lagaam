@@ -7,8 +7,11 @@ this module as LagaamError subclasses — raw trino exceptions never escape.
 
 import math
 import os
+from typing import Any
 
 import anyio.to_thread
+import requests
+import trino.auth
 import trino.dbapi
 import trino.exceptions
 
@@ -17,6 +20,7 @@ from lagaam.adapters.trino.explain import parse_io_estimate, plan_entry_counts
 from lagaam.adapters.trino.numbers import finite_number
 from lagaam.adapters.trino.plan import max_intermediate_rows
 from lagaam.core.errors import (
+    ConfigurationError,
     EngineError,
     LagaamError,
     QueryFailedError,
@@ -55,6 +59,42 @@ _ENGINE_FAILURES = (trino.exceptions.Error, trino.exceptions.HttpError, OSError)
 
 _UNREACHABLE = "the query engine is not reachable right now"
 
+# Fixed text, never the 401 body: the operator fixes this, the agent can't.
+_CREDENTIALS_REFUSED = (
+    "the query engine refused lagaam's login; the operator running lagaam "
+    "needs to check TRINO_USER and TRINO_PASSWORD or TRINO_JWT"
+)
+
+_HTTP_SCHEMES = ("http", "https")
+
+
+class _VerifySession(requests.Session):
+    """A session whose own verify setting outranks REQUESTS_CA_BUNDLE.
+
+    requests lets that env var override Session.verify, so TRINO_VERIFY's CA
+    bundle (or false) was silently replaced wherever a corporate bundle is set.
+    """
+
+    def request(self, *args: Any, **kwargs: Any) -> requests.Response:
+        kwargs.setdefault("verify", self.verify)
+        return super().request(*args, **kwargs)
+
+
+def _parse_verify(value: str) -> bool | str:
+    """TRINO_VERIFY: true/false, or the path of a CA bundle for a private CA."""
+    lowered = value.lower()
+    if lowered in ("true", "1", "yes"):
+        return True
+    if lowered in ("false", "0", "no"):
+        return False
+    if not os.path.isfile(value):
+        raise ConfigurationError(
+            f"TRINO_VERIFY={value!r} is neither true/false nor a CA bundle file "
+            "that exists. Point it at your cluster's CA certificate (PEM), or "
+            "set it to true."
+        )
+    return value
+
 # Planning is attacker-reachable work: a 722-char self-referencing CTE chain
 # measured 32s of coordinator time on Trino 476, quadrupling per two links,
 # while passing every parse-time guard in milliseconds. The gate waits for
@@ -80,6 +120,8 @@ def _detail(exc: Exception) -> str:
     message = getattr(exc, "message", None)
     if isinstance(message, str) and message:
         return message
+    if isinstance(exc, trino.exceptions.HttpError) and str(exc).startswith("error 401"):
+        return _CREDENTIALS_REFUSED
     return _UNREACHABLE
 
 
@@ -139,21 +181,58 @@ class TrinoEngine:
         port: int = 8080,
         user: str = "lagaam",
         max_tables_per_catalog: int = 1000,
+        password: str | None = None,
+        jwt: str | None = None,
+        http_scheme: str | None = None,
+        verify: bool | str = True,
     ) -> None:
+        """Connection settings; a shared cluster needs https plus auth.
+
+        With no explicit scheme, any auth means https: Trino refuses a
+        password over plain http, and a token sent in the clear is a leak.
+        """
+        if password is not None and jwt is not None:
+            raise ConfigurationError(
+                "TRINO_PASSWORD and TRINO_JWT are both set; Trino takes one "
+                "way to log in. Unset the one your cluster doesn't use."
+            )
+        if http_scheme is None:
+            http_scheme = "https" if password is not None or jwt is not None else "http"
+        if http_scheme not in _HTTP_SCHEMES:
+            raise ConfigurationError(
+                f"TRINO_HTTP_SCHEME={http_scheme!r} is not a scheme Trino speaks. "
+                "Set it to 'http' or 'https'."
+            )
         self._host = host
         self._port = port
         self._user = user
         self._max_tables = max_tables_per_catalog
+        self._http_scheme = http_scheme
+        self._verify = verify
+        self._auth: trino.auth.Authentication | None = None
+        if password is not None:
+            self._auth = trino.auth.BasicAuthentication(user, password)
+        elif jwt is not None:
+            self._auth = trino.auth.JWTAuthentication(jwt)
 
     @classmethod
     def from_env(cls) -> "TrinoEngine":
-        kwargs: dict[str, str | int] = {}
+        kwargs: dict[str, str | int | bool] = {}
         if "TRINO_HOST" in os.environ:
             kwargs["host"] = os.environ["TRINO_HOST"]
         if "TRINO_PORT" in os.environ:
             kwargs["port"] = int(os.environ["TRINO_PORT"])
         if "TRINO_USER" in os.environ:
             kwargs["user"] = os.environ["TRINO_USER"]
+        # Empty counts as unset: a blank plugin field or `TRINO_PASSWORD=` means no auth.
+        if password := os.environ.get("TRINO_PASSWORD"):
+            kwargs["password"] = password
+        if jwt := os.environ.get("TRINO_JWT"):
+            kwargs["jwt"] = jwt
+        if scheme := os.environ.get("TRINO_HTTP_SCHEME", "").strip().lower():
+            kwargs["http_scheme"] = scheme
+        if verify := os.environ.get("TRINO_VERIFY", "").strip():
+            kwargs["verify"] = _parse_verify(verify)
         return cls(**kwargs)  # type: ignore[arg-type]
 
     async def list_catalogs(self) -> CatalogMetadata:
@@ -194,11 +273,16 @@ class TrinoEngine:
     def _connect(
         self, session_properties: dict[str, str] | None = None
     ) -> trino.dbapi.Connection:
+        session = _VerifySession()
+        session.verify = self._verify
         return trino.dbapi.connect(
             host=self._host,
             port=self._port,
             user=self._user,
             session_properties=session_properties,
+            http_scheme=self._http_scheme,
+            auth=self._auth,
+            http_session=session,
         )
 
     def _list_catalogs(self) -> CatalogMetadata:
