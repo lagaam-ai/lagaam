@@ -58,6 +58,10 @@ The agent gets three tools — `list_catalogs`, `describe_table`,
 |---|---|---|
 | `LAGAAM_ALLOWED_TABLES` | Comma list of `catalog.schema.table` grants | **required** |
 | `TRINO_HOST` / `TRINO_PORT` / `TRINO_USER` | Trino coordinator | `localhost` / `8080` / `lagaam` |
+| `TRINO_PASSWORD` | Password for `TRINO_USER`, for a cluster that wants a login | unset (no login) |
+| `TRINO_JWT` | JWT to log in with instead of a password — set one or the other, not both | unset |
+| `TRINO_HTTP_SCHEME` | `http` or `https` | `https` once a password or JWT is set, else `http` |
+| `TRINO_VERIFY` | Check the cluster's TLS cert: `true`, `false`, or the path of your CA bundle (PEM) for a private CA | `true` |
 | `LAGAAM_ENGINE` | `pinot` to run the native Pinot adapter | `trino` |
 | `PINOT_CONTROLLER_URL` / `PINOT_BROKER_URL` | Pinot controller and broker | `http://localhost:9000` / `http://localhost:8000` |
 | `LAGAAM_MAX_SCAN_BYTES` | Scan-bytes budget per query, pre-execution | 50 GiB |
