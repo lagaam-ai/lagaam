@@ -29,6 +29,12 @@ One unit at a time; each unit ends in something demoable or a failing test.
   `examples/demo_pinot.py` → `docs/demo-pinot.gif`)
 - Post-execution actuals on the audit line: the quote next to what the
   engine read (ADR 0012) — **done**
+- Trino login for a shared cluster: https, password or JWT, TLS verify —
+  **done**
+
+Phase 3 closes the MCP server (Half A): feature-complete, maintenance only.
+
+## Not scheduled — control plane (Half B)
 - Operator v0: Agent CRD + reconcile → pod + identity + limits ConfigMap
 - LiteLLM proxy wiring: token/dollar meter per agent
 - `kubectl get agents` demo GIF

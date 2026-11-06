@@ -187,6 +187,9 @@ The agent gets three tools — `list_catalogs`, `describe_table`,
 | `LAGAAM_QUERY_TIMEOUT` | Wall-clock seconds per query | `300` |
 | `LAGAAM_METADATA_TTL` | Metadata cache TTL, seconds | `300` |
 | `LAGAAM_AUDIT_LOG` | Audit JSONL file path | stderr |
+| `LAGAAM_ENGINE` | `pinot` to run the native Pinot adapter | `trino` |
+| `PINOT_CONTROLLER_URL` / `PINOT_BROKER_URL` | Pinot controller and broker | `http://localhost:9000` / `http://localhost:8000` |
+| `PINOT_USER` / `PINOT_PASSWORD` | Basic-auth login for Pinot | unset (no login) |
 | `TRINO_HOST` / `TRINO_PORT` / `TRINO_USER` | Trino coordinator | `localhost` / `8080` / `lagaam` |
 | `TRINO_PASSWORD` | Password for `TRINO_USER`, for a cluster that wants a login | unset (no login) |
 | `TRINO_JWT` | JWT to log in with instead of a password — set one or the other, not both | unset |
@@ -219,6 +222,21 @@ at them — a connector that has no statistics at all is effectively unusable
 through the gate. That is deliberate: a query nobody can size is exactly the
 kind that stalls a shared cluster.
 
+## What it doesn't do
+
+- **One agent per server process, over stdio.** Identity and grant come from
+  the environment at startup; there is no HTTP transport or per-request token.
+  Run one `lagaam` per agent.
+- **No stats, no answer.** A table without statistics can't be priced, so its
+  queries are refused (see above).
+- **Per query, not per day.** Budgets bound each query; there is no running
+  total across an agent's session.
+- **Trino and Pinot only.** Other engines would need their own adapter behind
+  the same `QueryEngine` port.
+- **Actuals are recorded, never enforced.** The audit line shows what a query
+  really read next to its quote; nothing is cut off mid-run on those numbers —
+  that is what `LAGAAM_QUERY_TIMEOUT` and your engine's own limits are for.
+
 ## How it works
 
 A `QueryEngine` port with a Trino adapter and a native Pinot adapter —
@@ -250,14 +268,17 @@ Details in [docs/architecture.md](docs/architecture.md); the longer story in
 
 `v0.2.5` — on PyPI as `lagaam`, listed in the MCP Registry as `io.github.lagaam-ai/lagaam`, installable as a Claude Code plugin (`lagaam@lagaam`). Trino adapter, schema tools, plan-based cost guard, query
 budgets, read-only enforcement, per-agent allowlists, result verification,
-audit log. 1,189 unit + 212 integration tests (live Trino 476 and Pinot
+audit log with post-execution actuals, https + password/JWT login for a shared
+Trino. 1,243 unit + 219 integration tests (live Trino 476 and Pinot
 1.5.1, batch and realtime), mypy strict. `LAGAAM_ENGINE=pinot` starts the
 native Pinot adapter: grounding, execution and a quotation synthesised from
 segment metadata and the broker's own pruning oracle, for OFFLINE and
 REALTIME tables alike — a consuming segment is charged at the stream's
 flush threshold, and a join is charged its bound rather than the product
-wherever the catalog proves the key. On deck
-([roadmap](docs/roadmap.md)): a Kubernetes control plane — agents as CRDs with token/dollar budgets
-and kill switches.
+wherever the catalog proves the key.
+
+The MCP server is feature-complete: what's here is what v1 is, and new work
+is bug fixes and engine compatibility. The Kubernetes control plane in the
+[roadmap](docs/roadmap.md) is not scheduled.
 
 Apache 2.0.
